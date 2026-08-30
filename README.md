@@ -72,6 +72,24 @@ flowchart TB
 - **Capture/recall** run as Claude Code hooks: session profile injected at start, relevant
   memories injected per prompt, transcripts distilled to memories by a small LLM on a schedule.
 
+## Where code fits
+
+HyperMnesia indexes **docs, the architecture map, and memory** — not code symbols. Live code
+structure ("where is `foo` defined, who calls it") is best answered by a **language server**, which
+already keeps a precise, always-fresh index and updates it as you type. Pair HyperMnesia with an
+LSP-backed symbol MCP such as [Serena](https://github.com/oraios/serena): both run as MCP servers
+in the same client, with no overlap —
+
+| Agent's question | Answered by |
+|---|---|
+| where is a symbol defined / who calls it / its type | **Serena / LSP** (live, no re-embed) |
+| what rules apply to this file, before I edit it | **HyperMnesia** Tier 0/1 |
+| where's the doc, and what do I know about this project/owner | **HyperMnesia** Tier 2 + memory |
+
+Live code → the LSP layer; anything you want to remember or that lives in prose → HyperMnesia.
+See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full system picture, an example
+`.mcp.json` pairing both, and how it relates to managed memory offerings.
+
 ## Components
 
 | Path | What |
@@ -101,6 +119,7 @@ python ingest/embed_chunks.py     # fill embeddings
 
 ## Design docs
 
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the whole system: the LSP/code layer + HyperMnesia, how to pair them, and related work.
 - [docs/DESIGN.md](docs/DESIGN.md) — architecture and the reasoning behind the tiers.
 - [docs/MEMORY.md](docs/MEMORY.md) — the personal-memory model (bi-temporal, supersede, consolidation).
 
