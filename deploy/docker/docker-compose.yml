@@ -1,0 +1,49 @@
+# hypermnesia -- single-box stack: Postgres+pgvector, TEI embedder, optional reranker.
+#   docker compose up -d                      # Postgres + embedder
+#   docker compose --profile rerank up -d     # + cross-encoder reranker
+# Then load the schema (see docs/INSTALL.md section B).
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.5-pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-hm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-hypermnesia}
+    ports: ["${PG_PORT:-5432}:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../../sql:/sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hm} -d ${POSTGRES_DB:-hypermnesia}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # bge-m3 embeddings (CPU by default). For GPU, add a `deploy.resources` reservation
+  # or use the tei cuda image and an nvidia runtime.
+  embedder:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.7
+    command: ["--model-id", "BAAI/bge-m3", "--port", "80",
+              "--auto-truncate", "--max-batch-tokens", "4096"]
+    ports: ["${TEI_PORT:-8080}:80"]
+    volumes:
+      - tei-cache:/data
+    environment:
+      OMP_NUM_THREADS: ${TEI_THREADS:-4}
+
+  # Optional cross-encoder reranker (torch, CPU wheel by default; for GPU see rerank/Dockerfile).
+  reranker:
+    profiles: ["rerank"]
+    build:
+      context: ../../rerank
+    ports: ["${RERANK_PORT:-8091}:8091"]
+    environment:
+      RERANK_MODEL: BAAI/bge-reranker-v2-m3
+      RERANK_IDLE_SEC: ${RERANK_IDLE_SEC:-600}
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+
+volumes:
+  pgdata:
+  tei-cache:
+  hf-cache:

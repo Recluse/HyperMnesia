@@ -1,0 +1,26 @@
+# Rust build artifacts
+mcp-server/target/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*/.venv/
+*.egg-info/
+
+# Machine-local config (absolute paths, hostnames, secrets)
+.env
+.mcp.json
+config.local.*
+
+# Generated / temp embedding data (large; reproduced by the pipeline)
+ingest/_*.json
+ingest/_*.tsv
+*.tsv
+
+# Local model caches
+models/
+
+# OS / editor
+.DS_Store
+Thumbs.db
