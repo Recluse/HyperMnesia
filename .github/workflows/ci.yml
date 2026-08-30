@@ -18,6 +18,8 @@ jobs:
         run: |
           pip install --quiet ruff
           ruff check --select E9,F63,F7,F82 ingest hooks rerank ci
+      - name: GRAPH_SQL parity (hook copy vs Rust source of truth)
+        run: python ci/check_graph_sql_parity.py
 
   rust:
     runs-on: ubuntu-latest
@@ -56,3 +58,12 @@ jobs:
             "SELECT count(*) FROM components WHERE repo='myapp'" | grep -qx 4
           psql -h localhost -U hm -d hypermnesia -tAc \
             "SELECT count(*) FROM constraints WHERE repo='myapp'" | grep -qx 2
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Golden -- the hook's GRAPH_SQL is valid and returns the seed shape
+        run: |
+          # Run the exact query the PreToolUse hook uses; assert it loads the map (not just that
+          # the tables have rows). Catches an invalid/renamed column the string-parity check can't.
+          python ci/check_graph_sql_parity.py --print > /tmp/graph.sql
+          psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -tAf /tmp/graph.sql > /tmp/graph.json
+          python -c "import json; g=json.load(open('/tmp/graph.json')); c={x['slug'] for x in g['components'] if x['repo']=='myapp'}; assert {'myapp-api','myapp-db','myapp-docs','myapp-root'}<=c, c; assert any(x['scope']=='global' and x['severity']=='must' for x in g['constraints']), 'seed global must missing'; print('GRAPH_SQL golden OK:', sorted(c))"
