@@ -131,6 +131,7 @@ python ingest/embed_chunks.py     # fill embeddings
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the whole system: the LSP/code layer + HyperMnesia, how to pair them, and related work.
 - [docs/DESIGN.md](docs/DESIGN.md) — architecture and the reasoning behind the tiers.
 - [docs/MEMORY.md](docs/MEMORY.md) — the personal-memory model (bi-temporal, supersede, consolidation).
+- [docs/COMPARISON.md](docs/COMPARISON.md) — where HyperMnesia fits vs. neighbours, and honest non-goals/limitations.
 
 ## License
 
