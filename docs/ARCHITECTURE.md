@@ -98,6 +98,19 @@ constraints deterministically (Tier 0/1), or embeds a query and fuses vector + f
 optionally reranked (Tier 2). Fails open: embedder down → lexical-only; DB down → the tool
 surfaces the error, never blocks the agent.
 
+**Constraint injection (per edit, unprompted):** a `PreToolUse` hook (`hooks/arch_invariants.py`,
+matcher `Edit|Write|MultiEdit`) resolves the file about to be edited to its component and injects
+the applicable `must` invariants as `additionalContext` — so Tier 1 reaches the agent
+deterministically, without it having to think to call the `get_constraints` tool. This is the
+architectural-memory counterpart to the personal-memory recall hook; both make delivery, not just
+storage, the point. Fail-open: no DB / no match → the hook stays silent and the edit proceeds.
+
+**Keeping the map honest:** the hand-authored map is only trustworthy while it tracks the tree.
+`ci/freshness.py` makes decay mechanical — it flags component globs matching no file (a moved file
+that silently unhooked its constraints — the worst case, since the map then lies more confidently
+than search would), docs ingested behind HEAD, and constraints whose source doc is gone. Run it in
+CI or on a schedule against each target repo; it exits non-zero on orphaned globs.
+
 **Personal memory (background):** capture hooks enqueue session transcripts; a scheduled job
 distills them to memories via a pluggable LLM; a daily consolidator merges near-duplicates behind
 a confidence gate + review queue. Recall/profile hooks inject relevant memories into the prompt.

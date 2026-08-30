@@ -17,8 +17,10 @@ One store (Postgres + [pgvector](https://github.com/pgvector/pgvector)), local-m
 (embeddings via [Ollama](https://ollama.com) or [TEI](https://github.com/huggingface/text-embeddings-inference)),
 MCP-native, no cloud dependency. Runs on a laptop, one server, or Kubernetes.
 
-> Not a vector-DB wrapper. The value is the **delivery**: deterministic constraint injection
-> (Tier 1) and hook-driven personal-memory capture/recall — "storage is solved, injection isn't."
+> Not a vector-DB wrapper. The value is the **delivery**: constraints for the file you're about
+> to edit are injected by a **PreToolUse hook** (deterministic, unprompted — the agent doesn't
+> have to think to ask), and personal memory is captured/recalled by hooks too — "storage is
+> solved, injection isn't."
 
 ## How it works
 
@@ -71,6 +73,12 @@ flowchart TB
   in a review queue for you.
 - **Capture/recall** run as Claude Code hooks: session profile injected at start, relevant
   memories injected per prompt, transcripts distilled to memories by a small LLM on a schedule.
+- **Constraint injection** is a hook too: a `PreToolUse` hook (`hooks/arch_invariants.py`) resolves
+  the file you're about to edit to its component and injects the applicable `must` invariants
+  before the edit — so Tier 1 is delivered deterministically, not left to the agent to ask for.
+- **Map freshness** is checkable: `ci/freshness.py` flags component globs that match no file
+  (a moved file silently unhooking its constraints), docs behind HEAD, and dangling sources — so
+  the map decays *loudly*, not silently.
 
 ## Where code fits
 
@@ -97,7 +105,8 @@ See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full system picture
 | `sql/` | schema: doc-RAG (`documents/components/constraints/relationships/chunks`) + personal memory (`mem.*`) |
 | `ingest/` | markdown chunker, embedder (Ollama/TEI), hybrid RRF search, `mem_ops` |
 | `rerank/` | optional cross-encoder reranker service + search orchestrator |
-| `hooks/` | Claude Code hooks: profile inject, per-prompt recall, capture, extract, consolidate |
+| `hooks/` | Claude Code hooks: constraint inject (`arch_invariants`), profile inject, per-prompt recall, capture, extract, consolidate |
+| `ci/` | `freshness.py` — map-staleness / orphan-glob checker (run against a target repo) |
 | `mcp-server/` | Rust MCP server exposing project map / constraints / search / memory tools |
 | `deploy/` | docker-compose (single box) + Kubernetes manifests |
 | `examples/` | an example structural-tier seed for a project |
