@@ -21,6 +21,10 @@ invariants as `additionalContext` — the architectural-memory counterpart to `m
 `DATABASE_URL` and `HM_REPO` (or the cwd basename), and shells `psql`; if `psql` or the DB is
 absent it silently exits 0. It only ever `allow`s the edit — it surfaces rules, it never blocks.
 
+It injects only `must`, on purpose — `should` constraints are kept out of the every-edit context
+for token budget; call the `get_constraints` MCP tool to see `should`/`info` for a path. It fires
+for `Edit`, `Write`, and `MultiEdit` alike (all carry the target at `tool_input.file_path`).
+
 ## Wire the event hooks
 
 In Claude Code settings (`~/.claude/settings.json`), point each event at the script with your

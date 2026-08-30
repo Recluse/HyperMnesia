@@ -48,10 +48,11 @@ def main():
 
     tn = data.get("tool_name", "")
     ti = data.get("tool_input", {}) or {}
-    if tn in ("Edit", "Write"):
+    # Edit, Write AND MultiEdit all carry the target file at tool_input.file_path -- MultiEdit's
+    # edits[] hold only old_string/new_string, NOT a path. (Reading edits[].file_path silently
+    # skipped MultiEdit entirely -- exactly where invariants matter most.)
+    if tn in ("Edit", "Write", "MultiEdit"):
         paths = [ti["file_path"]] if ti.get("file_path") else []
-    elif tn == "MultiEdit":
-        paths = [e["file_path"] for e in ti.get("edits", []) if e.get("file_path")]
     else:
         sys.exit(0)
 
