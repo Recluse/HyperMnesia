@@ -1,5 +1,8 @@
 # HyperMnesia
 
+[![CI](https://github.com/Recluse/HyperMnesia/actions/workflows/ci.yml/badge.svg)](https://github.com/Recluse/HyperMnesia/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 *The opposite of amnesia* (Greek *hypermnesia* — abnormally complete recall). Self-hosted long-term
 memory for AI coding agents — a
 Postgres-backed store that gives an agent (Claude Code, or any MCP client) two things:
@@ -19,12 +22,43 @@ MCP-native, no cloud dependency. Runs on a laptop, one server, or Kubernetes.
 
 ## How it works
 
-```
-                 +---------------- retrieval ----------------+
-   query --> Tier 0: pinned project map + global invariants   |
-             Tier 1: path -> component -> must/should constraints (+1-hop graph)   <- deterministic
-             Tier 2: hybrid RRF search (pgvector cosine + Postgres FTS) + rerank  <- fuzzy
-                 +-------------------------------------------+
+```mermaid
+flowchart TB
+    subgraph store["🗄️ One Postgres + pgvector"]
+        direction LR
+        DOC[("doc chunks<br/>embedding + tsvector")]
+        MAP[("component / constraint<br/>map + graph")]
+        MEM[("mem.* personal memory<br/>bi-temporal, supersede")]
+    end
+
+    subgraph ingest["📥 Ingest · offline"]
+        MD["repo *.md"] --> CH["chunk by heading"]
+        CH --> EMB["embed · bge-m3<br/>Ollama / TEI"]
+        EMB --> DOC
+        CH --> TS["composite tsvector<br/>(stem || simple)"] --> DOC
+        SEED["hand-authored<br/>Tier 0/1 seed"] --> MAP
+    end
+
+    subgraph ask["🔎 Agent asks · per request"]
+        FP["file path"] -->|"deterministic"| T01["Tier 0/1: resolve<br/>path → component"]
+        T01 --> RULES["must / should constraints<br/>+ 1-hop graph"]
+        Q["query"] --> QE["embed query"]
+        QE --> RRF["Tier 2: RRF fuse<br/>vector cosine + FTS"]
+        RRF --> RRK["cross-encoder rerank<br/>bge-reranker-v2-m3"]
+        RRK --> TOPK["top-k docs"]
+    end
+
+    subgraph pm["🧠 Personal memory · background"]
+        SESS["session transcript"] --> EX["extract · LLM<br/>durable facts only"]
+        EX --> MEM
+        MEM --> RC["recall → inject<br/>into the prompt"]
+        MEM --> CO["consolidate<br/>merge / supersede · review-gated"]
+    end
+
+    MAP -.-> T01
+    MAP -.-> RULES
+    DOC -.-> RRF
+    MEM -.-> RC
 ```
 
 - **Tier 2 search** fuses dense (bge-m3 embeddings, HNSW) and lexical (composite `tsvector`,
