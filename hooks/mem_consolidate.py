@@ -26,6 +26,8 @@ SELECT a.id, b.id, round((a.embedding <=> b.embedding)::numeric, 3)
 FROM mem.active_memories a
 JOIN mem.active_memories b ON b.id > a.id
 WHERE a.embedding IS NOT NULL AND b.embedding IS NOT NULL
+  AND (a.metadata->>'kind') IS DISTINCT FROM 'page'   -- pages are syntheses of their sources:
+  AND (b.metadata->>'kind') IS DISTINCT FROM 'page'   -- never merge a page with what it summarizes
   AND a.embedding <=> b.embedding < {SIM_DIST}
 ORDER BY a.embedding <=> b.embedding;
 """

@@ -158,14 +158,52 @@ def do_nearest(cur, p):
     untouched). Returns {"distance": float, "content": str} or {} if the store is empty."""
     emb = embed(scrub(p["content"]))   # scrub so a would-be-redacted candidate matches its stored form
     proj = p.get("project")
+    # exclude synthesized pages: a page summarizes its sources, so it sits close to each of them --
+    # counting it here would make the novelty gate suppress capture of the very memories it's built from.
     cur.execute("""SELECT content, (embedding <=> %s::vector) AS dist
                    FROM mem.active_memories
                    WHERE embedding IS NOT NULL
+                     AND (metadata->>'kind') IS DISTINCT FROM 'page'
                      AND (%s::text IS NULL OR project = %s OR project IS NULL)
                    ORDER BY embedding <=> %s::vector LIMIT 1""",
                 (emb, proj, proj, emb))
     r = cur.fetchone()
     return {"distance": float(r[1]), "content": r[0]} if r else {}
+
+
+# -- reflect / knowledge pages ----------------------------------------------------------------
+def do_reflect_targets(cur, p):
+    """Projects with >= min active non-page memories -> JSON [{project, n}]."""
+    cur.execute("""SELECT coalesce(json_agg(json_build_object('project',project,'n',n)),'[]')
+                   FROM (SELECT project, count(*) n FROM mem.active_memories
+                         WHERE (metadata->>'kind') IS DISTINCT FROM 'page' AND project IS NOT NULL
+                         GROUP BY project HAVING count(*) >= %s) t""",
+                (int(p.get("min", 5)),))
+    return cur.fetchone()[0]
+
+
+def do_reflect_group(cur, p):
+    """Active non-page memories for one project -> JSON [{id, type, imp, content}]."""
+    cur.execute("""SELECT coalesce(json_agg(json_build_object(
+                     'id',id,'type',memory_type,'imp',importance,'content',content)
+                     ORDER BY importance DESC),'[]')
+                   FROM mem.active_memories
+                   WHERE (metadata->>'kind') IS DISTINCT FROM 'page' AND project = %s""",
+                (p["project"],))
+    return cur.fetchone()[0]
+
+
+def do_page_upsert(cur, p):
+    """Write the project's knowledge page, superseding its prior page so it never goes stale
+    (each reflect run rebuilds it from the current active memories)."""
+    cur.execute("""SELECT id FROM mem.active_memories
+                   WHERE (metadata->>'kind')='page' AND project IS NOT DISTINCT FROM %s
+                   ORDER BY id DESC LIMIT 1""", (p.get("project"),))
+    row = cur.fetchone()
+    payload = {**p, "type": "semantic",
+               "metadata": {**(p.get("metadata") or {}), "kind": "page"},
+               "importance": p.get("importance", 0.6), "confidence": p.get("confidence", 0.7)}
+    return do_write(cur, payload, supersedes_id=row[0] if row else None)
 
 
 def fmt_row(r):
@@ -232,6 +270,15 @@ def main():
             print(fmt_row(r))
     elif cmd == "nearest":
         print(json.dumps(do_nearest(cur, p)))
+    elif cmd == "reflect_targets":
+        # psycopg2 deserializes a json column to a Python object -> re-serialize to real JSON
+        print(json.dumps(do_reflect_targets(cur, p)))
+    elif cmd == "reflect_group":
+        print(json.dumps(do_reflect_group(cur, p)))
+    elif cmd == "page_upsert":
+        mid = do_page_upsert(cur, p)
+        conn.commit()
+        print(f"saved [#{mid}]")
     elif cmd == "mark":
         # admin op for the consolidator: flip status without a replacement memory
         status = p["status"]

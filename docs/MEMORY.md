@@ -43,6 +43,26 @@ python hooks/mem_review.py reject  <id>
 
 So a wrong merge can never silently drop a memory.
 
+## Reflect: per-project knowledge pages
+
+A scheduled reflect pass (`hooks/mem_reflect.py`) synthesizes each project's active memories into
+one coherent **knowledge page** (`metadata.kind='page'`), so recall can surface a single overview
+instead of N scattered fragments. **Anti-staleness by construction:** every run *rebuilds* the page
+from the project's current active memories and supersedes the prior page (`page_upsert`) — a page is
+never edited in place and can't drift from its sources; if the memories change, the next run
+regenerates it. Only projects with at least `MEM_REFLECT_MIN` (default 5) active memories get one.
+
+Pages are deliberately excluded from two places so they don't corrupt the store they summarize:
+the **novelty gate** (`nearest` skips pages — otherwise a page, sitting close to each source, would
+suppress capture of the very memories it's built from) and the **consolidator** (never merges a
+page with its sources). Run it out of band like consolidation:
+
+```bash
+python hooks/mem_reflect.py --dry-run            # synthesize + print, no write
+python hooks/mem_reflect.py                       # write/refresh all project pages
+python hooks/mem_reflect.py --project myrepo      # just one
+```
+
 ## Capture (Claude Code hooks)
 
 Optional, and the only Claude-Code-specific part. Register in Claude Code settings:

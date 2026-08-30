@@ -13,6 +13,7 @@ to ask. All are **fail-open** — any error and they output nothing, never block
 | `mem_capture.py` | SessionEnd, PreCompact | enqueue the transcript path |
 | `mem_extract.py` | schedule (cron/systemd/launchd) | distill queued transcripts -> memories |
 | `mem_consolidate.py` | schedule (daily) | merge/supersede near-duplicates (gated) |
+| `mem_reflect.py` | schedule (daily) | synthesize per-project knowledge pages (regenerated, never stale) |
 | `mem_review.py`  | you, manually | `list \| approve <id> \| reject <id>` the review queue |
 
 `arch_invariants.py` is what makes constraint delivery *deterministic and unprompted*: before an
@@ -57,6 +58,7 @@ cron:
 ```cron
 0 */4 * * *  cd /opt/hypermnesia && DATABASE_URL=... HM_LLM_BACKEND=ollama HM_LLM_MODEL=qwen2.5:7b python3 hooks/mem_extract.py
 30 5 * * *   cd /opt/hypermnesia && DATABASE_URL=... HM_LLM_BACKEND=ollama HM_LLM_MODEL=qwen2.5:7b python3 hooks/mem_consolidate.py
+50 5 * * *   cd /opt/hypermnesia && DATABASE_URL=... HM_LLM_BACKEND=ollama HM_LLM_MODEL=qwen2.5:7b python3 hooks/mem_reflect.py
 ```
 
 systemd timer, launchd agent, or any scheduler works equally — they just invoke the two scripts.
