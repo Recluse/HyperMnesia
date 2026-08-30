@@ -6,8 +6,11 @@ to mem.* with provenance. Run manually or from cron/systemd/launchd; NOT from a 
     python3 hooks/mem_extract.py [--dry-run] [--limit N]
 
 Idempotent: processed transcript paths are recorded in ~/.claude/mem-queue.done;
-a lock file serializes concurrent runs. Naive dedup at write time (search top-1
-for near-identical content); real consolidation is the M3 cron agent's job.
+a lock file serializes concurrent runs. A write-time novelty gate (is_duplicate:
+exact-substring + tight semantic paraphrase with a negation guard) drops repeats so
+they don't pile up; deeper semantic consolidation is the cron agent's job.
+
+    python3 hooks/mem_extract.py --selfcheck   # pure-logic checks, no DB
 """
 import json, os, re, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -92,22 +95,44 @@ def extract(text):
                        f"not marking done: {raw[:200]!r}")
 
 
+# Novelty gate: skip an extracted item we effectively already hold, so pure repeats don't pile up
+# for the O(n^2) consolidator to merge later (Vestige-style write-time gating). Kept SAFE against
+# the classic failure -- a correction ("X" -> "not X") is near-identical in embedding space, so a
+# blind cosine gate would silently drop the update. Two guards: (1) a very TIGHT distance so only
+# near-verbatim paraphrases trip it, (2) a negation-polarity check that keeps anything that flips a
+# negation vs its nearest match. Genuine semantic near-dups (reworded, same polarity) still go to
+# the consolidator, which reads meaning; this only stops the exact/near-exact restatements.
+NOVELTY_MAXDIST = float(os.environ.get("MEM_NOVELTY_MAXDIST", "0.12"))
+_NEG = re.compile(r"\b(?:not|no|never|don'?t|doesn'?t|isn'?t|aren'?t|can'?t|won'?t|"
+                  r"без|нет|не|ни|нельзя)\b", re.I)
+
+
+def _neg_differs(a, b):
+    return bool(_NEG.search(a)) != bool(_NEG.search(b))
+
+
 def is_duplicate(content):
-    # Conservative exact-substring check against the top-5 candidates (not just #1):
-    # catches an exact repeat even when it isn't the single closest hit. Deliberately
-    # NOT a lexical near-dup (simhash/Jaccard) -- those false-positive on negation
-    # ("I like tea" vs "I don't like tea"), which would silently drop a correction. Semantic
-    # near-dups are handled by the consolidator, which can read meaning.
-    out = mem_ops("search", {"query": content[:400], "k": 5}, timeout=15) or ""
     cand = content.strip().lower()
     if not cand:
         return False
+    # (1) conservative exact-substring vs the top-5 candidates (not just #1): catches an exact
+    # repeat even when it isn't the single closest hit.
+    out = mem_ops("search", {"query": content[:400], "k": 5}, timeout=15) or ""
     for line in out.strip().splitlines():
         if ") " not in line:
             continue
         existing = line.split(") ", 1)[-1].strip().lower()
         if existing and (cand in existing or existing in cand):
             return True
+    # (2) tight semantic paraphrase, with the negation guard.
+    near = mem_ops("nearest", {"content": content[:400]}, timeout=15)
+    try:
+        hit = json.loads(near) if near else {}
+    except Exception:
+        hit = {}
+    if hit and hit.get("distance", 1.0) < NOVELTY_MAXDIST \
+            and not _neg_differs(cand, (hit.get("content") or "").lower()):
+        return True
     return False
 
 
@@ -214,5 +239,19 @@ def main():
         os.remove(LOCK)
 
 
+def _selfcheck():
+    # the negation guard is the load-bearing safety bit: a correction ("X" -> "not X") is
+    # near-identical in embedding space, so without this a tight-distance gate would drop it.
+    assert _neg_differs("owner prefers zed", "owner does not prefer zed")
+    assert _neg_differs("нельзя пушить", "можно пушить")
+    assert not _neg_differs("owner prefers zed", "the owner likes zed")
+    assert not _neg_differs("both say no here", "no also here")
+    assert 0.0 < NOVELTY_MAXDIST < 0.5
+    print("ok")
+
+
 if __name__ == "__main__":
-    main()
+    if "--selfcheck" in sys.argv:
+        _selfcheck()
+    else:
+        main()

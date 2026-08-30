@@ -152,6 +152,22 @@ def do_search(cur, p):
     return rows
 
 
+def do_nearest(cur, p):
+    """Top-1 semantic neighbour among ACTIVE memories + its cosine distance, as JSON.
+    Purpose-built for the extractor's novelty gate (isolated from `search` so its text format is
+    untouched). Returns {"distance": float, "content": str} or {} if the store is empty."""
+    emb = embed(scrub(p["content"]))   # scrub so a would-be-redacted candidate matches its stored form
+    proj = p.get("project")
+    cur.execute("""SELECT content, (embedding <=> %s::vector) AS dist
+                   FROM mem.active_memories
+                   WHERE embedding IS NOT NULL
+                     AND (%s::text IS NULL OR project = %s OR project IS NULL)
+                   ORDER BY embedding <=> %s::vector LIMIT 1""",
+                (emb, proj, proj, emb))
+    r = cur.fetchone()
+    return {"distance": float(r[1]), "content": r[0]} if r else {}
+
+
 def fmt_row(r):
     mid, mtype, status, imp, conf, created, vfrom, vto, project, content, _ = r
     flags = f"{mtype} imp={imp:.1f}"
@@ -214,6 +230,8 @@ def main():
             print("(no memories found)")
         for r in rows:
             print(fmt_row(r))
+    elif cmd == "nearest":
+        print(json.dumps(do_nearest(cur, p)))
     elif cmd == "mark":
         # admin op for the consolidator: flip status without a replacement memory
         status = p["status"]
