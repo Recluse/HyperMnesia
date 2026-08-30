@@ -22,6 +22,7 @@ import re
 import sys, json, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import connect, embed_query, vec_literal
+from _redact import scrub
 
 FTS_LANG = os.environ.get("HM_FTS_LANG", "english")
 if not re.fullmatch(r"[a-z_]+", FTS_LANG):   # it is interpolated into SQL literals
@@ -45,6 +46,11 @@ def ensure_entity(cur, subj):
 
 
 def do_write(cur, p, supersedes_id=None):
+    # Redact structured secrets BEFORE persist/embed. This is the single chokepoint for every
+    # write path (hook extract, MCP memory_write, supersede, consolidation merge), so a leaked
+    # key from a coding session can't land in mem.* or its embedding.
+    content = scrub(p["content"])
+    title = scrub(p.get("title"))
     subj_id = ensure_entity(cur, p["subject"]) if p.get("subject") else None
     supersedes_id = supersedes_id or p.get("supersedes_id")
     mtype = p.get("type")
@@ -63,10 +69,10 @@ def do_write(cur, p, supersedes_id=None):
         (memory_type, content, title, lang, importance, confidence, subject_entity_id,
          project, valid_from, valid_to, event_time, supersedes_id, metadata, embedding)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector) RETURNING id""",
-        (mtype, p["content"], p.get("title"), p.get("lang", "ru"),
+        (mtype, content, title, p.get("lang", "ru"),
          p.get("importance", 0.5), p.get("confidence", 0.8), subj_id,
          p.get("project"), p.get("valid_from"), p.get("valid_to"), p.get("event_time"),
-         supersedes_id, json.dumps(p.get("metadata", {})), embed(p["content"])))
+         supersedes_id, json.dumps(p.get("metadata", {})), embed(content)))
     mid = cur.fetchone()[0]
     if supersedes_id:
         # Close the old fact's validity window at the moment the new one takes over. LEAST (not
@@ -80,7 +86,7 @@ def do_write(cur, p, supersedes_id=None):
     cur.execute("""INSERT INTO mem.sources (memory_id, source_type, session_id, channel, excerpt)
                    VALUES (%s,%s,%s,%s,%s)""",
                 (mid, src.get("source_type", "manual"), src.get("session_id"),
-                 src.get("channel"), src.get("excerpt")))
+                 src.get("channel"), scrub(src.get("excerpt"))))
     for a in p.get("assertions", []):
         cur.execute("""INSERT INTO mem.assertions
             (memory_id, subject_entity_id, predicate, object_text, object_number, unit)

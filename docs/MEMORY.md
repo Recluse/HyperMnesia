@@ -56,6 +56,15 @@ Optional, and the only Claude-Code-specific part. Register in Claude Code settin
 Injected memory is wrapped in a nonce-fenced block marked as *data, not instructions*, and the
 content is defanged, so a poisoned memory can't smuggle directives into the agent.
 
+**Secret redaction on capture.** Memory is distilled from raw coding-session transcripts, which
+routinely hold API keys, tokens and connection strings. Every write path — hook extract, the
+`memory_write` MCP tool, supersede, and consolidation merges — funnels through `do_write`, which
+runs `ingest/_redact.py` over the content, title, and source excerpt *before* they are stored or
+embedded. Structured secrets (OpenAI/Anthropic/GitHub/GitLab/AWS/Google/Slack keys, JWTs, private
+keys, `name=value` credentials, and passwords inside connection URLs) become `[REDACTED:<kind>]` —
+the fact that a secret existed survives, the secret does not. Best-effort (known shapes, not a
+guarantee); ordinary prose like "the password reset flow" is left untouched.
+
 **The LLM step is pluggable** (see `hooks/_llm.py`): set `HM_LLM_BACKEND` to `openai`
 (`HM_LLM_URL`/`HM_LLM_KEY`/`HM_LLM_MODEL`), `ollama` (`HM_LLM_MODEL`), or `cli` (`HM_LLM_CMD`).
 Auto-selected if unset: openai when `HM_LLM_URL` is set, else cli when `HM_LLM_CMD` is set, else ollama. It only needs to turn text into a small JSON array of memory items; nothing about the
