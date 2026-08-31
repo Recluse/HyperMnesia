@@ -46,6 +46,34 @@ env (`DATABASE_URL`, `EMBED_BACKEND`, and `HM_LLM*` for the schedule jobs). Exam
 Set `HM_REPO` in the hook env (or rely on the cwd basename) so the constraint hook scopes to the
 right repo, matching the MCP server.
 
+## Other clients (e.g. Codex CLI)
+
+The hooks aren't Claude-specific — they read a JSON event on stdin and print injected context to
+stdout. **Any agent that speaks the same hook contract can use them.** [Codex
+CLI](https://github.com/openai/codex), for instance, uses the same event model (a `hooks.json`
+with `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `Stop`), so the memory-injection hooks
+drop straight into `~/.codex/hooks.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart":    [{"hooks": [{"type": "command", "command": "python3 /opt/hypermnesia/hooks/mem_profile.py"}]}],
+    "UserPromptSubmit":[{"hooks": [{"type": "command", "command": "python3 /opt/hypermnesia/hooks/mem_recall.py"}]}]
+  }
+}
+```
+
+Two caveats when porting to a non-Claude client:
+
+- **`mem_capture`** enqueues the client's *transcript path*; the extractor then parses that
+  transcript. If the client stores sessions in a different format/location, capture needs a small
+  adapter for that format — the injection hooks above don't.
+- **`arch_invariants`** matches the `Edit|Write|MultiEdit` tool names. A client whose edit tool is
+  named differently (Codex uses `apply_patch`/`shell`) needs its own matcher; the resolver itself
+  is client-agnostic.
+
+So profile + recall are portable as-is; capture and the constraint hook need a per-client touch.
+
 The hooks read `DATABASE_URL` / `EMBED_BACKEND` from their environment (Claude Code passes the
 shell env through). Keep those exported, or set them in the hook command.
 
