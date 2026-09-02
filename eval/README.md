@@ -24,17 +24,25 @@ Probes:
 Run it after any change to the memory retrieval path. It needs an embedder (Ollama/TEI) and `psql`
 on `PATH`; point `HM_PYTHON` / `HM_MEM_OPS` at your interpreter / `mem_ops.py` if not the defaults.
 
-### Known finding: abstention vs. the lexical leg
+### Finding (fixed): abstention vs. the lexical leg
 
-Running this against a populated store surfaced a real weakness worth recording. The distance gate
-(`MEM_SEM_MAXDIST`, default 0.6) only gates the **semantic** leg of the hybrid search. The
-**lexical** leg (`tsvector`) is OR-converted and includes a `simple` (no-stopword) component, so a
-query sharing even a single common token with a memory produces a lexical hit that survives with no
-relevance floor — defeating abstention for stopword-heavy queries (e.g. a Russian "recipe for
-borscht…" returned unrelated infra memories via `на`/`с`/`и`). Separately, even the semantic gate at
-0.6 is loose for bge-m3: measured unrelated queries land ~0.51–0.67 while genuine paraphrases sit
-~0.34, so a topically-adjacent-but-unrelated query can slip under 0.6.
+Running this against a populated store surfaced two real weaknesses, both now fixed in
+`ingest/mem_ops.py` and worth recording so the design intent survives:
 
-The probe here uses a query orthogonal enough to pass at the current settings; closing the gap for
-real is a retrieval-tuning task (a lexical relevance floor + revisiting `MEM_SEM_MAXDIST`), to be
-measured against recall so it doesn't trade abstention for misses.
+1. **The lexical leg had no relevance floor.** The hybrid query is OR-converted (deliberately, so
+   identifiers and unstemmed forms match), and the composite `tsvector` includes a `simple`
+   (no-stopword) component. So a query sharing *one* incidental token with a memory — a stopword
+   like `на`/`the`, or a content word like `high` — produced a lexical hit that bypassed the
+   semantic distance gate entirely. A Russian "recipe for borscht…" returned five unrelated infra
+   memories. Fix: a lexical-only hit is kept only if it is also semantically plausible
+   (`embedding <=> query < MEM_LEX_MAXDIST`, which defaults to `MEM_SEM_MAXDIST` itself — no slack, since unrelated memories start right above the gate). The lexical leg's job
+   is to rescue near-misses of the semantic gate, not to admit strangers. The simple-leg *query*
+   also drops stopwords and ≤2-char tokens to cut ranking noise.
+2. **The semantic gate was loose for bge-m3.** Measured on a populated store: genuine paraphrase
+   recall tops out ~0.45 (8 queries: 0.34–0.45), unrelated queries start ~0.52 (6 queries:
+   0.52–0.68). The old default of 0.6 let topically-adjacent-but-unrelated queries through as
+   noise. `MEM_SEM_MAXDIST` now defaults to **0.5**, in the measured gap; tune it per embedder with
+   the same kind of measurement (`mem_ops nearest` gives the distance).
+
+The abstention probe deliberately uses a query that shares stopwords with typical memories, so it
+regresses if either fix is undone.

@@ -128,9 +128,33 @@ SELECT m.id, m.memory_type::text, m.status::text, m.importance, m.confidence,
 FROM pool m
 LEFT JOIN semantic s ON s.id = m.id
 LEFT JOIN lexical  l ON l.id = m.id
-WHERE s.id IS NOT NULL OR l.id IS NOT NULL
+-- a lexical-only hit must still be semantically plausible: the lexical leg exists to rescue
+-- near-misses of the semantic gate (identifiers, unstemmed forms), not to admit a memory that
+-- merely shares one incidental token with the query. Without this floor, OR-converted lexical
+-- matching defeats abstention.
+WHERE s.id IS NOT NULL
+   OR (l.id IS NOT NULL AND (m.embedding IS NULL OR m.embedding <=> (SELECT emb FROM q) < {lexdist}))
 ORDER BY score DESC LIMIT %s;
 """
+
+
+# -- abstention: keep the lexical leg honest -------------------------------------------------
+# The composite tsvector has a `simple` (no-stopword) component so identifiers and unstemmed
+# words match. But the query is OR-converted, so a `simple` query built from raw text matches any
+# memory that shares a single stopword ("на", "с", "the", "at") -- a lexical hit with no relevance
+# floor that bypasses the semantic distance gate and defeats abstention. Fix at the source: the
+# simple-leg QUERY drops stopwords and <=2-char tokens; the stemmed leg is untouched (its config
+# already strips stopwords). Identifiers/code tokens (>=3 chars, not stopwords) still get through.
+_STOP = set("""a an and are as at be by for from has he in is it its of on or that the to was were
+will with this these those there their they them then than not no but if so do does did can could
+would should may might into onto over under out up down about after before between through during
+я ты он она оно мы вы они и а но или что это как так же для на в во с со к ко по о об от до из за
+над под при про без через между у не ни ли бы же то все всё вот еще ещё уже только очень был была
+были быть есть нет да их его её ему ей них нем нём них мой моя мое моё твой наш ваш свой""".split())
+
+def _simple_query(q):
+    toks = [t for t in re.findall(r"[\w\-]+", q or "", flags=re.U) if len(t) > 2 and t.lower() not in _STOP]
+    return " ".join(toks) if toks else "zzz-no-lexemes-zzz"   # nothing meaningful -> matches nothing
 
 
 def do_search(cur, p):
@@ -139,11 +163,19 @@ def do_search(cur, p):
     q = p["query"]
     types = p.get("types") or None
     proj = p.get("project")
-    maxdist = float(p.get("max_distance") or os.environ.get("MEM_SEM_MAXDIST", 0.6))
+    # 0.5 (was 0.6): measured on a populated bge-m3 store -- genuine paraphrase recall tops out
+    # ~0.45 (8 samples: 0.34-0.45) while unrelated queries start ~0.52 (6 samples: 0.52-0.68);
+    # 0.6 let topically-adjacent-but-unrelated queries through as noise instead of abstaining.
+    maxdist = float(p.get("max_distance") or os.environ.get("MEM_SEM_MAXDIST", 0.5))
+    # lexical-only hits must ALSO sit inside the semantic gate (see SEARCH_SQL). No slack: unrelated
+    # memories start ~0.52 on bge-m3, so a looser lexical gate re-admits exactly the noise the
+    # semantic gate rejects. The lexical leg still re-ranks (RRF) and can surface plausible hits
+    # outside the semantic top-30; identifier queries sit well inside the gate anyway.
+    lexdist = float(os.environ.get("MEM_LEX_MAXDIST", 0) or maxdist)
     cur.execute("SET hnsw.ef_search = 100")
     cur.execute("SET hnsw.iterative_scan = relaxed_order")
-    cur.execute(SEARCH_SQL.format(src=src, maxdist=maxdist, lang=FTS_LANG),
-                (emb, q, q, proj, proj, types, types, p.get("k", 8)))
+    cur.execute(SEARCH_SQL.format(src=src, maxdist=maxdist, lexdist=lexdist, lang=FTS_LANG),
+                (emb, q, _simple_query(q), proj, proj, types, types, p.get("k", 8)))
     rows = cur.fetchall()
     ids = [r[0] for r in rows]
     if ids and not p.get("include_inactive"):
