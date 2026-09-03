@@ -13,6 +13,9 @@ from _mem_common import psql, read_stdin_json, fence
 CACHE = "/tmp/hypermnesia-profile-cache.txt"
 TTL = 300
 REVIEW_LINE = ("[Waiting for your review] {n} consolidation proposal(s) queued (oldest {d}) -- run: python3 hooks/mem_review.py list")
+DOWN_NOTE = ("Long-term memory is CURRENTLY UNAVAILABLE (the store did not answer). Proceed "
+             "without it and do not treat it as empty: absence of memories here proves nothing.")
+STALE_NOTE = "NOTE: the store did not answer; this profile is a cached copy, {age} old."
 TRUNC = 220  # NB: content is whitespace-collapsed in SQL --
 # a multi-line memory (e.g. a reflect page) otherwise emits continuation lines
 # that match no #TAG# prefix and were silently dropped by the parser below.  # chars per memory line
@@ -73,6 +76,7 @@ def main():
             profile = open(CACHE, encoding="utf-8").read()
         except OSError:
             pass
+    stale_age = None
     if profile is None:
         profile = build_profile()
         if profile is not None:
@@ -81,11 +85,20 @@ def main():
                     f.write(profile)
             except OSError:
                 pass
-        elif os.path.exists(CACHE):  # cluster down -> stale cache
+        elif os.path.exists(CACHE):   # store unreachable -> serve the stale cache, but SAY so
             try:
                 profile = open(CACHE, encoding="utf-8").read()
+                stale_age = int((time.time() - os.path.getmtime(CACHE)) // 60)
             except OSError:
                 profile = None
+    if profile is None:
+        # Unreachable AND no cache: emit the one honest line instead of nothing, so a silently
+        # memory-less machine is visible rather than looking like an empty store.
+        print(fence("profile", DOWN_NOTE, ""))
+        return
+    if stale_age is not None:
+        age = f"{stale_age} min" if stale_age < 120 else f"{stale_age // 60} h"
+        profile = STALE_NOTE.format(age=age) + "\n" + profile
     if profile:
         print(fence("profile",
                     "Owner's long-term memory (pinned; full search: the memory_search tool):",

@@ -33,6 +33,12 @@ work-session transcript. Extract ONLY durable, non-derivable knowledge useful in
 Do NOT save: transient task details, code contents, anything obvious from the repo, common \
 knowledge, or secrets / tokens / passwords.
 
+Do NOT store personal data about THIRD PARTIES. Memories are about the user. For anyone else \
+(colleagues, clients, testers, contractors) never record names, contact details, a role tied to \
+a name, health, location or other personal information. If the fact is useful without the \
+person, store it with a role instead of a name ("the project's tester", "a network engineer"). \
+If it only makes sense with the name, do not store it at all.
+
 Answer STRICTLY as a JSON array (may be empty []), no prose, no markdown fences, each item:
 {"type":"preference|semantic|episodic|prospective|procedural","content":"one self-contained \
 sentence","importance":0.0-1.0,"confidence":0.0-1.0,"project":"repo name or null"}
