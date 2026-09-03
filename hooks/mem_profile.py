@@ -12,15 +12,17 @@ from _mem_common import psql, read_stdin_json, fence
 
 CACHE = "/tmp/hypermnesia-profile-cache.txt"
 TTL = 300
-TRUNC = 220  # chars per memory line
+TRUNC = 220  # NB: content is whitespace-collapsed in SQL --
+# a multi-line memory (e.g. a reflect page) otherwise emits continuation lines
+# that match no #TAG# prefix and were silently dropped by the parser below.  # chars per memory line
 
 SQL = r"""
-SELECT '#PREF# ' || id || '|' || left(content, %(t)s) FROM mem.active_memories
+SELECT '#PREF# ' || id || '|' || left(regexp_replace(content, '\s+', ' ', 'g'), %(t)s) FROM mem.active_memories
  WHERE memory_type='preference' ORDER BY importance DESC, created_at DESC LIMIT 10;
-SELECT '#FACT# ' || id || '|' || left(content, %(t)s) FROM mem.active_memories
+SELECT '#FACT# ' || id || '|' || left(regexp_replace(content, '\s+', ' ', 'g'), %(t)s) FROM mem.active_memories
  WHERE memory_type IN ('semantic','procedural') AND importance >= 0.6
  ORDER BY importance DESC, created_at DESC LIMIT 10;
-SELECT '#PLAN# ' || id || '|' || left(content, %(t)s) FROM mem.active_memories
+SELECT '#PLAN# ' || id || '|' || left(regexp_replace(content, '\s+', ' ', 'g'), %(t)s) FROM mem.active_memories
  WHERE memory_type='prospective' ORDER BY importance DESC, created_at DESC LIMIT 5;
 """.replace("%(t)s", str(TRUNC))
 

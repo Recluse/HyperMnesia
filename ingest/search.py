@@ -65,6 +65,36 @@ def _tune(cur):
         pass
 
 
+# -- lexical query hygiene ---------------------------------------------------------------------
+# Two defects this fixes, both caused by feeding RAW query text to websearch_to_tsquery and then
+# rewriting '&'->'|':
+#   1. the `simple` config keeps stopwords, so an OR'd query sharing one stopword ("the", "на")
+#      matches essentially every chunk -> 50 arbitrary lexical rows enter the RRF pool as noise;
+#   2. a leading '-' becomes a NEGATED lexeme ("!word") which, OR'd with the rest, is true for
+#      every document lacking that word -> the lexical leg degenerates to match-everything.
+# The stemmed leg drops stopwords itself, so it only needs the negation neutralised.
+_STOP = set("""a an and are as at be by for from has he in is it its of on or that the to was were
+will with this these those there their they them then than not no but if so do does did can could
+would should may might into onto over under out up down about after before between through during
+я ты он она оно мы вы они и а но или что это как так же для на в во с со к ко по о об от до из за
+над под при про без через между у не ни ли бы же то все всё вот еще ещё уже только очень был была
+были быть есть нет да их его её ему ей них нем нём них мой моя мое моё твой наш ваш свой""".split())
+
+
+def _no_neg(q):
+    """Strip leading/trailing dashes from every token so nothing becomes a negated lexeme."""
+    toks = [t.strip("-") for t in re.findall(r"[\w\-]+", q or "", flags=re.U)]
+    toks = [t for t in toks if t]
+    return " ".join(toks) if toks else "zzz-no-lexemes-zzz"
+
+
+def _lex_query(q):
+    """Simple-leg query: no negation, no stopwords, no <=2-char tokens. Identifiers survive."""
+    toks = [t.strip("-") for t in re.findall(r"[\w\-]+", q or "", flags=re.U)]
+    toks = [t for t in toks if len(t) > 2 and t.lower() not in _STOP]
+    return " ".join(toks) if toks else "zzz-no-lexemes-zzz"
+
+
 def _query_vec(query):
     # Fail-open: if the embedder is down/slow, return None -> the SQL gets NULL::vector, the
     # semantic leg yields nothing, and search degrades to lexical-only instead of erroring.
@@ -78,7 +108,7 @@ def search(query, k=8, repo=None):
     emb = _query_vec(query)
     conn = connect(); cur = conn.cursor()
     _tune(cur)
-    cur.execute(RRF_SQL, (emb, query, query, repo, max(k * 8, 40)))
+    cur.execute(RRF_SQL, (emb, _no_neg(query), _lex_query(query), repo, max(k * 8, 40)))
     per_doc, rows = {}, []
     for r in cur.fetchall():                 # cap 2 chunks/doc so one doc can't monopolise top-k
         doc = r[0]
@@ -104,7 +134,7 @@ def candidates(query, pool, repo):
     conn = connect(); cur = conn.cursor()
     _tune(cur)
     cur.execute(RRF_SQL.replace("left(c.content,110)", "left(c.content,512)"),
-                (emb, query, query, repo, pool))
+                (emb, _no_neg(query), _lex_query(query), repo, pool))
     out = [{"doc": doc, "heading": heading,
             "score": float(score) if score is not None else None,
             "srank": srank, "lrank": lrank, "text": snippet}

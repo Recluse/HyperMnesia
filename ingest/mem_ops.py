@@ -33,6 +33,17 @@ def embed(text):
     return vec_literal(embed_query(text))
 
 
+def _scrub_deep(obj):
+    """scrub() every string inside a nested JSON-ish structure (used for metadata)."""
+    if isinstance(obj, str):
+        return scrub(obj)
+    if isinstance(obj, list):
+        return [_scrub_deep(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _scrub_deep(v) for k, v in obj.items()}
+    return obj
+
+
 def ensure_entity(cur, subj):
     cur.execute("""INSERT INTO mem.entities (namespace, entity_type, canonical_name, aliases)
                    VALUES (%s,%s,%s,%s)
@@ -40,8 +51,8 @@ def ensure_entity(cur, subj):
                    DO UPDATE SET aliases = (SELECT array(SELECT DISTINCT unnest(
                        mem.entities.aliases || EXCLUDED.aliases)))
                    RETURNING id""",
-                (subj["namespace"], subj["entity_type"], subj["name"],
-                 subj.get("aliases", [])))
+                (subj["namespace"], subj["entity_type"], scrub(subj["name"]),
+                 [scrub(a) for a in (subj.get("aliases") or [])]))
     return cur.fetchone()[0]
 
 
@@ -72,7 +83,7 @@ def do_write(cur, p, supersedes_id=None):
         (mtype, content, title, p.get("lang", "ru"),
          p.get("importance", 0.5), p.get("confidence", 0.8), subj_id,
          p.get("project"), p.get("valid_from"), p.get("valid_to"), p.get("event_time"),
-         supersedes_id, json.dumps(p.get("metadata", {})), embed(content)))
+         supersedes_id, json.dumps(_scrub_deep(p.get("metadata", {}))), embed(content)))
     mid = cur.fetchone()[0]
     if supersedes_id:
         # Close the old fact's validity window at the moment the new one takes over. LEAST (not
@@ -85,14 +96,14 @@ def do_write(cur, p, supersedes_id=None):
     src = p.get("source") or {}
     cur.execute("""INSERT INTO mem.sources (memory_id, source_type, session_id, channel, excerpt)
                    VALUES (%s,%s,%s,%s,%s)""",
-                (mid, src.get("source_type", "manual"), src.get("session_id"),
-                 src.get("channel"), scrub(src.get("excerpt"))))
+                (mid, src.get("source_type", "manual"), scrub(src.get("session_id")),
+                 scrub(src.get("channel")), scrub(src.get("excerpt"))))
     for a in p.get("assertions", []):
         cur.execute("""INSERT INTO mem.assertions
             (memory_id, subject_entity_id, predicate, object_text, object_number, unit)
             VALUES (%s,%s,%s,%s,%s,%s)""",
-            (mid, subj_id, a["predicate"], a.get("object_text"),
-             a.get("object_number"), a.get("unit")))
+            (mid, subj_id, scrub(a["predicate"]), scrub(a.get("object_text")),
+             a.get("object_number"), scrub(a.get("unit"))))
     return mid
 
 

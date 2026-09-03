@@ -111,6 +111,19 @@ def _neg_differs(a, b):
     return bool(_NEG.search(a)) != bool(_NEG.search(b))
 
 
+# Salient = the tokens a correction actually changes: numbers, identifiers/paths, and proper
+# nouns. A true paraphrase reorders words but keeps these identical; a correction ("prefers Zed"
+# -> "prefers Cursor", "1000 credits" -> "2000 credits") does not. Without this, a preference
+# change that carries no negation word was silently swallowed by the paraphrase skip.
+_SALIENT = re.compile(r"\b(?:\w*\d[\w.]*|[A-Za-z_][\w.-]*[._-][\w.-]*|[A-Z][A-Za-z0-9]{2,})\b")
+
+
+def _salient_differs(a, b):
+    sa = {t.lower() for t in _SALIENT.findall(a)}
+    sb = {t.lower() for t in _SALIENT.findall(b)}
+    return bool(sa ^ sb)
+
+
 def is_duplicate(content):
     cand = content.strip().lower()
     if not cand:
@@ -130,8 +143,10 @@ def is_duplicate(content):
         hit = json.loads(near) if near else {}
     except Exception:
         hit = {}
+    near_txt = hit.get("content") or ""
     if hit and hit.get("distance", 1.0) < NOVELTY_MAXDIST \
-            and not _neg_differs(cand, (hit.get("content") or "").lower()):
+            and not _neg_differs(cand, near_txt.lower()) \
+            and not _salient_differs(content, near_txt):
         return True
     return False
 

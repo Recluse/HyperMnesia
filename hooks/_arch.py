@@ -68,7 +68,11 @@ def _literal_prefix_len(glob):
 
 def resolve(path, components):
     """Every component whose key_paths match `path`, most-specific first -> [slug]."""
-    path = path.replace("\\", "/").lstrip("./")
+    # NB: lstrip() takes a CHARACTER SET, so lstrip("./") ate the leading dot of every
+    # dot-prefixed path (".gitlab-ci.yml" -> "gitlab-ci.yml", ".claude/x" -> "claude/x"),
+    # which no glob can then match -> Tier 1 silently reported "no component" for mapped
+    # files. Strip only a literal leading "./" (repeated), matching the Rust resolver.
+    path = re.sub(r"^(?:\./)+", "", path.replace("\\", "/"))
     hits = []
     for comp in components:
         best = None

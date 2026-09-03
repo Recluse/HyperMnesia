@@ -84,9 +84,11 @@ def main():
         lines.append(f"  (note: {', '.join(res['unmatched'])} maps to no component -- "
                      f"consider adding it to the map)")
 
+    # Inject context ONLY -- deliberately no permissionDecision. Emitting "allow" here would
+    # auto-approve every edit that happens to have a `must` invariant, silently bypassing the
+    # normal approval flow; "no opinion" is expressed by omitting the key.
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
-        "permissionDecision": "allow",
         "additionalContext": "\n".join(lines),
     }}))
     sys.exit(0)
