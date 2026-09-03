@@ -16,6 +16,8 @@ REVIEW_LINE = ("[Waiting for your review] {n} consolidation proposal(s) queued (
 DOWN_NOTE = ("Long-term memory is CURRENTLY UNAVAILABLE (the store did not answer). Proceed "
              "without it and do not treat it as empty: absence of memories here proves nothing.")
 STALE_NOTE = "NOTE: the store did not answer; this profile is a cached copy, {age} old."
+STALE_DAYS = int(os.environ.get("MEM_STALE_DAYS", "180"))
+STALE_LINE = ("[Possibly stale] {n} fact(s) older than {d} days have gone unrecalled -- check: python3 hooks/mem_review.py stale")
 TRUNC = 220  # NB: content is whitespace-collapsed in SQL --
 # a multi-line memory (e.g. a reflect page) otherwise emits continuation lines
 # that match no #TAG# prefix and were silently dropped by the parser below.  # chars per memory line
@@ -30,7 +32,12 @@ SELECT '#PLAN# ' || id || '|' || left(regexp_replace(content, '\s+', ' ', 'g'), 
  WHERE memory_type='prospective' ORDER BY importance DESC, created_at DESC LIMIT 5;
 SELECT '#REVQ# ' || count(*) || '|' || coalesce(min(created_at)::date::text,'')
   FROM mem.review_queue WHERE status='pending';
-""".replace("%(t)s", str(TRUNC))
+SELECT '#STALE# ' || count(*) FROM mem.active_memories
+  WHERE created_at < now() - make_interval(days => %(d)s)
+    AND memory_type IN ('semantic','episodic','prospective')
+    AND (metadata->>'kind') IS DISTINCT FROM 'page'
+    AND (last_accessed_at IS NULL OR last_accessed_at < now() - make_interval(days => %(d)s));
+""".replace("%(t)s", str(TRUNC)).replace("%(d)s", str(STALE_DAYS))
 
 
 def build_profile():
@@ -39,16 +46,19 @@ def build_profile():
         return None
     prefs, facts, plans = [], [], []
     revq = None
+    stale = None
     for line in raw.splitlines():
         if line.startswith("#PREF# "):
             prefs.append(line[7:].split("|", 1)[-1])
         elif line.startswith("#FACT# "):
             facts.append(line[7:].split("|", 1)[-1])
+        elif line.startswith("#STALE# "):
+            stale = line[8:].strip()
         elif line.startswith("#REVQ# "):
             revq = line[7:]
         elif line.startswith("#PLAN# "):
             plans.append(line[7:].split("|", 1)[-1])
-    if not (prefs or facts or plans or revq):
+    if not (prefs or facts or plans or revq or stale):
         return ""
     out = []                                   # body only; main() wraps it via fence()
     if prefs:
@@ -65,6 +75,8 @@ def build_profile():
         if cnt.isdigit() and int(cnt) > 0:
             out.append("")
             out.append(REVIEW_LINE.format(n=cnt, d=oldest or "?"))
+    if stale and stale.isdigit() and int(stale) > 0:
+        out.append(STALE_LINE.format(n=stale, d=STALE_DAYS))
     return "\n".join(out)
 
 

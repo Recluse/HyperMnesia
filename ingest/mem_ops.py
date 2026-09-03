@@ -251,6 +251,35 @@ def do_page_upsert(cur, p):
     return do_write(cur, payload, supersedes_id=row[0] if row else None)
 
 
+
+def do_stale_list(cur, p):
+    """Active memories that are old and have never been re-confirmed or displaced.
+
+    The design has no decay on purpose -- correctness comes from validity windows and explicit
+    supersede. But when nothing ever contradicts a fact, an entry whose truth quietly expired
+    (hardware swapped, a project phase ended, a preference changed without a negation word)
+    keeps scoring like a fresh one and keeps being injected as current. This is the fallback:
+    surface the old, never-touched entries so a human can confirm or retire them.
+
+    Preferences and procedures are excluded -- those are stated rules, not facts about a
+    mutable world, and they do not rot the same way. Pages are excluded (regenerated anyway).
+    """
+    days = int(p.get("days", 180))
+    cur.execute("""SELECT coalesce(json_agg(json_build_object(
+                     'id', id, 'type', memory_type, 'age_days', extract(day from now()-created_at)::int,
+                     'project', project, 'content', left(content, 160)) ORDER BY created_at), '[]')
+                   FROM mem.active_memories
+                   WHERE created_at < now() - make_interval(days => %s)
+                     AND memory_type IN ('semantic','episodic','prospective')
+                     AND (metadata->>'kind') IS DISTINCT FROM 'page'
+                     -- never recalled, or not recalled within the same window: a fact nobody
+                     -- has touched in months is exactly the one most likely to have gone stale
+                     AND (last_accessed_at IS NULL
+                          OR last_accessed_at < now() - make_interval(days => %s))
+                   LIMIT %s""", (days, days, int(p.get("limit", 50))))
+    return cur.fetchone()[0]
+
+
 def fmt_row(r):
     mid, mtype, status, imp, conf, created, vfrom, vto, project, content, _ = r
     flags = f"{mtype} imp={imp:.1f}"
@@ -320,6 +349,8 @@ def main():
             print(fmt_row(r))
     elif cmd == "nearest":
         print(json.dumps(do_nearest(cur, p)))
+    elif cmd == "stale_list":
+        print(json.dumps(do_stale_list(cur, p)))
     elif cmd == "reflect_targets":
         # psycopg2 deserializes a json column to a Python object -> re-serialize to real JSON
         print(json.dumps(do_reflect_targets(cur, p)))
