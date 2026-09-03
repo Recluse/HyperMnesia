@@ -21,7 +21,7 @@ recency + importance as tiebreakers.
 import re
 import sys, json, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import connect, embed_query, vec_literal
+from _common import EMBED_MODEL, connect, embed_query, vec_literal
 from _redact import scrub
 
 FTS_LANG = os.environ.get("HM_FTS_LANG", "english")
@@ -78,12 +78,14 @@ def do_write(cur, p, supersedes_id=None):
         mtype = mtype or row[0]
     cur.execute("""INSERT INTO mem.memories
         (memory_type, content, title, lang, importance, confidence, subject_entity_id,
-         project, valid_from, valid_to, event_time, supersedes_id, metadata, embedding)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector) RETURNING id""",
+         project, valid_from, valid_to, event_time, supersedes_id, metadata, embedding,
+         embedding_model)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector,%s) RETURNING id""",
         (mtype, content, title, p.get("lang", "ru"),
          p.get("importance", 0.5), p.get("confidence", 0.8), subj_id,
          p.get("project"), p.get("valid_from"), p.get("valid_to"), p.get("event_time"),
-         supersedes_id, json.dumps(_scrub_deep(p.get("metadata", {}))), embed(content)))
+         supersedes_id, json.dumps(_scrub_deep(p.get("metadata", {}))), embed(content),
+         EMBED_MODEL))
     mid = cur.fetchone()[0]
     if supersedes_id:
         # Close the old fact's validity window at the moment the new one takes over. LEAST (not

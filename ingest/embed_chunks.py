@@ -10,7 +10,7 @@ Env: DATABASE_URL, EMBED_BACKEND/OLLAMA_URL/TEI_URL (see _common), EMBED_BATCH (
 """
 import os, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import connect, embed_texts, vec_literal
+from _common import EMBED_MODEL, connect, embed_texts, vec_literal
 
 BATCH = int(os.environ.get("EMBED_BATCH", "16"))
 SHARD_N = int(os.environ.get("SHARD_N", "1"))
@@ -54,8 +54,9 @@ def main():
                 conn.rollback()
                 continue
         for cid, prefix, v in zip(ids, prefixes, vecs):
-            cur.execute("UPDATE chunks SET embedding = %s::vector, context_prefix = %s WHERE id = %s",
-                        (vec_literal(v), prefix, cid))
+            cur.execute("UPDATE chunks SET embedding = %s::vector, context_prefix = %s, "
+                        "embedding_model = %s WHERE id = %s",
+                        (vec_literal(v), prefix, EMBED_MODEL, cid))
         conn.commit()
         done += len(batch)
         if done % (BATCH * 10) < BATCH:

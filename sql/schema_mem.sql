@@ -49,7 +49,12 @@ CREATE TABLE IF NOT EXISTS mem.memories (
     supersedes_id     BIGINT REFERENCES mem.memories(id),
     metadata          JSONB NOT NULL DEFAULT '{}',
     fts               TSVECTOR,
-    embedding         vector(1024)
+    embedding         vector(1024),
+    -- Which model produced `embedding`. Vectors from different models are NOT comparable,
+    -- and a silently-updated upstream tag would degrade cosine search with no error at all;
+    -- stamping it per row makes a mismatch detectable and lets a re-embed target only the
+    -- stale rows instead of the whole corpus.
+    embedding_model TEXT
 );
 
 -- Optional exact-lookup index over memories (subject-predicate-object).

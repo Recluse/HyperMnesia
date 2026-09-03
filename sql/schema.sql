@@ -70,6 +70,11 @@ CREATE TABLE IF NOT EXISTS chunks (
     content        TEXT NOT NULL,
     context_prefix TEXT,                  -- optional contextual-retrieval prefix
     embedding      vector(1024),          -- bge-m3 dense (filled by the embedder)
+    -- Which model produced `embedding`. Vectors from different models are NOT comparable,
+    -- and a silently-updated upstream tag would degrade cosine search with no error at all;
+    -- stamping it per row makes a mismatch detectable and lets a re-embed target only the
+    -- stale rows instead of the whole corpus.
+    embedding_model TEXT,
     fts            tsvector,              -- composite <lang> || simple
     token_count    INT
 );
