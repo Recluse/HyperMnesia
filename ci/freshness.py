@@ -26,19 +26,27 @@ from hooks._arch import _glob_matches         # noqa: E402
 
 
 def list_tracked(repo_dir):
-    """All tracked files (git ls-files, else filtered os.walk). Component key_paths point at
-    CODE, not just markdown -- the orphan check must see the whole tree or every code component
-    reads as orphaned."""
+    """Every file that actually exists in the tree: the UNION of the git index and a filtered
+    walk of the working directory.
+
+    Neither source alone is enough, and using only one produces false orphans:
+      * `git ls-files` misses anything present but untracked -- CUSTOMS tracks 16 files under
+        sourcecode/ while 96k sit on disk, so every `sourcecode/**` glob looked orphaned;
+      * a walk alone misses nothing here, but the index is still worth unioning in for trees
+        where files are tracked yet not materialised (sparse checkouts).
+    Component key_paths point at CODE, so this must see the whole tree, not just markdown.
+    """
+    files = set()
     try:
-        out = subprocess.check_output(["git", "-C", repo_dir, "ls-files"],
-                                      stderr=subprocess.DEVNULL).decode().splitlines()
+        files.update(subprocess.check_output(["git", "-C", repo_dir, "ls-files"],
+                                             stderr=subprocess.DEVNULL).decode().splitlines())
     except Exception:
-        out = []
-        for root, dirs, fs in os.walk(repo_dir):
-            dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
-            for fn in fs:
-                out.append(os.path.relpath(os.path.join(root, fn), repo_dir).replace("\\", "/"))
-    return [f for f in out if not (set(f.replace("\\", "/").split("/")) & _SKIP_DIRS)]
+        pass
+    for root, dirs, fs in os.walk(repo_dir):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+        for fn in fs:
+            files.add(os.path.relpath(os.path.join(root, fn), repo_dir).replace("\\", "/"))
+    return [f for f in files if not (set(f.replace("\\", "/").split("/")) & _SKIP_DIRS)]
 
 
 def main():
