@@ -20,6 +20,8 @@ jobs:
           ruff check --select E9,F63,F7,F82 ingest hooks rerank ci
       - name: GRAPH_SQL parity (hook copy vs Rust source of truth)
         run: python ci/check_graph_sql_parity.py
+      - name: Hook I/O contract (hooks are fail-open, so a broken contract is silent)
+        run: python tests/test_hook_contract.py
 
   rust:
     runs-on: ubuntu-latest
