@@ -12,6 +12,7 @@ from _mem_common import psql, read_stdin_json, fence
 
 CACHE = "/tmp/hypermnesia-profile-cache.txt"
 TTL = 300
+REVIEW_LINE = ("[Waiting for your review] {n} consolidation proposal(s) queued (oldest {d}) -- run: python3 hooks/mem_review.py list")
 TRUNC = 220  # NB: content is whitespace-collapsed in SQL --
 # a multi-line memory (e.g. a reflect page) otherwise emits continuation lines
 # that match no #TAG# prefix and were silently dropped by the parser below.  # chars per memory line
@@ -24,6 +25,8 @@ SELECT '#FACT# ' || id || '|' || left(regexp_replace(content, '\s+', ' ', 'g'), 
  ORDER BY importance DESC, created_at DESC LIMIT 10;
 SELECT '#PLAN# ' || id || '|' || left(regexp_replace(content, '\s+', ' ', 'g'), %(t)s) FROM mem.active_memories
  WHERE memory_type='prospective' ORDER BY importance DESC, created_at DESC LIMIT 5;
+SELECT '#REVQ# ' || count(*) || '|' || coalesce(min(created_at)::date::text,'')
+  FROM mem.review_queue WHERE status='pending';
 """.replace("%(t)s", str(TRUNC))
 
 
@@ -32,14 +35,17 @@ def build_profile():
     if raw is None:
         return None
     prefs, facts, plans = [], [], []
+    revq = None
     for line in raw.splitlines():
         if line.startswith("#PREF# "):
             prefs.append(line[7:].split("|", 1)[-1])
         elif line.startswith("#FACT# "):
             facts.append(line[7:].split("|", 1)[-1])
+        elif line.startswith("#REVQ# "):
+            revq = line[7:]
         elif line.startswith("#PLAN# "):
             plans.append(line[7:].split("|", 1)[-1])
-    if not (prefs or facts or plans):
+    if not (prefs or facts or plans or revq):
         return ""
     out = []                                   # body only; main() wraps it via fence()
     if prefs:
@@ -51,6 +57,11 @@ def build_profile():
     if plans:
         out.append("[Open plans/intentions]")
         out += [f"- {p}" for p in plans]
+    if revq:
+        cnt, _, oldest = revq.partition("|")
+        if cnt.isdigit() and int(cnt) > 0:
+            out.append("")
+            out.append(REVIEW_LINE.format(n=cnt, d=oldest or "?"))
     return "\n".join(out)
 
 
