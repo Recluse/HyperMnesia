@@ -141,13 +141,20 @@ def main():
                     print(f"    merge write FAILED, keeping originals intact: {r!r}")
                     continue
                 print(f"    {r.strip()}")
+                # link every loser to the replacement, so "what displaced this fact" stays
+                # answerable; the merge path never sets supersedes_id (separate write + mark).
+                try:
+                    new_id = int(r.split("[#", 1)[1].split("]", 1)[0])
+                except (IndexError, ValueError):
+                    new_id = None
                 for m in g:
-                    mem_ops("mark", {"id": m, "status": "superseded"}, timeout=20)
+                    mem_ops("mark", {"id": m, "status": "superseded", "by": new_id}, timeout=20)
                 changed = True
             elif action == "supersede" and verdict.get("winner_id") in g:
                 for m in g:
                     if m != verdict["winner_id"]:
-                        mem_ops("mark", {"id": m, "status": "superseded"}, timeout=20)
+                        mem_ops("mark", {"id": m, "status": "superseded",
+                                         "by": verdict["winner_id"]}, timeout=20)
                         print(f"    marked #{m} superseded (winner #{verdict['winner_id']})")
                 changed = True
         if changed and not dry:

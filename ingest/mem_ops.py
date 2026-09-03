@@ -274,18 +274,23 @@ def apply_proposal(cur, action, member_ids, proposal):
             "type": proposal.get("type", "semantic"),
             "content": proposal["content"],
             "importance": min(0.7, max(0.0, float(proposal.get("importance", 0.6)))),
+            "metadata": {"merged_from": list(member_ids)},
             "source": {"source_type": "consolidation", "channel": "review",
                        "excerpt": f"merged from {member_ids}"}})
         for m in member_ids:
             cur.execute("UPDATE mem.memories SET status='superseded', "
-                        "valid_to=COALESCE(valid_to, now()) WHERE id=%s AND status='active'", (m,))
+                        "valid_to=COALESCE(valid_to, now()), "
+                        "metadata = metadata || jsonb_build_object('superseded_by', %s::bigint) "
+                        "WHERE id=%s AND status='active'", (mid, m))
         return f"merged {member_ids} -> [#{mid}]"
     if action == "supersede" and proposal.get("winner_id") in member_ids:
         win = proposal["winner_id"]
         for m in member_ids:
             if m != win:
                 cur.execute("UPDATE mem.memories SET status='superseded', "
-                            "valid_to=COALESCE(valid_to, now()) WHERE id=%s AND status='active'", (m,))
+                            "valid_to=COALESCE(valid_to, now()), "
+                            "metadata = metadata || jsonb_build_object('superseded_by', %s::bigint) "
+                            "WHERE id=%s AND status='active'", (win, m))
         return f"superseded {[m for m in member_ids if m != win]} (winner #{win})"
     return "no-op (proposal did not match action)"
 
@@ -326,9 +331,16 @@ def main():
         # admin op for the consolidator: flip status without a replacement memory
         status = p["status"]
         assert status in ("active", "superseded", "retracted", "expired")
+        # Provenance: record WHAT displaced this memory. The row surviving is not enough --
+        # without this link "what replaced this fact, and why" is unanswerable, which was the
+        # case for 146 of 148 superseded rows (the consolidator marks losers separately from
+        # writing the replacement, so supersedes_id stays NULL on that path).
+        by = p.get("by")
         cur.execute("UPDATE mem.memories SET status=%s::mem.memory_status, "
-                    "valid_to=COALESCE(valid_to, CASE WHEN %s<>'active' THEN now() END) "
-                    "WHERE id=%s RETURNING id", (status, status, p["id"]))
+                    "valid_to=COALESCE(valid_to, CASE WHEN %s<>'active' THEN now() END), "
+                    "metadata = metadata || CASE WHEN %s::bigint IS NULL THEN '{}'::jsonb "
+                    "ELSE jsonb_build_object('superseded_by', %s::bigint) END "
+                    "WHERE id=%s RETURNING id", (status, status, by, by, p["id"]))
         row = cur.fetchone()
         conn.commit()
         print(f"marked [#{p['id']}] {status}" if row else "(not found)")
