@@ -110,7 +110,7 @@ See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full system picture
 | `mcp-server/` | Rust MCP server exposing project map / constraints / search / memory tools |
 | `deploy/` | docker-compose (single box) + Kubernetes manifests |
 | `examples/` | an example structural-tier seed for a project |
-| `skills/` | `onboard-project` — the six steps to connect a new repo (agent-readable skill) |
+| `skills/` | `onboard-project` — the six steps to connect a new repo; `just` — answer-only / audit mode (agent-readable skills) |
 
 ## Install
 
@@ -134,6 +134,7 @@ python ingest/embed_chunks.py     # fill embeddings
 - [docs/MEMORY.md](docs/MEMORY.md) — the personal-memory model (bi-temporal, supersede, consolidation).
 - [docs/COMPARISON.md](docs/COMPARISON.md) — where HyperMnesia fits vs. neighbours, and honest non-goals/limitations.
 - [skills/onboard-project/SKILL.md](skills/onboard-project/SKILL.md) — connecting a repository: ingest, the Tier 0/1 map, pairing with Serena, verification, and what changes per deployment.
+- [skills/just/SKILL.md](skills/just/SKILL.md) — `/just`: answer the question literally with read-only tools and stop; the contract is checkable from the tool log. Session-wide as "audit mode".
 
 ## License
 
