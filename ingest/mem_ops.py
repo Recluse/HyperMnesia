@@ -44,6 +44,34 @@ def _scrub_deep(obj):
     return obj
 
 
+
+def _proj_key(name):
+    return "".join(ch for ch in (name or "").lower() if ch not in "-_ ")
+
+
+def canon_project(cur, name):
+    """Map a project tag to its canonical spelling.
+
+    The extractor emits whatever the model wrote, so one project ends up split across
+    'NES_Player' / 'NES-Player' / 'nes-player' and project-scoped recall silently drops the
+    variants. Canonical = the structural map's repo tag when one matches (case/punctuation
+    insensitive), else the spelling already carried by the most memories, else the name as given.
+    """
+    if not name:
+        return name
+    key = _proj_key(name)
+    cur.execute("SELECT repo FROM components GROUP BY repo")
+    for (repo,) in cur.fetchall():
+        if _proj_key(repo) == key:
+            return repo
+    cur.execute("""SELECT project FROM mem.memories WHERE project IS NOT NULL
+                   GROUP BY project ORDER BY count(*) DESC""")
+    for (proj,) in cur.fetchall():
+        if _proj_key(proj) == key:
+            return proj
+    return name
+
+
 def ensure_entity(cur, subj):
     cur.execute("""INSERT INTO mem.entities (namespace, entity_type, canonical_name, aliases)
                    VALUES (%s,%s,%s,%s)
@@ -83,7 +111,7 @@ def do_write(cur, p, supersedes_id=None):
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector,%s) RETURNING id""",
         (mtype, content, title, p.get("lang", "ru"),
          p.get("importance", 0.5), p.get("confidence", 0.8), subj_id,
-         p.get("project"), p.get("valid_from"), p.get("valid_to"), p.get("event_time"),
+         canon_project(cur, p.get("project")), p.get("valid_from"), p.get("valid_to"), p.get("event_time"),
          supersedes_id, json.dumps(_scrub_deep(p.get("metadata", {}))), embed(content),
          EMBED_MODEL))
     mid = cur.fetchone()[0]
@@ -175,7 +203,7 @@ def do_search(cur, p):
     emb = embed(p["query"])
     q = p["query"]
     types = p.get("types") or None
-    proj = p.get("project")
+    proj = canon_project(cur, p.get("project"))
     # 0.5 (was 0.6): measured on a populated bge-m3 store -- genuine paraphrase recall tops out
     # ~0.45 (8 samples: 0.34-0.45) while unrelated queries start ~0.52 (6 samples: 0.52-0.68);
     # 0.6 let topically-adjacent-but-unrelated queries through as noise instead of abstaining.
@@ -202,7 +230,7 @@ def do_nearest(cur, p):
     Purpose-built for the extractor's novelty gate (isolated from `search` so its text format is
     untouched). Returns {"distance": float, "content": str} or {} if the store is empty."""
     emb = embed(scrub(p["content"]))   # scrub so a would-be-redacted candidate matches its stored form
-    proj = p.get("project")
+    proj = canon_project(cur, p.get("project"))
     # exclude synthesized pages: a page summarizes its sources, so it sits close to each of them --
     # counting it here would make the novelty gate suppress capture of the very memories it's built from.
     cur.execute("""SELECT content, (embedding <=> %s::vector) AS dist
@@ -234,18 +262,19 @@ def do_reflect_group(cur, p):
                      ORDER BY importance DESC),'[]')
                    FROM mem.active_memories
                    WHERE (metadata->>'kind') IS DISTINCT FROM 'page' AND project = %s""",
-                (p["project"],))
+                (canon_project(cur, p["project"]),))
     return cur.fetchone()[0]
 
 
 def do_page_upsert(cur, p):
     """Write the project's knowledge page, superseding its prior page so it never goes stale
     (each reflect run rebuilds it from the current active memories)."""
+    proj = canon_project(cur, p.get("project"))
     cur.execute("""SELECT id FROM mem.active_memories
                    WHERE (metadata->>'kind')='page' AND project IS NOT DISTINCT FROM %s
-                   ORDER BY id DESC LIMIT 1""", (p.get("project"),))
+                   ORDER BY id DESC LIMIT 1""", (proj,))
     row = cur.fetchone()
-    payload = {**p, "type": "semantic",
+    payload = {**p, "project": proj, "type": "semantic",
                "metadata": {**(p.get("metadata") or {}), "kind": "page"},
                "importance": p.get("importance", 0.6), "confidence": p.get("confidence", 0.7)}
     return do_write(cur, payload, supersedes_id=row[0] if row else None)
