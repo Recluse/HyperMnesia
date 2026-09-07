@@ -53,6 +53,11 @@ Markdown only, chunked by heading. Two things to know before you trust the resul
   python ingest/ingest_repo.py /path/to/repo <repo-tag> out.sql --known-hashes known.tsv
   psql "$DATABASE_URL" -f out.sql
   ```
+
+  Take the snapshot from the database you are about to load into. The SQL checks that the repo
+  still holds as many documents as the snapshot describes and aborts if it doesn't — a snapshot
+  from another environment would silently skip documents that database never had, leaving a
+  corpus with holes that reads as "search finds nothing".
 - The chunker reads `# ` at line start as a heading even inside a ``` fence, so a runbook full
   of YAML comments can pick up a phantom heading path. Check a few chunks of your most
   code-heavy doc before assuming the corpus is clean.

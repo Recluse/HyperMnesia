@@ -16,6 +16,11 @@ still needs no database connection of its own:
       -c "SELECT path, content_hash FROM documents WHERE repo='myrepo'" > known.tsv
     python ingest_repo.py ~/code/myrepo myrepo out.sql --known-hashes known.tsv
 
+Take that snapshot from the database you are about to load into: the emitted SQL asserts that
+the repo still holds exactly as many documents as the file describes and aborts if it does
+not, because a snapshot from elsewhere would mark documents "already stored" that were never
+there -- a corpus with holes that only shows up as missing search results.
+
 Env: HM_FTS_LANG (default 'english') -- the Postgres text-search config for stemming; 'simple'
 is always added alongside so exact tokens (code identifiers, IDs) match regardless of language.
 """
@@ -228,6 +233,18 @@ def main():
     with open(out, "w", encoding="utf-8") as f:
         f.write("BEGIN;\n")
         if incremental:
+            # The TSV is trusted as ground truth about the DB, and a wrong one fails SILENTLY:
+            # a document listed with its current hash is treated as already stored, so if the
+            # DB never had that row it is simply never inserted -- an incomplete corpus that
+            # answers "no results" instead of erroring. Snapshot and apply must therefore
+            # describe the same rows; if they don't, abort the transaction rather than write a
+            # corpus with holes in it.
+            f.write("DO $do$ DECLARE n int; BEGIN\n"
+                    f"  SELECT count(*) INTO n FROM documents WHERE repo = {sqlstr(repo)};\n"
+                    f"  IF n <> {len(known)} THEN RAISE EXCEPTION\n"
+                    f"    'known-hashes describes % documents but repo {repo} holds % -- "
+                    f"stale or wrong snapshot, refusing incremental ingest', {len(known)}, n;\n"
+                    "  END IF;\nEND $do$;\n")
             # freshness.py flags documents whose git_commit != HEAD, so leaving untouched rows
             # at their old commit would report the entire corpus as stale after any commit.
             # Their CONTENT is current as of this commit; only their chunks were not rewritten.
@@ -247,7 +264,7 @@ def main():
         f.write("COMMIT;\n")
         # Re-ingest churns the repo's chunk set; refresh planner stats so the
         # HNSW/FTS cost estimates don't drift after a bulk DELETE+INSERT.
-        if bodies or (incremental and gone):
+        if not incremental or bodies or gone:
             f.write("ANALYZE chunks;\n")
     if incremental:
         sys.stderr.write(f"{repo}: {n_docs} docs re-emitted ({n_chunks} chunks), "

@@ -26,9 +26,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INGEST = os.path.join(ROOT, "ingest", "ingest_repo.py")
 
 failures = []
+ran = 0
 
 
 def check(name, cond):
+    global ran
+    ran += 1
     print(f"  {'ok  ' if cond else 'FAIL'} {name}")
     if not cond:
         failures.append(name)
@@ -68,6 +71,7 @@ def main():
         check("clears the whole repo", "DELETE FROM documents WHERE repo = 'testrepo';" in full)
         check("emits every document", all(f"'{n}'" in full for n in ("keep.md", "edit.md", "drop.md")))
         check("does not touch git_commit separately", "UPDATE documents SET git_commit" not in full)
+        check("emits no snapshot guard", "DO $do$" not in full)
 
         # What the DB would now hold. Real callers get this from psql; the hashes are just
         # sha256 of the file bytes, so the test can compute them the same way.
@@ -104,9 +108,15 @@ def main():
         check("refreshes git_commit so freshness.py stays honest",
               f"UPDATE documents SET git_commit = '{head}' WHERE repo = 'testrepo';" in inc)
         check("reports what it kept", "1 unchanged kept" in report and "1 removed" in report)
+        # A snapshot that does not describe the DB fails SILENTLY without this: a path listed
+        # with its current hash is skipped as "already stored", so a row the DB never had is
+        # never inserted and the corpus just answers "no results". The guard turns that into
+        # an aborted transaction.
+        check("aborts on a snapshot that does not match the DB",
+              "DO $do$" in inc and "IF n <> 3 THEN RAISE EXCEPTION" in inc
+              and "SELECT count(*) INTO n FROM documents WHERE repo = 'testrepo';" in inc)
 
-    total = 12
-    print(f"\n{total - len(failures)}/{total} checks passed"
+    print(f"\n{ran - len(failures)}/{ran} checks passed"
           + (f"; FAILED: {', '.join(failures)}" if failures else ""))
     return 1 if failures else 0
 
