@@ -79,6 +79,10 @@ flowchart TB
 - **Map freshness** is checkable: `ci/freshness.py` flags component globs that match no file
   (a moved file silently unhooking its constraints) and documents indexed at an older commit, so
   the map decays *loudly*, not silently.
+- **Nothing outward is unbounded.** Every child process the MCP server spawns is on a clock, a
+  document comes back capped with an explicit truncation notice rather than 80k tokens of text,
+  and the structural map is re-read on a TTL — a server process that lives for days used to serve
+  the map it loaded on the day it started.
 - **Failure never looks like an empty answer.** The recurring bug in a system like this is a
   silence that reads as a fact: search says "no results" when the embedder is down, a hook
   injects nothing because the query broke, an ingest indexes zero documents and then deletes the

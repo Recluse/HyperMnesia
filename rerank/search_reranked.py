@@ -46,11 +46,20 @@ def fmt(c):
     return f"[{c['score']}] ({legs}) {c['doc']} # {c['heading']}\n    {(c['text'] or '').strip()[:100]}"
 
 
+def _read_query():
+    """The whole of stdin, as one query.
+
+    `readline()` silently discarded everything after the first newline, and the MCP server sends
+    the query verbatim -- so a multi-line question was quietly answered on its first line only,
+    with no sign that the rest had been dropped."""
+    return " ".join(sys.stdin.read().split())
+
+
 def main():
     args = sys.argv[1:]
     k = int(args[0]) if args and args[0].isdigit() else 8
     repo = args[1] if len(args) > 1 else (os.environ.get("HM_REPO") or None)
-    query = sys.stdin.readline().strip()
+    query = _read_query()
     if not query:
         print("(no query)")
         return

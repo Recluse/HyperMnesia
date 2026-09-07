@@ -177,6 +177,15 @@ def candidates(query, pool, repo):
     return out
 
 
+def _read_query():
+    """The whole of stdin, as one query.
+
+    `readline()` silently discarded everything after the first newline, and the MCP server sends
+    the query verbatim -- so a multi-line question was quietly answered on its first line only,
+    with no sign that the rest had been dropped."""
+    return " ".join(sys.stdin.read().split())
+
+
 def main():
     args = sys.argv[1:]
     if args and args[0] == "--json":
@@ -184,7 +193,7 @@ def main():
         repo = args[2] if len(args) > 2 else (os.environ.get("HM_REPO") or None)
         if repo and repo.upper() == "ALL":
             repo = None
-        query = sys.stdin.readline().strip()
+        query = _read_query()
         # candidates() is what SETS DEGRADED, and dict values evaluate left to right -- reading
         # DEGRADED in the same literal captured its pre-call value, so the reranked path always
         # received "" and never printed the LEXICAL-ONLY warning. Call first, then build.
@@ -199,7 +208,7 @@ def main():
     else:
         k = int(args[0]) if args else 8
         repo = args[1] if len(args) > 1 else None
-        query = sys.stdin.readline().strip()
+        query = _read_query()
     repo = repo or os.environ.get("HM_REPO") or None
     if repo and repo.upper() == "ALL":
         repo = None

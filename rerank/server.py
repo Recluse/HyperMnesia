@@ -24,6 +24,9 @@ import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 MODEL = os.environ.get("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
+# A model id without a revision resolves to whatever the hub serves today, so the thing
+# scoring your search can change under you between restarts. Pin it when that matters.
+REVISION = os.environ.get("RERANK_REVISION") or None
 PORT = int(os.environ.get("PORT", "8091"))
 MAXLEN = int(os.environ.get("RERANK_MAXLEN", "512"))
 IDLE_SEC = int(os.environ.get("RERANK_IDLE_SEC", "600"))
@@ -38,9 +41,9 @@ def _ensure_loaded():
     global _tok, _model
     if _model is None:
         print(f"[rerank] loading {MODEL} on {DEV} ...", flush=True)
-        _tok = AutoTokenizer.from_pretrained(MODEL)
+        _tok = AutoTokenizer.from_pretrained(MODEL, revision=REVISION)
         _model = AutoModelForSequenceClassification.from_pretrained(
-            MODEL, torch_dtype=torch.float32).to(DEV).eval()
+            MODEL, revision=REVISION, torch_dtype=torch.float32).to(DEV).eval()
         print("[rerank] loaded", flush=True)
 
 
