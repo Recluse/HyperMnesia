@@ -74,11 +74,15 @@ def main():
                 (repo, commit))
     stale = cur.fetchone()[0]
 
-    # 3. constraints that LOST their source document. NOT "dangling pointer": the FK is
+    # 3. constraints with no source document. NOT "dangling pointer": the FK is
     #    ON DELETE SET NULL (sql/schema.sql), so a deleted document can never leave a pointer to
     #    a missing row -- that test asks for a state the schema makes unreachable and therefore
-    #    reports 0 forever, which reads as health. The real event is the link going NULL, which
-    #    is what a full re-ingest does to every constraint whose source it deletes.
+    #    reports 0 forever, which reads as health.
+    #    Read this number as INFORMATIONAL. From the database alone, a link a re-ingest severed
+    #    is indistinguishable from a norm whose seed row deliberately carries no source, and in
+    #    practice most are the latter. The checkable question is whether every document path a
+    #    seed references actually exists in the index: a seed pointing at a file the corpus
+    #    cannot hold (a .yml, say, in a markdown-only corpus) silently resolves to NULL.
     cur.execute("SELECT count(*) FROM constraints WHERE repo=%s AND source_doc_id IS NULL", (repo,))
     dangling = cur.fetchone()[0]
 
@@ -87,7 +91,7 @@ def main():
     for slug, g in orphans:
         print(f"   ! {slug}: '{g}'")
     print(f"STALE DOCS (git_commit != HEAD): {stale}")
-    print(f"CONSTRAINTS w/o source_doc (link lost, re-apply the seed): {dangling}")
+    print(f"CONSTRAINTS w/o source_doc (informational; many are NULL by design): {dangling}")
 
     if "--mark" in sys.argv:
         cur.execute("UPDATE documents SET status='stale' WHERE repo=%s AND git_commit NOT IN (%s,'nogit')",
