@@ -39,7 +39,20 @@ Markdown only, chunked by heading. Two things to know before you trust the resul
 
 - A full re-ingest **deletes and re-inserts** the repo's documents, so `constraints.source_doc_id`
   is reset to NULL (the FK is `ON DELETE SET NULL`). Re-apply the seed afterwards if you care
-  about those links.
+  about those links. It also drops every chunk (that FK cascades) and chunks carry the
+  embeddings — so a re-ingest for one edited file re-embeds the whole corpus.
+- **Re-ingesting later? Use `--known-hashes`.** Hand the ingester what the DB already holds and
+  only new and changed files are rewritten; unchanged documents keep their chunks, their
+  embeddings, and their `source_doc_id` links. The ingester still needs no DB connection —
+  the hashes arrive as a file, so this works over `kubectl exec` or a tunnel like everything
+  else here:
+
+  ```bash
+  psql "$DATABASE_URL" -tAF$'\t' \
+    -c "SELECT path, content_hash FROM documents WHERE repo='<repo-tag>'" > known.tsv
+  python ingest/ingest_repo.py /path/to/repo <repo-tag> out.sql --known-hashes known.tsv
+  psql "$DATABASE_URL" -f out.sql
+  ```
 - The chunker reads `# ` at line start as a heading even inside a ``` fence, so a runbook full
   of YAML comments can pick up a phantom heading path. Check a few chunks of your most
   code-heavy doc before assuming the corpus is clean.
