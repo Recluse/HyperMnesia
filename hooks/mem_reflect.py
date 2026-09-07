@@ -63,15 +63,33 @@ def main():
     dry = "--dry-run" in sys.argv
     only = sys.argv[sys.argv.index("--project") + 1] if "--project" in sys.argv else None
 
-    if os.path.exists(LOCK):                         # stale-lock safe (killed run -> 2h)
-        if time.time() - os.path.getmtime(LOCK) < 7200:
-            print("another reflect run holds the lock; exiting")
+    # The lock records the PID, so a run that was KILLED (its finally never ran) does not block
+    # the next one for two hours while looking exactly like a run in progress. Age alone was the
+    # only test before, and a stale lock is silent: the scheduled pass prints "another run holds
+    # the lock" and does nothing.
+    if os.path.exists(LOCK):
+        try:
+            holder = int(open(LOCK, encoding="utf-8").read().strip() or 0)
+        except (OSError, ValueError):
+            holder = 0
+        alive = False
+        if holder:
+            try:
+                os.kill(holder, 0)          # signal 0: liveness test, sends nothing
+                alive = True
+            except OSError:
+                alive = False
+        if alive and time.time() - os.path.getmtime(LOCK) < 7200:
+            print(f"another reflect run (pid {holder}) holds the lock; exiting", flush=True)
             return
+        if not alive:
+            print(f"clearing a stale lock (pid {holder or '?'} is gone)", flush=True)
         try:
             os.remove(LOCK)
         except OSError:
             pass
-    open(LOCK, "w").close()
+    with open(LOCK, "w", encoding="utf-8") as fh:
+        fh.write(str(os.getpid()))
     try:
         if only:
             targets = [{"project": only}]
@@ -80,10 +98,10 @@ def main():
             if raw is None:
                 # Not "nothing to reflect": the store never answered. Printing 0 here made a
                 # failed scheduled run indistinguishable from one with no work to do.
-                print("store unreachable; exiting")
+                print("store unreachable; exiting", flush=True)
                 return
             targets = json.loads(raw)
-        print(f"{len(targets)} project(s) to reflect")
+        print(f"{len(targets)} project(s) to reflect", flush=True)
         changed = False
         for t in targets:
             try:
