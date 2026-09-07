@@ -21,6 +21,11 @@ the repo still holds exactly as many documents as the file describes and aborts 
 not, because a snapshot from elsewhere would mark documents "already stored" that were never
 there -- a corpus with holes that only shows up as missing search results.
 
+--walk enumerates the tree with os.walk instead of `git ls-files`, for a directory that is
+git-ignored or otherwise untracked. Without it such a directory ingests as zero documents,
+which a full ingest turns into "delete everything stored for this repo"; that case now exits
+non-zero instead.
+
 Env: HM_FTS_LANG (default 'english') -- the Postgres text-search config for stemming; 'simple'
 is always added alongside so exact tokens (code identifiers, IDs) match regardless of language.
 """
@@ -59,15 +64,30 @@ _SKIP_DIRS = {'.git', 'node_modules', '.venv', 'venv', 'target', 'dist', 'build'
               'coverage', 'bin', 'obj', '.pytest_cache', 'site-packages'}
 
 
-def list_md(repo_dir):
-    """(commit, [rel paths]) -- tracked *.md if a git repo, else a filtered os.walk."""
-    try:
-        commit = subprocess.check_output(["git", "-C", repo_dir, "rev-parse", "HEAD"],
-                                         stderr=subprocess.DEVNULL).decode().strip()
-        files = subprocess.check_output(["git", "-C", repo_dir, "ls-files", "*.md"],
-                                        stderr=subprocess.DEVNULL).decode().splitlines()
-    except Exception:
-        commit, files = "nogit", []
+def list_md(repo_dir, walk=False):
+    """(commit, [rel paths]) -- tracked *.md if a git repo, else a filtered os.walk.
+
+    `walk=True` forces the filesystem walk. It has to be explicit rather than inferred: the
+    auto-detect asks "is this a git repo", but the caller means "find the files", and a
+    directory that IS inside a repo yet fully .gitignored answers yes to the first and returns
+    nothing for the second -- `git -C` also walks up to the enclosing repo, so a subdirectory
+    is enough to take the git branch. Working notes and scratch docs are exactly the material
+    people keep out of git and exactly the material worth indexing.
+
+    Walking reports the commit as 'nogit' on purpose: an untracked file's content has no
+    relationship to HEAD, and freshness checks exempt 'nogit' rather than calling it stale.
+    """
+    commit, files = "nogit", None
+    if not walk:
+        try:
+            commit = subprocess.check_output(["git", "-C", repo_dir, "rev-parse", "HEAD"],
+                                             stderr=subprocess.DEVNULL).decode().strip()
+            files = subprocess.check_output(["git", "-C", repo_dir, "ls-files", "*.md"],
+                                            stderr=subprocess.DEVNULL).decode().splitlines()
+        except Exception:
+            commit, files = "nogit", None
+    if files is None:
+        files = []
         for root, dirs, fs in os.walk(repo_dir):
             dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
             for fn in fs:
@@ -169,13 +189,24 @@ def main():
         known = read_known_hashes(argv[i + 1])
         del argv[i:i + 2]
     incremental = "--known-hashes" in sys.argv
+    walk = "--walk" in argv
+    argv = [a for a in argv if a != "--walk"]
     repo_dir, repo, out = argv[0], argv[1], argv[2]
     # The repo name is the scope key; the MCP server sanitizes its own scope to [A-Za-z0-9._-],
     # so ingest must use the same alphabet or the two won't agree. Reject rather than silently mangle.
     if not re.fullmatch(r"[A-Za-z0-9._-]+", repo):
         sys.exit(f"repo name {repo!r} must match [A-Za-z0-9._-] (the MCP server scopes to this)")
     real_root = os.path.realpath(repo_dir)
-    commit, files = list_md(repo_dir)
+    commit, files = list_md(repo_dir, walk=walk)
+    # A full ingest opens with DELETE FROM documents WHERE repo = <tag>, so writing an empty
+    # corpus does not merely index nothing -- it deletes everything this repo already had, and
+    # exits 0 while doing it. The likeliest cause is enumeration, not an empty tree: a
+    # git-ignored directory inside a repo makes `git ls-files` return nothing while both git
+    # calls succeed. Refuse, and name the way out.
+    if not files:
+        sys.exit(f"{repo}: no *.md found under {repo_dir} -- refusing to write an empty corpus "
+                 f"(applying it would delete every document already stored for '{repo}'). "
+                 f"If the directory is git-ignored or untracked, re-run with --walk.")
 
     n_docs = n_chunks = n_kept = 0
     on_disk, replaced, bodies = set(), set(), []

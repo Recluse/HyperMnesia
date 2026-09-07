@@ -24,6 +24,8 @@ jobs:
         run: python tests/test_hook_contract.py
       - name: Incremental ingest (a silent fallback to full replace only costs embeddings)
         run: python tests/test_incremental_ingest.py
+      - name: Ingest enumeration (an empty ingest deletes the corpus it should have refreshed)
+        run: python tests/test_ingest_enumeration.py
 
   rust:
     runs-on: ubuntu-latest

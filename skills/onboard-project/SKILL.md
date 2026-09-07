@@ -37,6 +37,10 @@ psql "$DATABASE_URL" -f out.sql
 
 Markdown only, chunked by heading. Two things to know before you trust the result:
 
+- **A git-ignored corpus needs `--walk`.** `git ls-files` is the default enumeration, and it
+  returns nothing for a directory that is inside a repo but `.gitignore`d — working notes and
+  scratch docs, typically. The ingester refuses to write an empty corpus rather than emitting
+  one that would delete what is already stored; pass `--walk` to index the tree directly.
 - A full re-ingest **deletes and re-inserts** the repo's documents, so `constraints.source_doc_id`
   is reset to NULL (the FK is `ON DELETE SET NULL`). Re-apply the seed afterwards if you care
   about those links. It also drops every chunk (that FK cascades) and chunks carry the
