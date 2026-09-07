@@ -77,8 +77,16 @@ flowchart TB
   the file you're about to edit to its component and injects the applicable `must` invariants
   before the edit — so Tier 1 is delivered deterministically, not left to the agent to ask for.
 - **Map freshness** is checkable: `ci/freshness.py` flags component globs that match no file
-  (a moved file silently unhooking its constraints), docs behind HEAD, and dangling sources — so
+  (a moved file silently unhooking its constraints) and documents indexed at an older commit, so
   the map decays *loudly*, not silently.
+- **Failure never looks like an empty answer.** The recurring bug in a system like this is a
+  silence that reads as a fact: search says "no results" when the embedder is down, a hook
+  injects nothing because the query broke, an ingest indexes zero documents and then deletes the
+  corpus it should have refreshed. So: `psql` runs with `ON_ERROR_STOP` (without it a failed
+  query exits 0 and returns an empty string, indistinguishable from "nothing matched"); search
+  announces when it fell back to lexical-only; recall says once per outage that memory did not
+  answer; an empty enumeration refuses to write rather than emptying the store; and the
+  consolidator reports a model that gave no verdict instead of recording it as "keep".
 
 ## Where code fits
 
@@ -103,10 +111,11 @@ See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full system picture
 | Path | What |
 |------|------|
 | `sql/` | schema: doc-RAG (`documents/components/constraints/relationships/chunks`) + personal memory (`mem.*`) |
-| `ingest/` | markdown chunker, embedder (Ollama/TEI), hybrid RRF search, `mem_ops` |
+| `ingest/` | markdown chunker, embedder (Ollama/TEI), hybrid RRF search, `mem_ops`; incremental re-ingest via `--known-hashes` (unchanged docs keep their embeddings) |
 | `rerank/` | optional cross-encoder reranker service + search orchestrator |
-| `hooks/` | Claude Code hooks: constraint inject (`arch_invariants`), profile inject, per-prompt recall, capture, extract, consolidate |
-| `ci/` | `freshness.py` — map-staleness / orphan-glob checker (run against a target repo) |
+| `hooks/` | Claude Code hooks: constraint inject (`arch_invariants`), profile inject, per-prompt recall, capture, extract, consolidate, reflect (per-project knowledge pages) |
+| `ci/` | `freshness.py` — map-staleness / orphan-glob checker (run against a target repo); `check_graph_sql_parity.py` — keeps the Python and Rust copies of the graph query identical |
+| `tests/` | DB-free contract tests, wired into CI: hook I/O, ingest enumeration, incremental ingest |
 | `mcp-server/` | Rust MCP server exposing project map / constraints / search / memory tools |
 | `deploy/` | docker-compose (single box) + Kubernetes manifests |
 | `examples/` | an example structural-tier seed for a project |
@@ -126,6 +135,18 @@ psql "$DATABASE_URL" -f sql/schema.sql -f sql/schema_mem.sql
 python ingest/ingest_repo.py /path/to/your/repo myrepo out.sql && psql "$DATABASE_URL" -f out.sql
 python ingest/embed_chunks.py     # fill embeddings
 ```
+
+Two flags worth knowing before your first run:
+
+- `--walk` enumerates the tree directly instead of asking git. Needed when the corpus is
+  `.gitignore`d (working notes, scratch docs), which `git ls-files` reports as an empty tree.
+  Without it the ingester refuses rather than emitting an empty corpus — a full ingest opens
+  with `DELETE FROM documents WHERE repo = <tag>`, so "empty" would mean "delete everything".
+- `--known-hashes known.tsv` re-emits only new and changed documents. Chunks carry the
+  embeddings, so a plain re-ingest after editing one file re-embeds the whole corpus. Produce
+  the file with `psql -tAF$'\t' -c "SELECT path, content_hash FROM documents WHERE repo='myrepo'"`
+  against the database you are about to load into — the emitted SQL asserts the two agree and
+  aborts if they do not.
 
 ## Design docs
 
