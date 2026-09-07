@@ -31,8 +31,9 @@ def list_tracked(repo_dir):
     walk of the working directory.
 
     Neither source alone is enough, and using only one produces false orphans:
-      * `git ls-files` misses anything present but untracked -- a repo may track 16 files under
-        sourcecode/ while 96k sit on disk, so every `sourcecode/**` glob looked orphaned;
+      * `git ls-files` misses anything present but untracked -- a repo that tracks a handful of
+        files under a vendored tree while tens of thousands sit on disk makes every glob over
+        that tree look orphaned;
       * a walk alone misses nothing here, but the index is still worth unioning in for trees
         where files are tracked yet not materialised (sparse checkouts).
     Component key_paths point at CODE, so this must see the whole tree, not just markdown.

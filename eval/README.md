@@ -44,5 +44,7 @@ Running this against a populated store surfaced two real weaknesses, both now fi
    noise. `MEM_SEM_MAXDIST` now defaults to **0.5**, in the measured gap; tune it per embedder with
    the same kind of measurement (`mem_ops nearest` gives the distance).
 
-The abstention probe deliberately uses a query that shares stopwords with typical memories, so it
-regresses if either fix is undone.
+The abstention probe uses a wholly orthogonal topic, so it proves only that an unrelated query
+abstains. It deliberately does NOT exercise the near-topic case the distance tuning above
+addresses: a query that shares one incidental token with a memory is not covered by any probe
+today.

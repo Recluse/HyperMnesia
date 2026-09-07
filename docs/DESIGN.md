@@ -49,8 +49,11 @@ name). Component slugs are unique per repo, not globally.
 
 ## Fail-open, everywhere
 
-Memory is an enhancement, never a gate. The personal-memory hooks return empty and exit 0 on any
-error. Doc search degrades gracefully: if the embedder is down it falls back to lexical-only (a slow
+Memory is an enhancement, never a gate. The personal-memory hooks always exit 0 and never block a
+tool call — but they do not answer an outage with silence: an unreachable store is announced once
+per outage, because "nothing matched" and "nothing answered" read identically to the agent. Doc
+search degrades gracefully: if the embedder is down it falls back to lexical-only and says so, since
+a silent half-retrieval makes "few results" read as a gap in the corpus (a slow
 embedder can't hang it — short query timeout), and if Postgres is down the MCP tool surfaces the
 error rather than blocking. A broken memory path must never stop the agent from working.
 

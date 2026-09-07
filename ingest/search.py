@@ -185,10 +185,12 @@ def main():
         if repo and repo.upper() == "ALL":
             repo = None
         query = sys.stdin.readline().strip()
-        print(json.dumps({"query": query, "repo": repo,
-                          "degraded": DEGRADED,
-                          "candidates": candidates(query, pool, repo) if query else []},
-                         ensure_ascii=False))
+        # candidates() is what SETS DEGRADED, and dict values evaluate left to right -- reading
+        # DEGRADED in the same literal captured its pre-call value, so the reranked path always
+        # received "" and never printed the LEXICAL-ONLY warning. Call first, then build.
+        cands = candidates(query, pool, repo) if query else []
+        print(json.dumps({"query": query, "repo": repo, "degraded": DEGRADED,
+                          "candidates": cands}, ensure_ascii=False))
         return
     if args and not args[0].isdigit():
         query = args[0]

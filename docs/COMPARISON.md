@@ -57,8 +57,9 @@ confidently than search does:
 
 - **The map is hand-authored — that's the value *and* the liability.** While the seed tracks the
   tree, Tier 1 is excellent. When files move and globs don't, it silently stops resolving. This is
-  why [`ci/freshness.py`](../ci/freshness.py) exists (orphan-glob / stale-doc / dangling-source
-  detection) — run it in CI or on a schedule so decay is *loud*.
+  why [`ci/freshness.py`](../ci/freshness.py) exists (orphan-glob and stale-doc detection, plus an
+  informational count of constraints with no source document) — run it in CI or on a schedule so
+  decay is *loud*.
 - **Ingest is markdown-only.** Decisions that live in PRs, commits, or chat don't reach the map by
   themselves — someone has to write them into docs or the seed.
 - **No forgetting.** Personal memory accumulates in `active_memories`; there's no decay curve, so

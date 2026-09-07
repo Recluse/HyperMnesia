@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Memory consolidator (M3) -- the sleep-time pass over mem.* (sleep-time consolidation pattern:
 a background agent owns the write path; 'write everything, never revisit' is the
-canonical failure). Run daily from launchd/cron on the mac.
+canonical failure). Run daily from cron or a user-level scheduler.
 
   python3 hooks/mem_consolidate.py [--dry-run]
 

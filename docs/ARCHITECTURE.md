@@ -88,7 +88,7 @@ Any LSP-backed symbol MCP works in place of Serena; HyperMnesia doesn't depend o
 
 ## Data flow
 
-**Ingest (offline, per doc change):** `ingest_repo.py` walks the repo's markdown, chunks by
+**Ingest (offline, per doc change):** `ingest_repo.py` enumerates the repo's tracked markdown (`git ls-files`; `--walk` for a tree kept out of git), chunks by
 heading, and emits SQL; `embed_chunks.py` fills `chunks.embedding` via Ollama/TEI. The
 architectural map is seeded once by hand (`examples/seed_example.sql`), refreshed when the
 architecture changes.
@@ -108,7 +108,9 @@ storage, the point. Fail-open: no DB / no match → the hook stays silent and th
 **Keeping the map honest:** the hand-authored map is only trustworthy while it tracks the tree.
 `ci/freshness.py` makes decay mechanical — it flags component globs matching no file (a moved file
 that silently unhooked its constraints — the worst case, since the map then lies more confidently
-than search would), docs ingested behind HEAD, and constraints whose source doc is gone. Run it in
+than search would), docs ingested behind HEAD, and — informational only — how many constraints
+have no source document, since a full re-ingest nulls those links (the FK is `ON DELETE SET NULL`)
+and many seed rows legitimately carry none. Run it in
 CI or on a schedule against each target repo; it exits non-zero on orphaned globs.
 
 **Personal memory (background):** capture hooks enqueue session transcripts; a scheduled job

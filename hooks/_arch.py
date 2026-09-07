@@ -42,6 +42,14 @@ def _glob_to_regex(glob):
         c = glob[i]
         if c == "*":
             if glob[i + 1:i + 2] == "*":
+                # `**/` matches zero OR more path segments, so `src/**/*.py` also matches
+                # `src/main.py`. Mapping `**` to `.*` and leaving the `/` literal required at
+                # least one directory, which disagreed with the Rust resolver in main.rs and
+                # therefore with what get_constraints returns -- the hook silently withheld
+                # invariants the tool would have shown, which is the exact Tier-1 failure this
+                # file exists to prevent. Keep the two in step.
+                if glob[i + 2:i + 3] == "/":
+                    out.append("(?:.*/)?"); i += 3; continue
                 out.append(".*"); i += 2
             else:
                 out.append("[^/]*"); i += 1

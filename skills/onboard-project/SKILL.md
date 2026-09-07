@@ -24,7 +24,7 @@ curl -s localhost:11434/api/tags | head -c 80        # embedder alive (Ollama; T
 If the schema is missing: `psql "$DATABASE_URL" -f sql/schema.sql -f sql/schema_mem.sql`.
 
 Pick the repo tag now and use it everywhere — it is the scoping key for the whole tier and
-is matched **case-sensitively**. `~/Work/Infra` ingested as `infra` will not resolve unless
+is matched **case-sensitively**. `~/code/MyRepo` ingested as `myrepo` will not resolve unless
 `HM_REPO=infra` is set explicitly; the hook falls back to the cwd basename, which would be
 `Infra`.
 

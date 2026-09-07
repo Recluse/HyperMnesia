@@ -409,7 +409,7 @@ def main():
         assert status in ("active", "superseded", "retracted", "expired")
         # Provenance: record WHAT displaced this memory. The row surviving is not enough --
         # without this link "what replaced this fact, and why" is unanswerable, which was the
-        # case for 146 of 148 superseded rows (the consolidator marks losers separately from
+        # case for nearly every superseded row before this (the consolidator marks losers separately from
         # writing the replacement, so supersedes_id stays NULL on that path).
         by = p.get("by")
         cur.execute("UPDATE mem.memories SET status=%s::mem.memory_status, "

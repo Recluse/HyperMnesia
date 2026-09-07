@@ -24,7 +24,7 @@ re-learning them every session. Free text is the primary representation; structu
 ## Retrieval
 
 `mem_ops.py search` runs the same hybrid RRF as doc search (bge-m3 + composite FTS) over
-`active_memories`, with importance and recency as tiebreakers and the abstention floor on the
+`active_memories`, with importance and recency as tiebreakers, a distance floor on the dense leg, and the SAME floor applied to lexical-only hits — the lexical leg exists to rescue near-misses, not to admit a memory that shares one incidental token with the query. The floor is on the
 dense leg. `write` / `supersede` / `get` / `mark` round out the CRUD; all take JSON on stdin.
 
 ## Consolidation and the review queue
@@ -39,6 +39,7 @@ mutation is gated.** The LLM returns a confidence; at or above `MEM_REVIEW_THRES
 python hooks/mem_review.py list
 python hooks/mem_review.py approve <id>   # applies the proposed merge/supersede
 python hooks/mem_review.py reject  <id>
+python hooks/mem_review.py stale [days]   # active facts nothing has recalled in that long
 ```
 
 So a wrong merge can never silently drop a memory.
