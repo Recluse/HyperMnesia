@@ -193,8 +193,22 @@ would should may might into onto over under out up down about after before betwe
 над под при про без через между у не ни ли бы же то все всё вот еще ещё уже только очень был была
 были быть есть нет да их его её ему ей них нем нём них мой моя мое моё твой наш ваш свой""".split())
 
+# Compound tokens (example.com, docs/ops/x.md, search.py) are stored by Postgres as ONE lexeme,
+# so splitting them asked the index for lexemes it does not contain and the exact match for every
+# host, path and dotted filename silently stopped working. Keep them whole, and exempt them from
+# the length/stopword filter, which is there to stop common WORDS from OR-matching the store.
+_COMPOUND = re.compile(r"[\w\-]+(?:[./][\w\-]+)+", flags=re.U)
+_WORD = re.compile(r"[\w\-]+", flags=re.U)
+
+
 def _simple_query(q):
-    toks = [t for t in re.findall(r"[\w\-]+", q or "", flags=re.U) if len(t) > 2 and t.lower() not in _STOP]
+    q, out, pos = q or "", [], 0
+    for m in _COMPOUND.finditer(q):
+        out += [(t, False) for t in _WORD.findall(q[pos:m.start()])]
+        out.append((m.group(0), True))
+        pos = m.end()
+    out += [(t, False) for t in _WORD.findall(q[pos:])]
+    toks = [t for t, comp in out if comp or (len(t) > 2 and t.lower() not in _STOP)]
     return " ".join(toks) if toks else "zzz-no-lexemes-zzz"   # nothing meaningful -> matches nothing
 
 

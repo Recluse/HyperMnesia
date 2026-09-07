@@ -81,17 +81,42 @@ would should may might into onto over under out up down about after before betwe
 были быть есть нет да их его её ему ей них нем нём них мой моя мое моё твой наш ваш свой""".split())
 
 
+# Splitting on every non-word character also splits the tokens Postgres stores WHOLE:
+# to_tsvector('simple','example.com') is the single lexeme 'example.com', and a full path is one
+# lexeme too. Rewriting the query to `example | com` therefore asked for lexemes the index does
+# not contain, and the exact match for every hostname, URL, dotted filename and path silently
+# stopped working -- verified against a live store in the production query form. Keep compound
+# tokens intact, and exempt them from the length/stopword filter, which exists to stop common
+# WORDS from OR-matching every chunk.
+_COMPOUND = re.compile(r"[\w\-]+(?:[./][\w\-]+)+", flags=re.U)
+_WORD = re.compile(r"[\w\-]+", flags=re.U)
+
+
+def _tokens(q):
+    """[(token, is_compound)] over the query, compound tokens (a.b, a/b/c) kept whole."""
+    q = q or ""
+    out, pos = [], 0
+    for m in _COMPOUND.finditer(q):
+        out += [(t, False) for t in _WORD.findall(q[pos:m.start()])]
+        out.append((m.group(0), True))
+        pos = m.end()
+    out += [(t, False) for t in _WORD.findall(q[pos:])]
+    return out
+
+
 def _no_neg(q):
     """Strip leading/trailing dashes from every token so nothing becomes a negated lexeme."""
-    toks = [t.strip("-") for t in re.findall(r"[\w\-]+", q or "", flags=re.U)]
+    toks = [t.strip("-") for t, _ in _tokens(q)]
     toks = [t for t in toks if t]
     return " ".join(toks) if toks else "zzz-no-lexemes-zzz"
 
 
 def _lex_query(q):
-    """Simple-leg query: no negation, no stopwords, no <=2-char tokens. Identifiers survive."""
-    toks = [t.strip("-") for t in re.findall(r"[\w\-]+", q or "", flags=re.U)]
-    toks = [t for t in toks if len(t) > 2 and t.lower() not in _STOP]
+    """Simple-leg query: no negation, no stopwords, no <=2-char tokens. Identifiers survive, and
+    so do compound tokens -- `search.py` must not be dropped for being short, and
+    `docs/plan/on.md` must not be dropped for containing a stopword."""
+    toks = [(t.strip("-"), comp) for t, comp in _tokens(q)]
+    toks = [t for t, comp in toks if t and (comp or (len(t) > 2 and t.lower() not in _STOP))]
     return " ".join(toks) if toks else "zzz-no-lexemes-zzz"
 
 

@@ -26,6 +26,8 @@ jobs:
         run: python tests/test_incremental_ingest.py
       - name: Ingest enumeration (an empty ingest deletes the corpus it should have refreshed)
         run: python tests/test_ingest_enumeration.py
+      - name: Query hygiene (a split hostname matches nothing, and nothing says so)
+        run: python tests/test_query_hygiene.py
 
   rust:
     runs-on: ubuntu-latest
