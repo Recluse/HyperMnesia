@@ -26,7 +26,10 @@ def get_candidates(query, k, repo, timeout=60):
                        input=(query + "\n").encode(), capture_output=True, timeout=timeout)
     if p.returncode != 0:
         raise RuntimeError(p.stderr.decode()[-400:])
-    return json.loads(p.stdout.decode() or "{}").get("candidates", [])
+    payload = json.loads(p.stdout.decode() or "{}")
+    # (candidates, degraded): "degraded" is non-empty when the query could not be embedded, i.e.
+    # the pool is lexical-only. Passing it up keeps a silent outage from reading as a thin corpus.
+    return payload.get("candidates", []), payload.get("degraded", "")
 
 
 def rerank_scores(query, docs, timeout=20):
@@ -51,7 +54,7 @@ def main():
     if not query:
         print("(no query)")
         return
-    cands = get_candidates(query, k, repo)
+    cands, degraded = get_candidates(query, k, repo)
     order = cands
     if cands:
         try:  # fail open to RRF order on any reranker problem
@@ -71,8 +74,11 @@ def main():
         if len(picked) >= k:
             break
     print(f"== query: {query!r}  [scope: {repo or 'ALL repos'}] ==")
+    if degraded:
+        print(f"!! EMBEDDER UNREACHABLE ({degraded}) -- this search was LEXICAL-ONLY: ranking is "
+              f"degraded, and few or no results does NOT mean the corpus lacks the topic")
     if not picked:
-        print("(no results -- embeddings may still be indexing)")
+        print("(no results)")
     for c in picked:
         print(fmt(c))
 

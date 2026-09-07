@@ -112,6 +112,19 @@ def main():
         # with its current hash is skipped as "already stored", so a row the DB never had is
         # never inserted and the corpus just answers "no results". The guard turns that into
         # an aborted transaction.
+        # A file that exists but cannot be read must NOT be pruned as "gone": that would delete
+        # a good document, its chunks and its embeddings on a transient EACCES/EIO.
+        os.chmod(os.path.join(repo, "keep.md"), 0o000)
+        try:
+            unread, ureport = ingest(repo, os.path.join(tmp, "unread.sql"), known_path)
+        finally:
+            os.chmod(os.path.join(repo, "keep.md"), 0o644)
+        doomed_unread = unread.split("AND path IN (")[1].split(");")[0] if "AND path IN (" in unread else ""
+        check("an unreadable file is not deleted as if it had vanished",
+              "'keep.md'" not in doomed_unread)
+        check("and the unreadable file is reported, not passed over in silence",
+              "could not read keep.md" in ureport)
+
         check("aborts on a snapshot that does not match the DB",
               "DO $do$" in inc and "IF n <> 3 THEN RAISE EXCEPTION" in inc
               and "SELECT count(*) INTO n FROM documents WHERE repo = 'testrepo';" in inc)

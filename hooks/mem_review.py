@@ -28,10 +28,16 @@ def main():
     elif cmd == "stale":
         days = int(args[1]) if len(args) > 1 else 180
         raw = mem_ops("stale_list", {"days": days, "limit": 50}, timeout=30)
+        if raw is None:
+            # The sibling branches already say this; only `stale` answered a failed call with a
+            # confident all-clear, the worst possible answer for a decay audit.
+            print("(store unreachable)")
+            return
         try:
-            rows = json.loads(raw) if raw else []
-        except ValueError:
-            rows = []
+            rows = json.loads(raw)
+        except ValueError as exc:
+            print(f"(unreadable answer from the store: {exc}) -- NOT an empty result")
+            return
         if not rows:
             print(f"(nothing active older than {days}d that has gone unrecalled that long)")
         for r in rows:

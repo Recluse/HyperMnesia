@@ -348,7 +348,10 @@ fn tool_search_docs(query: &str, k: u32) -> Result<String, String> {
         return Err(format!("search failed: {}", String::from_utf8_lossy(&out.stderr)));
     }
     let s = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
-    Ok(if s.is_empty() { "(no results -- embeddings may still be indexing)".to_string() } else { s })
+    // Don't assert a cause. Empty stdout means the search printed nothing at all; blaming
+    // indexing was a guess that reads as a diagnosis, and it hid the common case (the embedder
+    // being down, which search.py now reports in its own output as LEXICAL-ONLY).
+    Ok(if s.is_empty() { "(search returned nothing at all -- check the search process's stderr)".to_string() } else { s })
 }
 
 fn tool_memory(cmd: &str, payload: &Value) -> Result<String, String> {

@@ -95,12 +95,21 @@ def _lex_query(q):
     return " ".join(toks) if toks else "zzz-no-lexemes-zzz"
 
 
+DEGRADED = ""   # set when the query could not be embedded: that run was lexical-only
+
+
 def _query_vec(query):
     # Fail-open: if the embedder is down/slow, return None -> the SQL gets NULL::vector, the
     # semantic leg yields nothing, and search degrades to lexical-only instead of erroring.
+    # Failing open is right; failing open SILENTLY is not. Half the retrieval is gone, ranking
+    # is worse, and zero hits then look like a gap in the corpus rather than an outage.
+    global DEGRADED
     try:
-        return vec_literal(embed_query(query))
-    except Exception:
+        v = vec_literal(embed_query(query))
+        DEGRADED = ""
+        return v
+    except Exception as exc:
+        DEGRADED = f"{type(exc).__name__}: {exc}"
         return None
 
 
@@ -152,6 +161,7 @@ def main():
             repo = None
         query = sys.stdin.readline().strip()
         print(json.dumps({"query": query, "repo": repo,
+                          "degraded": DEGRADED,
                           "candidates": candidates(query, pool, repo) if query else []},
                          ensure_ascii=False))
         return
@@ -169,7 +179,13 @@ def main():
     if not query:
         print("(no query)"); return
     print(f"== query: {query!r}  [scope: {repo or 'ALL repos'}] ==")
-    for doc, heading, score, srank, lrank, snippet in search(query, k, repo):
+    rows = search(query, k, repo)
+    if DEGRADED:
+        print(f"!! EMBEDDER UNREACHABLE ({DEGRADED}) -- this search was LEXICAL-ONLY: ranking is "
+              f"degraded, and few or no results does NOT mean the corpus lacks the topic")
+    if not rows:
+        print("(no results)")
+    for doc, heading, score, srank, lrank, snippet in rows:
         legs = f"sem#{srank if srank is not None else '-'} lex#{lrank if lrank is not None else '-'}"
         print(f"[{score}] ({legs}) {doc} # {heading}")
         print(f"    {snippet.strip()[:100]}")

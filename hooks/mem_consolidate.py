@@ -56,13 +56,17 @@ def load_memory(mid):
 def decide(group_lines):
     # LLM failure -> "keep" (never a destructive default when the model is unavailable).
     raw = complete(PROMPT, "\n".join(group_lines), timeout=300) or ""
+    # An unparseable reply is a FAILED VERDICT, not the verdict "keep". Both are
+    # non-destructive, which is why this was easy to miss, but they read completely differently:
+    # a run that says "keep" for every group tells the operator memory is already consolidated,
+    # when in fact the model never answered (rate limit, refusal, truncation).
     start, end = raw.find("{"), raw.rfind("}")
     if start < 0 or end <= start:
-        return {"action": "keep"}
+        return {"action": "keep", "_failed": "no JSON object in the model's reply"}
     try:
         return json.loads(raw[start:end + 1])
-    except ValueError:
-        return {"action": "keep"}
+    except ValueError as exc:
+        return {"action": "keep", "_failed": f"unparseable JSON: {exc}"}
 
 
 def union_groups(pairs):
@@ -107,13 +111,18 @@ def main():
         groups = union_groups(pairs)
         print(f"{len(groups)} similar group(s) to review")
         changed = False
+        failed = 0
         for g in groups:
             lines = [l for l in (load_memory(m) for m in g) if l]
             if len(lines) < 2:
                 continue
             verdict = decide(lines)
             action = verdict.get("action", "keep")
-            print(f"  group {g}: {action}")
+            if verdict.get("_failed"):
+                failed += 1
+                print(f"  group {g}: NO VERDICT ({verdict['_failed']}) -- left untouched")
+            else:
+                print(f"  group {g}: {action}")
             if dry or action == "keep":
                 continue
             # confidence gate: only auto-mutate when the LLM is sure; otherwise park for review.
@@ -163,6 +172,11 @@ def main():
                 print("profile cache invalidated")
             except OSError:
                 pass
+        if failed:
+            # Say it in the last line too: a run whose verdicts all failed otherwise reads as
+            # "every group examined, nothing to do".
+            print(f"WARNING: {failed} group(s) got no verdict from the model -- "
+                  f"they were NOT reviewed, not 'kept'")
         print("done" + (" (dry-run)" if dry else ""))
     finally:
         os.remove(LOCK)

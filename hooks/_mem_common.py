@@ -64,6 +64,29 @@ def psql(sql, timeout=10):
     return _run(["psql", DATABASE_URL, "-tAX", "-v", "ON_ERROR_STOP=1"], sql, timeout)
 
 
+STORE_DOWN = os.path.expanduser("~/.claude/hypermnesia-store-down")
+
+
+def store_down_flip(down):
+    """True exactly once per outage -- the first prompt on which the store stopped answering
+    (and again after a recovery followed by a new failure).
+
+    Recall runs on EVERY prompt, so an outage cannot be announced every turn. It must be
+    announced once, though: "nothing was recalled" and "the store never answered" are otherwise
+    the same silence, and the agent then reasons as if memory were empty rather than absent.
+    """
+    try:
+        was = os.path.exists(STORE_DOWN)
+        if down and not was:
+            open(STORE_DOWN, "w").close()
+            return True
+        if not down and was:
+            os.remove(STORE_DOWN)
+    except OSError:
+        pass
+    return False
+
+
 def read_stdin_json():
     try:
         import sys

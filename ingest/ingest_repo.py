@@ -209,20 +209,29 @@ def main():
                  f"If the directory is git-ignored or untracked, re-run with --walk.")
 
     n_docs = n_chunks = n_kept = 0
-    on_disk, replaced, bodies = set(), set(), []
+    on_disk, replaced, bodies, unreadable, oversize = set(), set(), [], [], []
     for rel in files:
         ap = os.path.join(repo_dir, rel)
+        relp = rel.replace("\\", "/")
         # Don't follow symlinks: a committed `x.md -> /etc/secret` would otherwise be read
         # and stored as a repo document. Skip links and anything resolving outside the repo.
+        # A deliberate exclusion (symlink, oversize) SHOULD drop the stored document, and does,
+        # because it never reaches on_disk below.
         if os.path.islink(ap) or not os.path.realpath(ap).startswith(real_root + os.sep):
             continue
         try:
             raw = open(ap, "rb").read()
-        except OSError:
+        except OSError as exc:
+            # NOT an exclusion: the file is right there, we just could not read it this time
+            # (EACCES, EIO, too many open files). Letting it fall through to `gone` would DELETE
+            # a perfectly good document, its chunks and its embeddings on a transient error, so
+            # count it as present and leave the stored row alone.
+            unreadable.append((relp, exc))
+            on_disk.add(relp)
             continue
         if len(raw) > MAX_FILE_BYTES:      # skip giant generated/dumped md
+            oversize.append(relp)
             continue
-        relp = rel.replace("\\", "/")
         chash = hashlib.sha256(raw).hexdigest()
         on_disk.add(relp)
         # Unchanged content means unchanged chunks, and chunks carry the embeddings -- the
@@ -297,6 +306,12 @@ def main():
         # HNSW/FTS cost estimates don't drift after a bulk DELETE+INSERT.
         if not incremental or bodies or gone:
             f.write("ANALYZE chunks;\n")
+    for relp, exc in unreadable:
+        sys.stderr.write(f"{repo}: WARNING could not read {relp} ({exc}) -- keeping whatever is "
+                         f"already stored for it rather than deleting it\n")
+    for relp in oversize:
+        sys.stderr.write(f"{repo}: {relp} is over {MAX_FILE_BYTES} bytes -- excluded, and any "
+                         f"stored copy will be removed\n")
     if incremental:
         sys.stderr.write(f"{repo}: {n_docs} docs re-emitted ({n_chunks} chunks), "
                          f"{n_kept} unchanged kept, {len(gone)} removed -> {out}\n")

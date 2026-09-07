@@ -36,7 +36,10 @@ output only the page. Keep it under ~250 words."""
 
 
 def reflect_one(project, dry):
-    grp = json.loads(mem_ops("reflect_group", {"project": project}, timeout=30) or "[]")
+    raw = mem_ops("reflect_group", {"project": project}, timeout=30)
+    if raw is None:
+        raise RuntimeError("store unreachable while fetching the group")
+    grp = json.loads(raw)
     if len(grp) < MIN_MEMS:
         return False
     body = "\n".join(f"- [{m['type']}] {m['content']}" for m in grp[:MAX_MEMS])
@@ -73,7 +76,13 @@ def main():
         if only:
             targets = [{"project": only}]
         else:
-            targets = json.loads(mem_ops("reflect_targets", {"min": MIN_MEMS}, timeout=30) or "[]")
+            raw = mem_ops("reflect_targets", {"min": MIN_MEMS}, timeout=30)
+            if raw is None:
+                # Not "nothing to reflect": the store never answered. Printing 0 here made a
+                # failed scheduled run indistinguishable from one with no work to do.
+                print("store unreachable; exiting")
+                return
+            targets = json.loads(raw)
         print(f"{len(targets)} project(s) to reflect")
         changed = False
         for t in targets:
