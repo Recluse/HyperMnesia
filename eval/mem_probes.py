@@ -39,7 +39,7 @@ def mem(cmd, payload, timeout=60):
 
 
 def psql(sql, timeout=30):
-    subprocess.run(["psql", DATABASE_URL, "-tAX"], input=sql.encode(),
+    subprocess.run(["psql", DATABASE_URL, "-tAX", "-v", "ON_ERROR_STOP=1"], input=sql.encode(),
                    capture_output=True, timeout=timeout, check=True)
 
 

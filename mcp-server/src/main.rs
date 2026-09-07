@@ -77,7 +77,7 @@ fn repo() -> String {
 fn db_query(sql: &str) -> Result<String, String> {
     use std::process::{Command, Stdio};
     let mut child = Command::new("psql")
-        .arg(database_url()).args(["-tAX"])
+        .arg(database_url()).args(["-tAX", "-v", "ON_ERROR_STOP=1"])
         .env("PGCLIENTENCODING", "UTF8")
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().map_err(|e| format!("spawn psql: {e}"))?;

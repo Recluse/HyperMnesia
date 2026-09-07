@@ -8,8 +8,9 @@ confidently than search would. This surfaces that mechanically:
   1. MAP ORPHANS  -- component key_paths globs matching NO real file (a moved/renamed file quietly
      unhooked its constraints). The most important check; exit 1 if any (so CI fails).
   2. STALE DOCS   -- documents whose git_commit != repo HEAD (ingestion lagged behind the tree).
-  3. CONSTRAINT RE-REVIEW -- constraints whose source_doc is gone (dangling): the norm may no
-     longer match a source that changed or vanished.
+  3. CONSTRAINT RE-REVIEW -- constraints whose source_doc link is NULL: the document they were
+     authored from was deleted (a full re-ingest does exactly this, since the FK is
+     ON DELETE SET NULL). Re-apply the repo's seed to restore the links.
 
 Generic: connects via DATABASE_URL (ingest/_common). Scope is one repo (the map is multi-repo).
 
@@ -73,9 +74,12 @@ def main():
                 (repo, commit))
     stale = cur.fetchone()[0]
 
-    # 3. constraints with a dangling source_doc (source removed since it was authored)
-    cur.execute("SELECT count(*) FROM constraints WHERE repo=%s AND source_doc_id IS NOT NULL "
-                "AND source_doc_id NOT IN (SELECT id FROM documents)", (repo,))
+    # 3. constraints that LOST their source document. NOT "dangling pointer": the FK is
+    #    ON DELETE SET NULL (sql/schema.sql), so a deleted document can never leave a pointer to
+    #    a missing row -- that test asks for a state the schema makes unreachable and therefore
+    #    reports 0 forever, which reads as health. The real event is the link going NULL, which
+    #    is what a full re-ingest does to every constraint whose source it deletes.
+    cur.execute("SELECT count(*) FROM constraints WHERE repo=%s AND source_doc_id IS NULL", (repo,))
     dangling = cur.fetchone()[0]
 
     print(f"-- freshness [{repo} @ {commit[:8]}] --")
@@ -83,7 +87,7 @@ def main():
     for slug, g in orphans:
         print(f"   ! {slug}: '{g}'")
     print(f"STALE DOCS (git_commit != HEAD): {stale}")
-    print(f"CONSTRAINTS w/ dangling source_doc (re-review): {dangling}")
+    print(f"CONSTRAINTS w/o source_doc (link lost, re-apply the seed): {dangling}")
 
     if "--mark" in sys.argv:
         cur.execute("UPDATE documents SET status='stale' WHERE repo=%s AND git_commit NOT IN (%s,'nogit')",

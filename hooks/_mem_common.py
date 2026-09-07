@@ -61,7 +61,7 @@ def mem_ops(cmd, payload, timeout=10):
 
 
 def psql(sql, timeout=10):
-    return _run(["psql", DATABASE_URL, "-tAX"], sql, timeout)
+    return _run(["psql", DATABASE_URL, "-tAX", "-v", "ON_ERROR_STOP=1"], sql, timeout)
 
 
 def read_stdin_json():
