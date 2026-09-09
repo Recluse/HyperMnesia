@@ -28,7 +28,7 @@ _PATTERNS = [
     # connection string with an inline password: scheme://user:PASSWORD@host -> keep everything but the secret
     (re.compile(r"(?P<pre>[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@]+:)(?P<secret>[^\s:/@]+)(?P<at>@)"), "url-password"),
     # generic name=value / name: value assignment for sensitive keys
-    (re.compile(r"(?i)(?P<key>\b(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|auth[_-]?token|bearer)\b\s*[:=]\s*[\"']?)(?P<secret>[^\s\"']{8,})"), "credential"),
+    (re.compile(r"(?i)(?P<key>\b(?:\w*(?:password|passwd)|secret|token|api[_-]?key|access[_-]?key|auth[_-]?token|bearer)\b\s*[:=]\s*[\"']?)(?P<secret>[^\s\"']{8,})"), "credential"),
 ]
 
 
@@ -55,6 +55,8 @@ def _selfcheck():
         ("token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", "github-token"),
         ("db at postgresql://hm:s3cr3tpass@host:5432/db", "url-password"),
         ("PASSWORD=hunter2hunter2 in the env", "credential"),
+        # prefixed forms count: PGPASSWORD is what this repo's own CI sets
+        ("PGPASSWORD=hunter2hunter2", "credential"),
         ("AKIAIOSFODNN7EXAMPLE is the key", "aws-key"),
     ]
     for text, label in cases:
