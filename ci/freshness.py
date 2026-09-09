@@ -38,17 +38,25 @@ def list_tracked(repo_dir):
         where files are tracked yet not materialised (sparse checkouts).
     Component key_paths point at CODE, so this must see the whole tree, not just markdown.
     """
-    files = set()
+    tracked = set()
     try:
-        files.update(subprocess.check_output(["git", "-C", repo_dir, "ls-files"],
-                                             stderr=subprocess.DEVNULL).decode().splitlines())
+        tracked.update(subprocess.check_output(["git", "-C", repo_dir, "ls-files"],
+                                               stderr=subprocess.DEVNULL).decode().splitlines())
     except Exception:
         pass
+    walked = set()
     for root, dirs, fs in os.walk(repo_dir):
         dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
         for fn in fs:
-            files.add(os.path.relpath(os.path.join(root, fn), repo_dir).replace("\\", "/"))
-    return [f for f in files if not (set(f.replace("\\", "/").split("/")) & _SKIP_DIRS)]
+            walked.add(os.path.relpath(os.path.join(root, fn), repo_dir).replace("\\", "/"))
+    # The skip list belongs to the INGESTER, where it means "don't index vendored/generated
+    # markdown". Here the question is "does this file exist", and a tracked file exists no matter
+    # what its directory is called -- `build/`, `bin/`, `dist/` and `out/` are perfectly ordinary
+    # source directories in some projects. Applying the list to tracked paths invented three
+    # orphan globs for a real project (build/macos/**, src/bin/**) whose files are right
+    # there in git. So: filter only what the WALK found, never what git reports.
+    walked = {f for f in walked if not (set(f.split("/")) & _SKIP_DIRS)}
+    return sorted(tracked | walked)
 
 
 def main():
