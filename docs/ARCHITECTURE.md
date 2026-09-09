@@ -120,6 +120,51 @@ a confidence gate + review queue. Recall/profile hooks inject relevant memories 
 See [DESIGN.md](DESIGN.md) for the reasoning behind the tiers and [MEMORY.md](MEMORY.md) for the
 personal-memory model.
 
+## One model, two runtimes: the embedder
+
+Worth spelling out, because it is the single easiest way to break a store like this silently.
+
+Every vector in the database — document chunks and memories alike — must come from **the same
+embedding model**. Vectors from two models do not live in the same space, so a query embedded by
+one cannot find rows embedded by the other. Nothing errors. Search simply gets worse, in a way
+that reads as "the corpus does not cover that" rather than as a bug, and it stays broken until
+someone re-embeds everything.
+
+A concrete deployment, as an example of how to satisfy that while still using the right hardware
+for each job:
+
+| | Serving (per query) | Bulk (re-index, onboarding a repo) |
+|---|---|---|
+| Model | `BAAI/bge-m3` | `BAAI/bge-m3` |
+| Runtime | text-embeddings-inference 1.7, CPU, in-cluster | Ollama, Apple Silicon |
+| Shape | float32, 1024 dims, 8192-token input | same model, F16 weights |
+| Why here | one query at a time, must always be up | ~10 chunks/s; a bulk run on the CPU replica takes 8-9 cores and starves live queries |
+
+The split exists because the CPU replica that answers queries is easily saturated: one bulk client
+pushed it to 8-9 cores and ordinary queries stopped fitting their timeout. Moving bulk work to a
+local GPU/Neural-Engine runtime keeps serving responsive.
+
+**The split is only safe because both sides run the same model, and that is worth verifying rather
+than assuming.** Take a few chunks that were embedded locally, re-embed their exact text through
+the serving runtime, and compare:
+
+```sql
+SELECT embedding <=> '[...vector from the serving runtime...]'::vector FROM chunks WHERE id = 52396;
+```
+
+Cosine distance came back at ~1e-5 — float rounding, not a difference in meaning — so the vectors
+are interchangeable. A different model would have shown a distance in the tenths.
+
+`chunks.embedding_model` and `mem.memories.embedding_model` record which model produced each
+vector, so a silent swap becomes a visible mixture:
+
+```sql
+SELECT embedding_model, count(*) FROM chunks GROUP BY 1;   -- expect exactly one row
+```
+
+If that query ever returns two rows, retrieval quality is already degraded for part of the store,
+and the fix is to re-embed the minority — not to tune the ranking.
+
 ## Related work
 
 HyperMnesia is self-hosted memory + architectural control for **coding agents**, where you own
