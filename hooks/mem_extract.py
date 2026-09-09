@@ -16,6 +16,8 @@ import json, os, re, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _mem_common import mem_ops, defang
 from _llm import complete
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ingest"))
+from _redact import scrub
 
 QUEUE = os.path.expanduser("~/.claude/mem-queue.jsonl")
 DONE = os.path.expanduser("~/.claude/mem-queue.done")
@@ -75,7 +77,13 @@ def transcript_text(path):
 
 
 def extract(text):
-    raw = (complete(PROMPT, text) or "").strip()
+    # Redact BEFORE the transcript leaves the machine. ingest/_redact.py also runs on the write
+    # path, but that protects the database row -- by then the model has already read the text.
+    # Privacy by default matters more here than anywhere else in this project: the extractor is
+    # pointed at whatever LLM you configured, which may well be someone else's API, and it is fed
+    # raw session transcripts on a schedule. Best effort by nature: it catches structured secrets
+    # (keys, tokens, URL passwords), not a credential typed as prose.
+    raw = (complete(PROMPT, scrub(text)) or "").strip()
     if not raw:
         raise RuntimeError("LLM returned empty (rate-limited/unreachable?) -- not marking done")
     # JSON-salvage: some models wrap output in <think>...</think> or ```json fences.

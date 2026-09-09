@@ -55,11 +55,19 @@ python ingest/ingest_repo.py ~/code/myrepo myrepo /tmp/myrepo.sql
 psql "$DATABASE_URL" -f /tmp/myrepo.sql
 python ingest/embed_chunks.py               # fills chunks.embedding
 
-# 5. (optional) reranker on your GPU/Mac
+# 5. Build the ANN index — AFTER the first bulk embed, and do not skip it.
+#    schema.sql leaves this commented on purpose: building HNSW before the rows exist is far
+#    slower than building it once they do. Skip it and search still WORKS, so nothing complains
+#    — the dense leg just sequential-scans every vector for the rest of the install's life.
+psql "$DATABASE_URL" -c "CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw \
+  ON chunks USING hnsw (embedding vector_cosine_ops)"
+
+# 6. (optional) reranker on your GPU/Mac
 python -m venv rerank/.venv && rerank/.venv/bin/pip install torch transformers sentencepiece
 rerank/.venv/bin/python rerank/server.py &  # 127.0.0.1:8091, lazy-loads, idle-unloads
+                                            # HM_RERANK_BIND=0.0.0.0 to serve it beyond localhost
 
-# 6. Point your MCP client at mcp-server (see "MCP client" below)
+# 7. Point your MCP client at mcp-server (see "MCP client" below)
 ```
 
 ## B. Single server (docker-compose) — recommended for a homelab
@@ -73,8 +81,11 @@ docker compose -f deploy/docker/docker-compose.yml exec postgres \
   psql -U hm -d hypermnesia -f /sql/schema.sql -f /sql/schema_mem.sql
 ```
 
-Then ingest/embed as in A steps 4. See `deploy/docker/docker-compose.yml` for the services and
-ports. TEI serves `bge-m3` on CPU; add a GPU runtime to the compose service for speed.
+Then ingest/embed as in A steps 4 and 5 — including the ANN index, which is easy to miss and
+costs you a sequential scan on every query if you do. Point the embedder at TEI first, since this
+stack has no Ollama: `export EMBED_BACKEND=tei TEI_URL=http://localhost:8080`. See
+`deploy/docker/docker-compose.yml` for the services and ports. TEI serves `bge-m3` on CPU; add a
+GPU runtime to the compose service for speed.
 
 ## C. Kubernetes
 

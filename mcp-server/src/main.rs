@@ -469,3 +469,48 @@ fn main() {
         }
     }
 }
+
+// The shared glob contract, mirrored from tests/test_glob_parity.py. Two implementations of one
+// rule drift; `**/` once meant "one-or-more segments" here and "zero-or-more" there, so the hook
+// silently withheld invariants this server was happy to return. That test asserts this table is
+// present and identical, so a case added on one side has to be added on the other.
+#[cfg(test)]
+const GLOB_CASES: &[(&str, &str, bool)] = &[
+    ("src/**", "src/main.py", true),
+    ("src/**", "src/a/b/main.py", true),
+    ("src/*.py", "src/main.py", true),
+    ("src/*.py", "src/a/main.py", false),
+    ("src/**/*.py", "src/main.py", true),
+    ("src/**/*.py", "src/a/main.py", true),
+    ("src/**/*.py", "src/a/b/main.py", true),
+    ("**/CHANGELOG.md", "CHANGELOG.md", true),
+    ("**/CHANGELOG.md", "docs/CHANGELOG.md", true),
+    ("a/**/b", "a/b", true),
+    ("a/**/b", "a/x/b", true),
+    ("a/**/b", "a/x/y/b", true),
+    ("src/main.py", "src/main.py", true),
+    ("src/main.py", "src/main.pyc", false),
+    ("src", "src/main.py", false),
+    (".github/**", ".github/workflows/ci.yml", true),
+    (".gitlab-ci.yml", ".gitlab-ci.yml", true),
+    ("*.yml", ".gitlab-ci.yml", true),
+    ("*.yml", "ci/deploy.yml", false),
+    ("src/?.py", "src/a.py", true),
+    ("src/?.py", "src/ab.py", false),
+    ("src/?.py", "src/a/b.py", false),
+    ("docs/a+b.md", "docs/a+b.md", true),
+    ("docs/a+b.md", "docs/aab.md", false),
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_parity() {
+        for (glob, path, want) in GLOB_CASES {
+            let re = regex::Regex::new(&glob_to_regex(glob)).expect("glob compiles");
+            assert_eq!(re.is_match(path), *want, "glob {glob:?} vs path {path:?}");
+        }
+    }
+}

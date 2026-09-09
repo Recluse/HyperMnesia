@@ -28,6 +28,8 @@ jobs:
         run: python tests/test_ingest_enumeration.py
       - name: Query hygiene (a split hostname matches nothing, and nothing says so)
         run: python tests/test_query_hygiene.py
+      - name: Glob parity (the hook must inject exactly what get_constraints returns)
+        run: python tests/test_glob_parity.py
 
   rust:
     runs-on: ubuntu-latest
@@ -37,6 +39,9 @@ jobs:
       - name: Build the MCP server
         working-directory: mcp-server
         run: cargo build --release --locked
+      - name: Rust unit tests (glob parity with the Python hook)
+        working-directory: mcp-server
+        run: cargo test --locked
 
   schema:
     runs-on: ubuntu-latest

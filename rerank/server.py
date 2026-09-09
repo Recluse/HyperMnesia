@@ -2,8 +2,9 @@
 """Cross-encoder reranker for HyperMnesia doc search.
 
 bge-reranker-v2-m3 on Apple MPS (fp32 -- fp16 has attention glitches on MPS). Local
-HTTP only (127.0.0.1). The MCP-server's search path POSTs candidate passages here and
-reorders by score; if this service is down/cold, search fails open to plain RRF order.
+HTTP only, loopback by default (HM_RERANK_BIND to change it). The MCP-server's search
+path POSTs candidate passages here and reorders by score; if this service is down/cold,
+search fails open to plain RRF order.
 
 Memory-friendly: the model is LAZY-loaded on first /rerank and UNLOADED after
 RERANK_IDLE_SEC (default 600s) with no requests -- so it eats ~3.4GB only while you're
@@ -13,7 +14,8 @@ rerank timeout; a cold search just falls open to RRF and the next one is reranke
   POST /rerank {"query": str, "docs": [str, ...]} -> {"scores": [float, ...]}  (same order)
   GET  /health -> {"status":"ok", "model":..., "device":..., "loaded": bool}
 
-Env: RERANK_MODEL (default BAAI/bge-reranker-v2-m3), PORT (8091), RERANK_MAXLEN (512),
+Env: RERANK_MODEL (default BAAI/bge-reranker-v2-m3), PORT (8091), HM_RERANK_BIND (127.0.0.1),
+     RERANK_MAXLEN (512),
      RERANK_IDLE_SEC (600; 0 disables idle-unload -> always resident).
 A cross-encoder rerank of the top RRF candidates measurably improves recall@1.
 """
@@ -113,6 +115,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    # Loopback by default: this endpoint has no authentication, so it must not be reachable
+    # off-box unless someone says so. But the address has to be settable, because a hardcoded
+    # 127.0.0.1 inside a container listens only to that container -- a Service in front of it
+    # gets connection-refused, and search fails OPEN to plain RRF, so you get unreranked results
+    # while believing you are reranking. If you set this, put an authenticated proxy or a
+    # NetworkPolicy in front.
+    bind = os.environ.get("HM_RERANK_BIND", "127.0.0.1")
     threading.Thread(target=_reaper, daemon=True).start()
-    print(f"[rerank] serving 127.0.0.1:{PORT} (lazy load, idle-unload {IDLE_SEC}s)", flush=True)
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    print(f"[rerank] serving {bind}:{PORT} (lazy load, idle-unload {IDLE_SEC}s)"
+          + ("  [reachable off-box: no auth, front it with something]" if bind != "127.0.0.1" else ""),
+          flush=True)
+    ThreadingHTTPServer((bind, PORT), Handler).serve_forever()

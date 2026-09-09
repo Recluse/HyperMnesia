@@ -10,7 +10,7 @@ services into your own manifests. The shape:
   on 5432. Set `POSTGRES_PASSWORD` from a `Secret`; prefer `scram-sha-256` auth if any pod other
   than your own can reach 5432 (flannel and other CNIs don't enforce NetworkPolicy without a
   policy controller).
-- **Embedder (TEI)** — a `Deployment` of `text-embeddings-inference:cpu-1.7` with
+- **Embedder (TEI)** — a `Deployment` of `ghcr.io/huggingface/text-embeddings-inference:cpu-1.7` with
   `--model-id BAAI/bge-m3 --port 80 --auto-truncate --max-batch-tokens 4096`, a PVC or hostPath
   for the HF cache, and a Service on 80. One replica is plenty for a personal corpus.
 - **Ingest / embed / search** — these are just python scripts against `DATABASE_URL`. Run
@@ -19,6 +19,12 @@ services into your own manifests. The shape:
   port-forward or a routable Service; point `DATABASE_URL` at it.
 - **Reranker (optional)** — a `Deployment` built from `rerank/Dockerfile`, Service on 8091, and
   set `HM_RERANK_URL` accordingly. Skip it for a minimal setup.
+  ⚠ The server binds `127.0.0.1` by default, which inside a pod means "reachable only by that
+  pod" — a Service in front of it gets connection-refused. Set `HM_RERANK_BIND=0.0.0.0` in the
+  Deployment. Do that knowingly: the endpoint has no authentication, so pair it with a
+  NetworkPolicy or run it as a sidecar. And note the failure mode — search fails OPEN to plain
+  RRF when the reranker is unreachable, so a misconfigured Service looks like working search with
+  quietly worse ranking rather than an error.
 
 Load the schema once Postgres is up:
 
