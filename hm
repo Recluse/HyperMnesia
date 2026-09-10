@@ -1,0 +1,142 @@
+#!/bin/sh
+# hm -- the documented steps, in the order that works.
+#
+# Not a framework and not a new way to run anything: every subcommand below shells the same
+# scripts docs/INSTALL.md describes. It exists because the ORDER is load-bearing and getting it
+# wrong is silent. Build the ANN index before the rows exist and it is far slower; skip it and
+# search still answers, by sequential-scanning every vector for the life of the install. Re-run a
+# full ingest over an existing scope and it deletes the documents first, taking every embedding
+# with them. Neither raises an error.
+#
+#   ./hm init                  bring up the docker stack, load both schemas, print what to export
+#   ./hm ingest <dir> <scope>  ingest -> embed -> index, incrementally if the scope already exists
+#   ./hm doctor                is this install actually working, or only appearing to
+#
+# Env: DATABASE_URL (required by ingest/doctor; init prints the one it just set up).
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PY=${HM_PYTHON:-python3}
+
+die()  { printf '%s\n' "hm: $*" >&2; exit 1; }
+step() { printf '\n== %s\n' "$*"; }
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is not on PATH"; }
+
+# The header comment above IS the help text; printing it from the file keeps the two from
+# drifting. Stop at the first line that is not a comment rather than a hardcoded line number,
+# which goes stale the moment anyone edits the header.
+usage() {
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+    exit "${1:-1}"
+}
+
+cmd_init() {
+    need docker
+    env_file="$ROOT/deploy/docker/.env"
+    if [ ! -f "$env_file" ]; then
+        step "Writing $env_file"
+        cp "$ROOT/deploy/docker/.env.example" "$env_file"
+        # Generated, not chosen: a password typed in a hurry outlives the hurry.
+        pw=$(openssl rand -base64 24 2>/dev/null | tr -d '\n/+=' | cut -c1-24) \
+            || die "could not generate a password -- set POSTGRES_PASSWORD in $env_file yourself"
+        [ -n "$pw" ] || die "empty password generated -- set POSTGRES_PASSWORD in $env_file yourself"
+        # BSD and GNU sed disagree about -i, so write a new file and move it.
+        sed "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$pw|" "$env_file" > "$env_file.tmp"
+        mv "$env_file.tmp" "$env_file"
+        chmod 600 "$env_file"
+    else
+        step "Keeping the existing $env_file"     # never clobber a password already in use
+    fi
+
+    # shellcheck disable=SC1090
+    . "$env_file"
+    : "${POSTGRES_USER:=hm}" "${POSTGRES_DB:=hypermnesia}" "${PG_PORT:=5432}"
+    [ -n "${POSTGRES_PASSWORD:-}" ] || die "POSTGRES_PASSWORD is empty in $env_file"
+
+    step "Starting Postgres and the embedder"
+    (cd "$ROOT/deploy/docker" && docker compose up -d)
+
+    step "Waiting for Postgres to accept connections"
+    i=0
+    until docker compose -f "$ROOT/deploy/docker/docker-compose.yml" \
+              exec -T postgres pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1; do
+        i=$((i + 1))
+        [ "$i" -lt 60 ] || die "Postgres did not come up in 60s -- 'docker compose logs postgres'"
+        sleep 1
+    done
+
+    step "Loading the schema (both files are idempotent)"
+    docker compose -f "$ROOT/deploy/docker/docker-compose.yml" exec -T postgres \
+        psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+        -f /sql/schema.sql -f /sql/schema_mem.sql >/dev/null
+
+    url="postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@localhost:$PG_PORT/$POSTGRES_DB"
+    cat <<EOF
+
+Up. Export these, in this shell and in your MCP client's env:
+
+    export DATABASE_URL='$url'
+    export EMBED_BACKEND=tei TEI_URL=http://localhost:${TEI_PORT:-8080}
+
+Then put a repo in:  ./hm ingest ~/code/myrepo myrepo
+EOF
+}
+
+cmd_ingest() {
+    [ $# -eq 2 ] || usage
+    dir=$1; scope=$2
+    [ -d "$dir" ] || die "no such directory: $dir"
+    need psql
+    [ -n "${DATABASE_URL:-}" ] || die "DATABASE_URL is not set (./hm init prints it)"
+
+    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+
+    # Incremental when the scope already holds documents. The full path OPENS with
+    # DELETE FROM documents WHERE repo=<scope>, which cascades to chunks and therefore to every
+    # embedding -- a one-file edit costing a full re-embed, quietly. Taking the snapshot from the
+    # database we are about to write to is the point: one from anywhere else would mark documents
+    # "already stored" that were never there.
+    n=$(psql "$DATABASE_URL" -tAX -v ON_ERROR_STOP=1 \
+        -c "SELECT count(*) FROM documents WHERE repo='$scope'") || die "cannot reach the store"
+    if [ "$n" -gt 0 ]; then
+        step "Scope '$scope' already holds $n document(s) -- ingesting incrementally"
+        psql "$DATABASE_URL" -tAX -v ON_ERROR_STOP=1 -F'	' \
+            -c "SELECT path, content_hash FROM documents WHERE repo='$scope'" > "$tmp/known.tsv"
+        "$PY" "$ROOT/ingest/ingest_repo.py" "$dir" "$scope" "$tmp/out.sql" \
+            --known-hashes "$tmp/known.tsv"
+    else
+        step "First ingest of scope '$scope'"
+        "$PY" "$ROOT/ingest/ingest_repo.py" "$dir" "$scope" "$tmp/out.sql"
+    fi
+
+    step "Loading the documents"
+    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$tmp/out.sql"
+
+    step "Embedding what has no vector yet"
+    EMBED_REPO="$scope" "$PY" "$ROOT/ingest/embed_chunks.py"
+
+    # After the rows exist, never before: building HNSW on an empty table then filling it is far
+    # slower than the other way round. IF NOT EXISTS makes the re-run a no-op.
+    step "Building the ANN index if it is missing"
+    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q \
+        -c "CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw ON chunks USING hnsw (embedding vector_cosine_ops)"
+
+    step "Checking the result"
+    HM_REPO="$scope" "$PY" "$ROOT/ci/doctor.py" || true
+    cat <<EOF
+
+Documents are in. What is NOT in is the part that pays: the Tier 0/1 map -- which files belong to
+which component, and which rules must hold for them. Nothing can generate that honestly from a
+directory listing. See examples/seed_example.sql and skills/onboard-project.
+EOF
+}
+
+[ $# -ge 1 ] || usage 0
+sub=$1; shift
+case "$sub" in
+    init)   cmd_init "$@" ;;
+    ingest) cmd_ingest "$@" ;;
+    doctor) exec "$PY" "$ROOT/ci/doctor.py" "$@" ;;
+    -h|--help|help) usage 0 ;;
+    *)      die "unknown command: $sub (try ./hm help)" ;;
+esac

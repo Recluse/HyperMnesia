@@ -40,6 +40,12 @@ services:
     environment:
       RERANK_MODEL: BAAI/bge-reranker-v2-m3
       RERANK_IDLE_SEC: ${RERANK_IDLE_SEC:-600}
+      # The server defaults to 127.0.0.1, which INSIDE a container means "this container
+      # only" -- the published port above would refuse every connection, and search fails
+      # OPEN to plain RRF, so you would get unreranked results while believing otherwise.
+      # Safe here because only the published port reaches it; do not publish it to 0.0.0.0
+      # on a shared network without a proxy, as the endpoint has no auth.
+      HM_RERANK_BIND: 0.0.0.0
     volumes:
       - hf-cache:/root/.cache/huggingface
 

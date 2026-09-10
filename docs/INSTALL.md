@@ -15,6 +15,26 @@ HyperMnesia is a set of small, boring parts around **one Postgres database**:
 Pick a deployment below. All four use the same schema and code; they differ only in **where the
 Postgres and the embedder run**.
 
+## The short version
+
+If you have Docker and want the single-box stack, the wrapper runs the documented steps in the
+order that works:
+
+```bash
+./hm init                        # .env with a generated password, compose up, both schemas loaded
+export DATABASE_URL=...          # init prints the exact line
+./hm ingest ~/code/myrepo myrepo # ingest -> embed -> build the ANN index -> check
+./hm doctor                      # any time you suspect the store is answering worse than it should
+```
+
+`hm` is not a different way to install anything — it shells the same scripts as the manual steps
+below. It exists because the *order* is load-bearing and getting it wrong is silent: the ANN index
+must be built after the first bulk embed, and a re-ingest without a known-hashes snapshot deletes
+the scope's documents and every embedding with them. `hm ingest` takes that snapshot for you when
+the scope already has documents.
+
+Read on for the manual steps, for the non-Docker paths, and for Kubernetes.
+
 ## Hardware / OS / software requirements
 
 | | **A. Laptop / local** | **B. Single server** | **C. Kubernetes** | **D. CPU-only minimal** |

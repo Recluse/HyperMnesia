@@ -124,6 +124,7 @@ See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full system picture
 
 | Path | What |
 |------|------|
+| `hm` | one wrapper over the documented steps: `init` (compose + schema), `ingest` (ingest -> embed -> ANN index, incremental when the scope already exists), `doctor` |
 | `sql/` | schema: doc-RAG (`documents/components/constraints/relationships/chunks`) + personal memory (`mem.*`) |
 | `ingest/` | markdown chunker, embedder (Ollama/TEI), hybrid RRF search, `mem_ops`; incremental re-ingest via `--known-hashes` (unchanged docs keep their embeddings) |
 | `rerank/` | optional cross-encoder reranker service + search orchestrator |
