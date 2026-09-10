@@ -31,7 +31,8 @@ which is the weakness the hooks exist to remove.
 
 A coding agent repeats mistakes when the rule, the earlier decision or the stated preference is
 not in its context at the moment it acts. Having it there is not a guarantee — an agent can be
-handed a rule and break it anyway — but not having it guarantees the miss. Three common gaps:
+handed a rule and break it anyway, and it can get the same case right unaided. Missing context
+just makes the mistake much more likely. Three common gaps:
 
 - **The rule was written down and not read.** Your repo documents that only the data layer talks
   to Postgres. The agent opens a handler, writes a query, and the rule was two directories away
@@ -48,14 +49,15 @@ so the file gets trimmed to the rules that apply everywhere — and those are th
 also goes stale without saying so. Nothing tells you a path in it moved.
 
 **The map here is written by hand too. What is automatic is the selection and the delivery.** You
-author the components and their invariants once; from then on a file path is matched against the
+maintain the components and their invariants; from there a file path is matched against the
 component globs, and that component's `must` rules — plus those reached through one hop of the
 dependency graph — are injected before the edit by a hook, rather than waited for. Documentation
 and past decisions stay reachable behind that, by search.
 
 A hand-authored map rots, so the rot is made visible rather than assumed away: globs that match
 no file are reported, a store that will not answer says so instead of resembling a project with
-no rules, and `./hm doctor` names the faults that leave an install working-*looking*.
+no rules, and `./hm doctor` names the faults that leave an install answering normally with a
+missing index, half its embeddings, or a scope that matches nothing.
 
 If you want to see it rather than read about it: **[docs/DEMO.md](docs/DEMO.md)** — two minutes,
 real output, no install beyond a Postgres.
@@ -155,7 +157,7 @@ See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full system picture
 | `ingest/` | markdown chunker, embedder (Ollama/TEI), hybrid RRF search, `mem_ops`; incremental re-ingest via `--known-hashes` (unchanged docs keep their embeddings) |
 | `rerank/` | optional cross-encoder reranker service + search orchestrator |
 | `hooks/` | Claude Code hooks: constraint inject (`arch_invariants`), profile inject, per-prompt recall, capture, extract, consolidate, reflect (per-project knowledge pages) |
-| `ci/` | `doctor.py` — health check for the faults that leave a working-*looking* install; `latency.py` — where the time goes (hook, embedder, database, reranker); `freshness.py` — map-staleness / orphan-glob checker (run against a target repo); `check_graph_sql_parity.py` — keeps the Python and Rust copies of the graph query identical |
+| `ci/` | `doctor.py` — health check for faults that leave an install answering normally (missing index, partial embeddings, mixed models, wrong scope); `latency.py` — where the time goes (hook, embedder, database, reranker); `freshness.py` — map-staleness / orphan-glob checker (run against a target repo); `check_graph_sql_parity.py` — keeps the Python and Rust copies of the graph query identical |
 | `tests/` | contract tests, all wired into CI: hook I/O, ingest enumeration, incremental ingest, chunk bounds, glob parity, query hygiene, `doctor`, `hm ingest` — all DB-free except `test_memory_sql.py`, which asserts the `mem.*` view (supersede, validity window) and the abstention gate against a live pgvector, with no embedder |
 | `mcp-server/` | Rust MCP server exposing project map / constraints / search / memory / `status` tools |
 | `deploy/` | docker-compose (single box) + Kubernetes manifests |
@@ -183,19 +185,29 @@ a known-hashes snapshot deletes the scope's documents and every embedding with t
 [docs/INSTALL.md](docs/INSTALL.md) has the same steps by hand, the non-Docker and Kubernetes
 paths, and the flags (`--walk`, `--known-hashes`) that matter on later runs.
 
-Documents alone are the cheap half. What pays is the Tier 0/1 map — which files belong to which
-component, and which rules must hold for them — and nothing can generate it honestly from a
-directory listing. Seed one from [examples/seed_example.sql](examples/seed_example.sql), point
-your MCP client at `mcp-server` and register the hooks
-([docs/INSTALL.md](docs/INSTALL.md#mcp-client)), and then watch a rule arrive before an edit:
+The Tier 0/1 map is what defines which files belong to each component and which constraints apply
+to them. Nothing can generate it honestly from a directory listing, so writing it is the work —
+start from [examples/seed_example.sql](examples/seed_example.sql), load it under your own scope,
+then point your MCP client at `mcp-server` and register the hooks
+([docs/INSTALL.md](docs/INSTALL.md#mcp-client)).
+
+To see a rule reach an edit, run the hook by hand against a file in your repo. It lives in the
+HyperMnesia checkout, and `cwd` must be the project being edited, so give both explicitly:
 
 ```bash
+HM=/path/to/hypermnesia            # this checkout
+PROJ=/path/to/your/repo            # what you ingested as `myrepo`
+
 printf '{"hook_event_name":"PreToolUse","tool_name":"Edit","cwd":"%s",
-        "tool_input":{"file_path":"%s/src/api/users.py"}}' "$PWD" "$PWD" \
-  | HM_REPO=myapp python3 hooks/arch_invariants.py
+        "tool_input":{"file_path":"%s/src/api/users.py"}}' "$PROJ" "$PROJ" \
+  | HM_REPO=myrepo python3 "$HM/hooks/arch_invariants.py"
 ```
 
-If that prints a `hookSpecificOutput` block naming your invariant, the whole chain works.
+A `hookSpecificOutput` block naming your invariant confirms that the hook resolves that path
+against the map and returns the rule. It does **not** confirm that Claude Code is running the
+hook, or that your MCP client reached the server — for the first, make an edit from Claude Code
+and look for the same block; for the second, call the `status` tool, which answers from the store.
+
 **[docs/DEMO.md](docs/DEMO.md)** walks the same path in two minutes with real output.
 
 ## Design docs
