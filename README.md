@@ -83,6 +83,12 @@ flowchart TB
 - **Map freshness** is checkable: `ci/freshness.py` flags component globs that match no file
   (a moved file silently unhooking its constraints) and documents indexed at an older commit, so
   the map decays *loudly*, not silently.
+- **The install is checkable too**: `ci/doctor.py` (and the `status` MCP tool, which runs the very
+  same script) reports the faults that leave a *working-looking* system — an ANN index that was
+  never built, so the dense leg sequential-scans forever; chunks with no embedding, findable only
+  by the lexical leg; two embedding models in one table, whose vectors cannot be compared; a
+  scope name that differs from the ingested one only in case, so no invariant ever resolves.
+  None of those raises an error anywhere, which is exactly why they need a checker.
 - **Nothing outward is unbounded.** Every child process the MCP server spawns is on a clock, a
   document comes back capped with an explicit truncation notice rather than 80k tokens of text,
   and the structural map is re-read on a TTL — a server process that lives for days used to serve
@@ -122,9 +128,9 @@ See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full system picture
 | `ingest/` | markdown chunker, embedder (Ollama/TEI), hybrid RRF search, `mem_ops`; incremental re-ingest via `--known-hashes` (unchanged docs keep their embeddings) |
 | `rerank/` | optional cross-encoder reranker service + search orchestrator |
 | `hooks/` | Claude Code hooks: constraint inject (`arch_invariants`), profile inject, per-prompt recall, capture, extract, consolidate, reflect (per-project knowledge pages) |
-| `ci/` | `freshness.py` — map-staleness / orphan-glob checker (run against a target repo); `check_graph_sql_parity.py` — keeps the Python and Rust copies of the graph query identical |
+| `ci/` | `doctor.py` — health check for the faults that leave a working-*looking* install; `freshness.py` — map-staleness / orphan-glob checker (run against a target repo); `check_graph_sql_parity.py` — keeps the Python and Rust copies of the graph query identical |
 | `tests/` | DB-free contract tests, wired into CI: hook I/O, ingest enumeration, incremental ingest |
-| `mcp-server/` | Rust MCP server exposing project map / constraints / search / memory tools |
+| `mcp-server/` | Rust MCP server exposing project map / constraints / search / memory / `status` tools |
 | `deploy/` | docker-compose (single box) + Kubernetes manifests |
 | `examples/` | an example structural-tier seed for a project |
 | `skills/` | `onboard-project` — the six steps to connect a new repo; `just` — answer-only / audit mode (agent-readable skills) |

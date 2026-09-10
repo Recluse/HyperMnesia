@@ -30,6 +30,8 @@ jobs:
         run: python tests/test_query_hygiene.py
       - name: Glob parity (the hook must inject exactly what get_constraints returns)
         run: python tests/test_glob_parity.py
+      - name: Doctor (the health check must not call a broken store healthy)
+        run: python tests/test_doctor.py
 
   rust:
     runs-on: ubuntu-latest

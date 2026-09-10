@@ -373,6 +373,40 @@ fn tool_memory(cmd: &str, payload: &Value) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
 }
 
+fn tool_status() -> Result<String, String> {
+    // One implementation of "is this install actually working", shared with the CLI: this
+    // shells the same ci/doctor.py the human runs. Two implementations of a health check drift,
+    // and a health check that drifts reports health it no longer measures.
+    use std::process::{Command, Stdio};
+    let script = script_path("HM_DOCTOR", "ci/doctor.py");
+    let out = Command::new(py()).arg(&script).arg("--json")
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .output().map_err(|e| format!("spawn doctor ({script}): {e}"))?;
+    // A non-zero exit means the doctor FOUND something, not that it failed to run -- so the
+    // status code is deliberately not checked here; empty output is the real failure.
+    let body = String::from_utf8_lossy(&out.stdout);
+    let findings: Vec<Value> = serde_json::from_str(body.trim()).map_err(|e| {
+        format!("doctor returned no usable findings ({e}): {}", String::from_utf8_lossy(&out.stderr))
+    })?;
+    let mut lines = Vec::new();
+    // Faults first: an agent reading this needs the problem, not the inventory of what is fine.
+    for want in ["fail", "warn", "ok"] {
+        for f in findings.iter().filter(|f| f["level"].as_str() == Some(want)) {
+            let mark = match want { "fail" => "FAIL", "warn" => "WARN", _ => "ok  " };
+            let detail = f["detail"].as_str().unwrap_or("");
+            lines.push(format!("{mark}  {}{}", f["title"].as_str().unwrap_or(""),
+                               if detail.is_empty() { String::new() } else { format!("  -- {detail}") }));
+            let fix = f["fix"].as_str().unwrap_or("");
+            if want != "ok" && !fix.is_empty() { lines.push(format!("      fix: {fix}")); }
+        }
+    }
+    let n_fail = findings.iter().filter(|f| f["level"] == "fail").count();
+    let n_warn = findings.iter().filter(|f| f["level"] == "warn").count();
+    lines.push(format!("\n{} checks: {} ok, {n_warn} warning(s), {n_fail} failure(s)",
+                       findings.len(), findings.len() - n_fail - n_warn));
+    Ok(lines.join("\n"))
+}
+
 // -- MCP JSON-RPC over stdio -------------------------------------------------
 fn tool_defs() -> Value {
     json!([
@@ -384,7 +418,8 @@ fn tool_defs() -> Value {
         {"name":"memory_search","description":"PERSONAL long-term memory of the owner (facts, preferences, decisions, episodes, plans -- cross-workspace; distinct from search_docs which is the doc corpus). Hybrid search, superseded/expired facts hidden by default. Search here before assuming owner preferences or past decisions.","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"k":{"type":"integer","description":"default 8"},"types":{"type":"array","items":{"type":"string","enum":["semantic","episodic","preference","procedural","prospective","summary"]}},"project":{"type":"string","description":"also include memories tagged with this project"},"include_inactive":{"type":"boolean","description":"include superseded/retracted/expired history"}},"required":["query"]}},
         {"name":"memory_write","description":"Save a durable personal memory (fact/preference/decision/episode/plan). Only save what is NOT derivable from code/docs/git; prefer one self-contained natural-language sentence in content. Use valid_from/valid_to (event time) for facts with a validity window; assertions are an optional exact-lookup index (predicate + object).","inputSchema":{"type":"object","properties":{"type":{"type":"string","enum":["semantic","episodic","preference","procedural","prospective","summary"]},"content":{"type":"string"},"title":{"type":"string"},"importance":{"type":"number","description":"0-1, default 0.5"},"confidence":{"type":"number","description":"0-1, default 0.8"},"project":{"type":"string"},"subject":{"type":"object","properties":{"namespace":{"type":"string"},"entity_type":{"type":"string"},"name":{"type":"string"},"aliases":{"type":"array","items":{"type":"string"}}},"required":["namespace","entity_type","name"]},"valid_from":{"type":"string"},"valid_to":{"type":"string"},"event_time":{"type":"string"},"assertions":{"type":"array","items":{"type":"object","properties":{"predicate":{"type":"string"},"object_text":{"type":"string"},"object_number":{"type":"number"},"unit":{"type":"string"}},"required":["predicate"]}},"source":{"type":"object","properties":{"source_type":{"type":"string","enum":["user_message","assistant_inference","tool_result","manual","consolidation"]},"session_id":{"type":"string"},"channel":{"type":"string"},"excerpt":{"type":"string"}}}},"required":["type","content"]}},
         {"name":"memory_supersede","description":"Replace an outdated memory with a corrected/current version (old one is kept as history with its validity window closed -- never silently overwrite; use this instead of memory_write when a fact CHANGED).","inputSchema":{"type":"object","properties":{"old_id":{"type":"integer"},"content":{"type":"string"},"importance":{"type":"number"},"confidence":{"type":"number"},"valid_from":{"type":"string","description":"when the NEW fact became true (event time)"},"source":{"type":"object","properties":{"source_type":{"type":"string"},"excerpt":{"type":"string"}}}},"required":["old_id","content"]}},
-        {"name":"memory_get","description":"Fetch one personal memory by id with its assertions, sources and supersede chain.","inputSchema":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}
+        {"name":"memory_get","description":"Fetch one personal memory by id with its assertions, sources and supersede chain.","inputSchema":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}},
+        {"name":"status","description":"Health of this HyperMnesia install: store reachable, schema loaded, ANN index built, every chunk embedded, ONE embedding model, the component map's scopes, embedder and reranker reachable. Call when search returns less than expected, when no invariants are being injected, or before concluding the corpus does not cover something -- the failures it reports all leave a working-LOOKING system.","inputSchema":{"type":"object","properties":{}}}
     ])
 }
 
@@ -415,6 +450,7 @@ fn call_tool(name: &str, args: &Value) -> Result<String, String> {
         }
         "memory_supersede" => tool_memory("supersede", args),
         "memory_get" => tool_memory("get", args),
+        "status" => tool_status(),
         other => Err(format!("unknown tool: {other}")),
     }
 }

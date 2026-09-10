@@ -68,6 +68,10 @@ rerank/.venv/bin/python rerank/server.py &  # 127.0.0.1:8091, lazy-loads, idle-u
                                             # HM_RERANK_BIND=0.0.0.0 to serve it beyond localhost
 
 # 7. Point your MCP client at mcp-server (see "MCP client" below)
+
+# 8. Check it. Every fault this catches leaves a system that still answers -- an unbuilt index,
+#    unembedded chunks, two embedding models in one table, a scope name off by case.
+python3 ci/doctor.py
 ```
 
 ## B. Single server (docker-compose) — recommended for a homelab
