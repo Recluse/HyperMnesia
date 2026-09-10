@@ -46,6 +46,11 @@ SELECT json_build_object(
 // process that stays alive for days kept serving the map it loaded on the day it started, so a
 // component added or a key_path fixed in the store never reached the agent until someone
 // restarted the client. Re-read on a TTL instead.
+/// The MCP revision this server implements. Deliberately one without mandatory JSON-RPC
+/// batching, since it does not implement batching -- claiming a later revision would be a
+/// promise the code does not keep.
+const PROTOCOL_VERSION: &str = "2024-11-05";
+
 static GRAPH: Mutex<Option<(Value, Instant)>> = Mutex::new(None);
 
 // -- local process / DB access ----------------------------------------------
@@ -58,7 +63,8 @@ fn database_url() -> String {
 fn py() -> String { std::env::var("HM_PYTHON").unwrap_or_else(|_| "python3".to_string()) }
 
 /// Path to a bundled script: explicit env, else resolved from the binary's own location
-/// (`<repo>/mcp-server/target/release/hypermnesia-mcp` -> `<repo>/<rel>`), NOT the client's cwd.
+/// (`<repo>/mcp-server/target/release/hypermnesia-mcp` -> `<repo>/<rel>`). Only if neither works
+/// does it fall back to a cwd-relative path, and it says so on stderr when it does.
 fn script_path(env_key: &str, rel: &str) -> String {
     if let Ok(p) = std::env::var(env_key) {
         if !p.is_empty() { return p; }
@@ -69,6 +75,14 @@ fn script_path(env_key: &str, rel: &str) -> String {
             if p.exists() { return p.to_string_lossy().into_owned(); }
         }
     }
+    // Last resort: a path relative to the SERVER PROCESS's cwd, which the doc comment above
+    // says is not used -- and it should not be, because the cwd is the client's, so this can
+    // silently run a different checkout's script against a different database. Keep it (a
+    // relative path that happens to work beats a hard failure for someone running from the
+    // repo root) but say so, once, rather than let it look like the intended resolution.
+    eprintln!("hypermnesia-mcp: {env_key} is unset and {rel} was not found next to the binary; \
+               falling back to a path relative to the working directory, which may belong to a \
+               different checkout. Set {env_key} to be sure.");
     rel.to_string()
 }
 
@@ -77,13 +91,37 @@ fn script_path(env_key: &str, rel: &str) -> String {
 /// The result is interpolated into both a shell command (search_docs) and SQL (get_document),
 /// so it MUST be a bare identifier -- anything outside [A-Za-z0-9._-] is dropped, closing shell
 /// injection (and the split_whitespace argv split on a space) and SQL injection at the source.
-fn repo() -> String {
-    let raw = std::env::var("HM_REPO").ok().filter(|s| !s.is_empty())
+fn repo() -> String { repo_detail().0 }
+
+/// The scope, plus a line explaining it when it was not simply given. Returns
+/// (scope, Some(warning)) when the name was guessed from the cwd or rewritten by the filter --
+/// both cases produce a scope that may match nothing ingested, and both used to be invisible:
+/// every tool then answered "(no results)" / "(not found)" for a corpus that was there all
+/// along, under a name one character different.
+fn repo_detail() -> (String, Option<String>) {
+    let given = std::env::var("HM_REPO").ok().filter(|s| !s.is_empty());
+    let guessed = given.is_none();
+    let raw = given
         .or_else(|| std::env::current_dir().ok()
             .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned())))
         .unwrap_or_default();
     let safe: String = raw.chars().filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c)).collect();
-    if safe.is_empty() { "default".to_string() } else { safe }
+    if safe.is_empty() {
+        return ("default".to_string(),
+                Some("(!) SCOPE: nothing usable to scope by; falling back to 'default'. Set HM_REPO."
+                     .to_string()));
+    }
+    let note = if safe != raw {
+        Some(format!("(!) SCOPE: {raw:?} contains characters that cannot appear in a scope, so \
+                      this session is scoped to {safe:?}. If the corpus was ingested under a \
+                      different name, set HM_REPO to it."))
+    } else if guessed {
+        Some(format!("(!) SCOPE: HM_REPO is unset, so the scope was guessed from the directory \
+                      name ({safe:?}). Set HM_REPO if the corpus was ingested under another name."))
+    } else {
+        None
+    };
+    (safe, note)
 }
 
 fn env_secs(key: &str, default: u64) -> u64 {
@@ -141,9 +179,17 @@ fn wait_with_timeout(mut child: std::process::Child, secs: u64, what: &str)
     // The child is gone, so EOF is normally immediate. The grace covers the same inherited-pipe
     // case: take what arrived rather than block the caller on a process we no longer control.
     let grace = Duration::from_secs(5);
-    Ok((st.success(),
-        rx_out.recv_timeout(grace).unwrap_or_default(),
-        rx_err.recv_timeout(grace).unwrap_or_default()))
+    // NOT unwrap_or_default(). Substituting "" for output that never arrived tells the caller
+    // the child exited 0 and printed nothing, which is a different fact and a plausible one:
+    // get_document would return an empty document as the file's full text, memory_search would
+    // read as "no memories on this topic". If we could not read it, say so.
+    let out = rx_out.recv_timeout(grace).map_err(|_| {
+        format!("{what}: exited {} but its output never arrived within {}s -- something that \
+                 inherited its stdout is still holding the pipe",
+                if st.success() { "0" } else { "non-zero" }, grace.as_secs())
+    })?;
+    // stderr is only ever used to explain a failure, so a missing one is not worth failing over.
+    Ok((st.success(), out, rx_err.recv_timeout(grace).unwrap_or_default()))
 }
 
 fn db_query(sql: &str) -> Result<String, String> {
@@ -164,23 +210,47 @@ fn db_query(sql: &str) -> Result<String, String> {
     Ok(out)
 }
 
-fn graph() -> Result<Value, String> {
+/// How many TTLs a stale map may keep answering after a refresh failure before it becomes an
+/// error instead. Serving a five-minute-old map through a reboot is helpful; serving a
+/// day-old one as if it were current is the failure this project exists to prevent.
+const STALE_CEILING_MULT: u32 = 10;
+
+/// Returns the map and, when it came from a cache whose refresh failed, a line saying so.
+fn graph() -> Result<(Value, Option<String>), String> {
     let ttl = Duration::from_secs(env_secs("HM_GRAPH_TTL_SECS", 300));
     let mut g = GRAPH.lock().unwrap();
     if let Some((v, at)) = g.as_ref() {
         if at.elapsed() < ttl {
-            return Ok(v.clone());
+            return Ok((v.clone(), None));
         }
     }
     match db_query(GRAPH_SQL).and_then(|raw| {
         serde_json::from_str::<Value>(raw.trim()).map_err(|e| format!("parse graph: {e}"))
     }) {
-        Ok(v) => { *g = Some((v.clone(), Instant::now())); Ok(v) }
+        Ok(v) => { *g = Some((v.clone(), Instant::now())); Ok((v, None)) }
         // A refresh that fails must not throw away a map we already have: serving a map five
         // minutes stale beats serving nothing while the store reboots. A first load has nothing
         // to fall back to, so that error still propagates.
+        //
+        // But it must not be served SILENTLY, and not forever. The old version discarded the
+        // error entirely and left the timestamp untouched, so one migration that broke
+        // GRAPH_SQL meant every later call returned the startup snapshot as an ordinary success
+        // -- a `must` added afterwards never delivered, one deprecated afterwards still
+        // injected, with the agent seeing a confident complete list. Past a hard ceiling the
+        // stale copy stops being an answer at all.
         Err(e) => match g.as_ref() {
-            Some((v, _)) => Ok(v.clone()),
+            Some((v, at)) => {
+                let age = at.elapsed();
+                if age > ttl * STALE_CEILING_MULT {
+                    Err(format!("the component map could not be refreshed ({e}) and the cached \
+                                 copy is {}s old, past the {}s ceiling -- refusing to answer from it",
+                                age.as_secs(), (ttl * STALE_CEILING_MULT).as_secs()))
+                } else {
+                    Ok((v.clone(), Some(format!(
+                        "(!) STALE MAP: refresh failed ({e}); this answer comes from a copy {}s old",
+                        age.as_secs()))))
+                }
+            }
             None => Err(e),
         },
     }
@@ -271,12 +341,20 @@ fn tool_project_map(g: &Value) -> String {
     if comps.is_empty() {
         return format!("[no structural map for repo '{r}' yet -- its docs are searchable via search_docs / get_document]\n");
     }
+    // A component is a root if it has no parent OR its parent is not in this repo's set.
+    // components.parent_id is a plain FK with no same-repo constraint and GRAPH_SQL resolves the
+    // parent slug without one either, so a component parented across repos (a natural way to
+    // express shared ownership) was neither a root nor any rendered node's child: it and its
+    // whole subtree vanished from the map, silently, while resolve() still matched paths to it
+    // and get_constraints still returned its rules. A rendered map with an empty tree reads as
+    // "this repo has no components".
+    let own: HashSet<&str> = comps.iter().filter_map(|c| c["slug"].as_str()).collect();
     let mut children: HashMap<String, Vec<&Value>> = HashMap::new();
     let mut roots: Vec<&Value> = Vec::new();
     for c in &comps {
         match c["parent"].as_str() {
-            Some(p) => children.entry(p.to_string()).or_default().push(c),
-            None => roots.push(c),
+            Some(p) if own.contains(p) => children.entry(p.to_string()).or_default().push(c),
+            _ => roots.push(c),
         }
     }
     let mut out = String::from("# GLOBAL INVARIANTS\n");
@@ -339,12 +417,24 @@ fn tool_get_constraints(g: &Value, paths: &[String]) -> String {
     let expanded = expand_1hop(&direct, &rels);
 
     let mut selected: Vec<(&Value, &str)> = Vec::new();
+    // A constraint that reaches none of the three branches is DELIVERED NOWHERE, and until now
+    // it fell off the end of this loop without a word. The schema documents scope as
+    // 'global | component' but enforces neither that nor a non-null component_id, so a
+    // hand-authored seed with scope='repo', or scope='component' and no component, lands here:
+    // present in the store, counted by every "how many active must constraints" query, and
+    // returned by nothing. Unmatched PATHS have been flagged for a long time; unmatched RULES
+    // are the more dangerous half, because the map looks complete.
+    let mut undeliverable: Vec<String> = Vec::new();
     for c in &cons {
         let scope = c["scope"].as_str().unwrap_or("");
         let comp = c["component"].as_str().unwrap_or("");
         if scope == "global" { selected.push((c, "global")); }
         else if direct.contains(comp) { selected.push((c, "direct")); }
         else if expanded.contains(comp) { selected.push((c, "graph")); }
+        else if scope != "component" || comp.is_empty() {
+            undeliverable.push(format!("{:?} (scope={scope:?}, component={comp:?})",
+                                       c["title"].as_str().unwrap_or("")));
+        }
     }
     selected.sort_by(|a, b| {
         let ka = (sev_rank(a.0["severity"].as_str().unwrap_or("")),
@@ -358,6 +448,12 @@ fn tool_get_constraints(g: &Value, paths: &[String]) -> String {
     for (p, ms) in &touched { out.push_str(&format!("{} -> {}\n", p, ms.join(", "))); }
     if !unmatched.is_empty() {
         out.push_str(&format!("(!) FLAGGED (no component -- extend the map): {}\n", unmatched.join(", ")));
+    }
+    if !undeliverable.is_empty() {
+        out.push_str(&format!(
+            "(!) UNDELIVERABLE constraints in this repo -- neither global nor attached to a \
+             component that resolves, so no path will ever receive them: {}\n",
+            undeliverable.join("; ")));
     }
     let graph_only: Vec<String> = expanded.difference(&direct).cloned().collect();
     if !graph_only.is_empty() {
@@ -476,7 +572,12 @@ fn tool_status() -> Result<String, String> {
     // and a health check that drifts reports health it no longer measures.
     use std::process::{Command, Stdio};
     let script = script_path("HM_DOCTOR", "ci/doctor.py");
+    // HM_REPO explicitly, from repo(): the doctor's scope check is skipped when HM_REPO is
+    // empty, which is exactly the configuration where the server GUESSED its scope from the
+    // cwd folder name -- so status reported a clean bill of health for the one case where the
+    // scope is most likely wrong.
     let child = Command::new(py()).arg(&script).arg("--json")
+        .env("HM_REPO", repo())
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().map_err(|e| format!("spawn doctor ({script}): {e}"))?;
     // Generous, because every check inside is itself bounded and a slow store is the finding.
@@ -520,22 +621,39 @@ fn tool_defs() -> Value {
     ])
 }
 
+/// Put a warning line ahead of a tool's output. A staleness note that the caller has to go
+/// looking for is not a warning.
+fn prepend(note: Option<String>, body: String) -> String {
+    match note {
+        Some(n) => format!("{n}\n\n{body}"),
+        None => body,
+    }
+}
+
 fn call_tool(name: &str, args: &Value) -> Result<String, String> {
     match name {
-        "get_project_map" => Ok(tool_project_map(&graph()?)),
+        "get_project_map" => {
+            let (g, stale) = graph()?;
+            Ok(prepend(repo_detail().1, prepend(stale, tool_project_map(&g))))
+        }
         "get_constraints" => {
             let paths: Vec<String> = args["paths"].as_array().map(|a|
                 a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
             if paths.is_empty() { return Err("paths is required".into()); }
-            Ok(tool_get_constraints(&graph()?, &paths))
+            let (g, stale) = graph()?;
+            Ok(prepend(stale, tool_get_constraints(&g, &paths)))
         }
-        "locate" => Ok(tool_locate(&graph()?, args["query"].as_str().unwrap_or(""))),
-        "get_document" => tool_get_document(args["path"].as_str().unwrap_or("")),
+        "locate" => {
+            let (g, stale) = graph()?;
+            Ok(prepend(stale, tool_locate(&g, args["query"].as_str().unwrap_or(""))))
+        }
+        "get_document" => tool_get_document(args["path"].as_str().unwrap_or(""))
+            .map(|out| prepend(repo_detail().1, out)),
         "search_docs" => {
             let q = args["query"].as_str().unwrap_or("");
             if q.is_empty() { return Err("query is required".into()); }
             let k = args["k"].as_u64().unwrap_or(8) as u32;
-            tool_search_docs(q, k)
+            tool_search_docs(q, k).map(|out| prepend(repo_detail().1, out))
         }
         "memory_search" => tool_memory("search", args),
         "memory_write" => {
@@ -572,6 +690,18 @@ fn main() {
         let req: Value = match serde_json::from_str(&line) {
             Ok(v) => v, Err(e) => { eprintln!("hypermnesia-mcp: bad json: {e}"); continue; }
         };
+        // A JSON-RPC batch parses as an array: no method, no id, and the old code then
+        // `continue`d -- the client waited for a response that was never coming and reported
+        // the server as hung. Refuse it in words instead of in silence.
+        if req.is_array() {
+            println!("{}", json!({"jsonrpc": "2.0", "id": Value::Null, "error": {
+                "code": -32600,
+                "message": "this server does not implement JSON-RPC batching; send one request \
+                            per line (it negotiates protocolVersion 2024-11-05 for that reason)"
+            }}));
+            let _ = std::io::stdout().flush();
+            continue;
+        }
         let method = req["method"].as_str().unwrap_or("");
         let id = req.get("id").cloned();
 
@@ -581,9 +711,14 @@ fn main() {
 
         match method {
             "initialize" => {
-                let pv = req["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18");
+                // Answer with the revision this server actually implements, not whatever the
+                // client asked for. Echoing the client's version is a claim we cannot keep:
+                // batching is mandatory from 2025-03-26 and this server does not do it, so a
+                // client that took the echo at face value would send a batch and get silence.
+                // The spec's own rule for a version we do not support is to reply with one we
+                // do and let the client decide whether to continue.
                 reply(&id, json!({
-                    "protocolVersion": pv,
+                    "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "hypermnesia", "version": "0.1.0"}
                 }));
