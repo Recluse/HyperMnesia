@@ -34,10 +34,12 @@ until lifted ("audit mode off", "you can act now").
 
 ## Examples
 
-- `/just will recall break if I delete rerank/.venv?` → "No: recall talks to the cluster; the
-  venv is only used by the reranker service. The service itself — yes, it will fail." (no commands)
-- `/just how many map orphans in myrepo?` → read the flag / run the read-only freshness check,
-  report the number. Don't fix.
+- `/just will recall break if I delete rerank/.venv?` → "No: recall goes through `mem_ops` to
+  Postgres and the embedder; that venv only holds the reranker service's dependencies. The
+  service itself — yes, it will fail." (no commands)
+- `/just how many map orphans in myrepo?` → run the read-only check — `python ci/freshness.py
+  <repo_dir> myrepo`, without `--mark`, which is the flag that writes — and report the number.
+  Don't fix.
 - `/just fix the glob` → "That's an action, not a question. Not doing it in /just mode; lift the
   mode and I will." (don't fix)
 

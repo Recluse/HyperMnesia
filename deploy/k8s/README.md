@@ -23,8 +23,10 @@ services into your own manifests. The shape:
   pod" — a Service in front of it gets connection-refused. Set `HM_RERANK_BIND=0.0.0.0` in the
   Deployment. Do that knowingly: the endpoint has no authentication, so pair it with a
   NetworkPolicy or run it as a sidecar. And note the failure mode — search fails OPEN to plain
-  RRF when the reranker is unreachable, so a misconfigured Service looks like working search with
-  quietly worse ranking rather than an error.
+  RRF when the reranker is unreachable, so it is not an error or a non-zero exit; it is announced
+  instead, as a `!! RERANKER UNAVAILABLE (...) -- these results are in plain RRF order` line above
+  the results, so a misconfigured Service shows up in the search output rather than as silently
+  worse ranking.
 
 Load the schema once Postgres is up:
 

@@ -6,19 +6,21 @@ memory, all in your own Postgres. The neighbours below solve adjacent problems w
 of them do the deterministic **Tier 1** (path → component → `must`/`should`, no model in the loop).
 
 Facts below were checked against each project's own repo/site (links inline). External projects
-change — treated as **"as of 2026-08"**, and self-reported benchmark claims are labelled as such.
+change — the rows below were re-checked against primary sources on **2026-09-10**, and
+self-reported benchmark claims are labelled as such.
 
 ## Same shelf
 
 | Project | Bet | Store | License | Not what HyperMnesia is |
 |---|---|---|---|---|
 | **HyperMnesia** | file rules before an edit + docs + personal memory | Postgres + pgvector | MIT | doesn't index code; map is hand-authored |
+| [hypermnesia-mcp / Cortex](https://github.com/cdeust/Cortex) | persistent memory + self-curating wiki for coding agents | SQLite (default) or Postgres + pgvector | MIT | decay is central; no file→rule map |
 | [agentmemory](https://github.com/rohitg00/agentmemory) | auto-capture coding-agent sessions | SQLite + [iii-engine](https://github.com/iii-hq/iii) | Apache-2.0 | no deterministic component/constraint map |
 | [Vestige](https://github.com/samvallad33/vestige) | "find the cause of a bug, not the lookalike" | SQLite + FTS5 + HNSW | AGPL-3.0 | FSRS decay, single 25MB binary |
 | [Hindsight](https://github.com/vectorize-io/hindsight) | an agent that learns (retain/recall/reflect) | Postgres+pgvector / cloud | MIT | conversational/enterprise memory at its core |
 | [mem0](https://github.com/mem0ai/mem0) | memory API for any agent | library / self-host / cloud | Apache-2.0 | not about repo invariants |
-| [supermemory](https://github.com/supermemoryai/supermemory) | "the memory API" | cloud (backend closed) | SDKs open; backend proprietary | hosted API, not your SQL |
-| [Basic Memory](https://github.com/basicmachines-co/basic-memory) | memory as Markdown on disk | Markdown files (MCP) | AGPL-3.0 | plain-text transparency, weaker search |
+| [supermemory](https://github.com/supermemoryai/supermemory) | "the memory API" | self-hosted single binary, or cloud | MIT | a general memory engine, not a repo constraint map |
+| [Basic Memory](https://github.com/basicmachines-co/basic-memory) | memory as Markdown on disk | Markdown files + a local SQLite index (MCP) | AGPL-3.0 | files are the source of truth, not SQL |
 | [Claude memory](https://www.anthropic.com/news/memory) | managed chat memory | Anthropic-hosted | proprietary | not your SQL, not a code map |
 
 Notes on the neighbours worth stating plainly:
@@ -36,10 +38,23 @@ Notes on the neighbours worth stating plainly:
   benchmark; that's a vendor claim, and supermemory claims #1 on the same benchmark, so read
   "SOTA" as contested. HyperMnesia doesn't play on that field — and shouldn't, if the niche is
   "control over a repo," not "SOTA chat memory."
-- **Name collision (unverified):** a separate "Hypermnesia" (SQLite, local-first, "keep session
-  decisions, drop stale ones") has reportedly been announced by Taylor Weibley. We could not
-  verify it from a primary source (LinkedIn is auth-gated) and found no matching public GitHub
-  repo — treat it as unconfirmed. Different project, possibly the same word.
+- **hypermnesia-mcp / Cortex** is the closest neighbour by feature list, and the reason the name
+  collision below matters. Overlapping: nine Claude Code lifecycle hooks, "a self-curating
+  per-project wiki", supersession with history ("Corrections supersede rather than overwrite. The
+  new memory records what it replaces, the old one is demoted in recall"), weighted RRF over five
+  signals — vector, full-text, trigram, heat, recency — then a cross-encoder rerank, and SQLite by
+  default with PostgreSQL + pgvector optional. Diverging: decay is load-bearing there ("Memories
+  carry heat that decays unless replay reinforces them"), which HyperMnesia refuses on purpose; and
+  its README documents no deterministic file→component→rule map — searched for glob/constraint/
+  invariant wording, no hits. Its LongMemEval figures are self-reported (Recall@10 98.2% at
+  v4.14.1, 97.8% at v4.20.0), though published with reproduction artefacts and a code SHA.
+- **Name collision — verified, not a rumour.** [`hypermnesia-mcp`](https://pypi.org/project/hypermnesia-mcp/)
+  is on PyPI: version 4.21.0, MIT, 31 releases between 2026-06-19 and 2026-09-10, repository
+  [cdeust/Cortex](https://github.com/cdeust/Cortex). It is not a namesake in another niche — it is
+  persistent memory for AI coding agents, the same words for the same kind of tool (see the bullet
+  above). An earlier version of this note called the collision an unverified LinkedIn announcement
+  by another author and said no matching public repo existed; that was wrong on both counts. What
+  to do about the name is the owner's call; this document only records the facts.
 
 ## Where HyperMnesia is ahead
 
@@ -48,7 +63,9 @@ recovered snippet or an LLM-recalled fact. Asked *"what may not be imported into
 `src/api/routes.py`?"*, HyperMnesia answers **without a model**; similarity-based stores retrieve
 something that looks related. Beyond that: abstention instead of top-k noise, supersede-with-
 history instead of overwrite, a review queue gating merges, fail-open, and an explicit refusal to
-embed code. The map lives in SQL — readable and editable, not trapped in a model's head.
+embed code. Not all of that is exclusive — hypermnesia-mcp/Cortex ships supersession-with-history
+and a self-curating wiki too. The map lives in SQL — readable and editable, not trapped in a
+model's head.
 
 ## Non-goals and honest limitations
 
@@ -62,7 +79,8 @@ confidently than search does:
   decay is *loud*.
 - **Ingest is markdown-only.** Decisions that live in PRs, commits, or chat don't reach the map by
   themselves — someone has to write them into docs or the seed.
-- **No forgetting.** Personal memory accumulates in `active_memories`; there's no decay curve, so
+- **No forgetting.** Personal memory accumulates in `mem.memories` (`active_memories` is a view
+  over it, filtered to status and validity window); there's no decay curve, so
   quality rests on extraction + the review queue, not on eviction. Deliberate (an agent's "never
   do X here" shouldn't fade), but it means volume is managed by consolidation, not time.
 - **Consolidation is pairwise cosine over active memories** — simple, and O(n²) as memory grows.
@@ -72,7 +90,8 @@ confidently than search does:
 
 ## Summary
 
-Nearest by product is **agentmemory**; by local-first spirit, **Vestige**; by memory-as-a-system,
+Nearest by feature overlap — and by name — is **hypermnesia-mcp / Cortex**; nearest by market
+position, **agentmemory**; by local-first spirit, **Vestige**; by memory-as-a-system,
 **Hindsight**. HyperMnesia's distinctive bet isn't RAG and isn't hooks — it's that **a file's
 rules are data, not a retrieval result.** While the map is alive that's an advantage; the day the
 globs fall behind, the others still return "something similar" and HyperMnesia would return a

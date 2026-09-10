@@ -60,8 +60,8 @@ of N runs with the first discarded — a first run measures cold page cache, not
 DATABASE_URL=... ./hm latency          # or: -n 20 -q "your own query"
 ```
 
-Every line is printed next to the corpus it ran against, because a latency figure without a
-document and chunk count cannot be read at all, let alone compared.
+The corpus it ran against is printed once, as a header above the table — because a latency
+figure without a document and chunk count cannot be read at all, let alone compared.
 
 ## What is deliberately not measured
 

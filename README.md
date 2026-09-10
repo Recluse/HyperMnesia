@@ -112,7 +112,9 @@ flowchart TB
   before the edit — so Tier 1 is delivered deterministically, not left to the agent to ask for.
 - **Map freshness** is checkable: `ci/freshness.py` flags component globs that match no file
   (a moved file silently unhooking its constraints) and documents indexed at an older commit, so
-  the map decays *loudly*, not silently.
+  the map decays *loudly*, not silently. Asked about a scope nothing is mapped under — a tag one
+  character off, where every check below would report zero — it refuses and names the scopes that
+  do exist.
 - **The install is checkable too**: `ci/doctor.py` (and the `status` MCP tool, which runs the very
   same script) reports the faults that leave a *working-looking* system — an ANN index that was
   never built, so the dense leg sequential-scans forever; chunks with no embedding, findable only
@@ -122,14 +124,17 @@ flowchart TB
 - **Nothing outward is unbounded.** Every child process the MCP server spawns is on a clock, a
   document comes back capped with an explicit truncation notice rather than 80k tokens of text,
   and the structural map is re-read on a TTL — a server process that lives for days used to serve
-  the map it loaded on the day it started.
+  the map it loaded on the day it started. When that re-read fails, the cached copy is still
+  served (a store rebooting should not stop the rules arriving) but carries a `(!) STALE MAP`
+  line naming the error and the age, and past ten TTLs it stops being an answer at all.
 - **Failure never looks like an empty answer.** The recurring bug in a system like this is a
   silence that reads as a fact: search says "no results" when the embedder is down, a hook
   injects nothing because the query broke, an ingest indexes zero documents and then deletes the
   corpus it should have refreshed. So: `psql` runs with `ON_ERROR_STOP` (without it a failed
   query exits 0 and returns an empty string, indistinguishable from "nothing matched"); search
-  announces when it fell back to lexical-only; recall says once per outage that memory did not
-  answer; an empty enumeration refuses to write rather than emptying the store; and the
+  announces when it fell back to lexical-only, and when the reranker was unreachable so the
+  results are in plain RRF order; recall says once per outage that memory did not answer; an
+  empty enumeration refuses to write rather than emptying the store; and the
   consolidator reports a model that gave no verdict instead of recording it as "keep".
 
 ## Where code fits
@@ -160,7 +165,7 @@ See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full system picture
 | `rerank/` | optional cross-encoder reranker service + search orchestrator |
 | `hooks/` | Claude Code hooks: constraint inject (`arch_invariants`), profile inject, per-prompt recall, capture, extract, consolidate, reflect (per-project knowledge pages) |
 | `ci/` | `doctor.py` — health check for the faults that leave a working-*looking* install; `latency.py` — where the time goes (hook, embedder, database, reranker); `freshness.py` — map-staleness / orphan-glob checker (run against a target repo); `check_graph_sql_parity.py` — keeps the Python and Rust copies of the graph query identical |
-| `tests/` | DB-free contract tests, wired into CI: hook I/O, ingest enumeration, incremental ingest |
+| `tests/` | contract tests, all wired into CI: hook I/O, ingest enumeration, incremental ingest, chunk bounds, glob parity, query hygiene, `doctor`, `hm ingest` — all DB-free except `test_memory_sql.py`, which asserts the `mem.*` view (supersede, validity window) and the abstention gate against a live pgvector, with no embedder |
 | `mcp-server/` | Rust MCP server exposing project map / constraints / search / memory / `status` tools |
 | `deploy/` | docker-compose (single box) + Kubernetes manifests |
 | `examples/` | an example structural-tier seed for a project |
@@ -174,10 +179,16 @@ server, Kubernetes, CPU-only-minimal) and the hardware / OS / software requireme
 TL;DR (single box):
 
 ```bash
-cp deploy/docker/.env.example deploy/docker/.env   # edit
+cp deploy/docker/.env.example deploy/docker/.env   # POSTGRES_PASSWORD: openssl rand -hex 24
 docker compose -f deploy/docker/docker-compose.yml up -d
-psql "$DATABASE_URL" -f sql/schema.sql -f sql/schema_mem.sql
-python ingest/ingest_repo.py /path/to/your/repo myrepo out.sql && psql "$DATABASE_URL" -f out.sql
+
+# Every client below reads DATABASE_URL, and an unset one is not an error -- psql would quietly
+# connect to your local default database instead of the stack you just started.
+export DATABASE_URL="postgresql://hm:<the password you generated>@localhost:5432/hypermnesia"
+
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/schema.sql -f sql/schema_mem.sql
+python ingest/ingest_repo.py /path/to/your/repo myrepo out.sql \
+  && psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f out.sql
 python ingest/embed_chunks.py     # fill embeddings
 ```
 
@@ -189,9 +200,17 @@ Two flags worth knowing before your first run:
   with `DELETE FROM documents WHERE repo = <tag>`, so "empty" would mean "delete everything".
 - `--known-hashes known.tsv` re-emits only new and changed documents. Chunks carry the
   embeddings, so a plain re-ingest after editing one file re-embeds the whole corpus. Produce
-  the file with `psql -tAF$'\t' -c "SELECT path, content_hash FROM documents WHERE repo='myrepo'"`
-  against the database you are about to load into — the emitted SQL asserts the two agree and
-  aborts if they do not.
+  the file against the database you are about to load into:
+
+  ```bash
+  psql "$DATABASE_URL" -tAF$'\t' -v ON_ERROR_STOP=1 \
+    -c "SELECT path, content_hash FROM documents WHERE repo='myrepo'" > known.tsv
+  ```
+
+  The emitted SQL opens with a guard that the scope still holds exactly as many documents as
+  the snapshot describes, and raises — aborting the whole transaction — if it does not. That
+  guard only reaches you if psql is run with `-v ON_ERROR_STOP=1`: the file is one
+  `BEGIN; … COMMIT;`, so without it psql prints the error, rolls back at COMMIT and exits 0.
 
 ## Design docs
 

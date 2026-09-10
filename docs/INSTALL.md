@@ -2,9 +2,12 @@
 
 HyperMnesia is a set of small, boring parts around **one Postgres database**:
 
-- **Postgres 16 + pgvector >= 0.8.2** — the only required datastore (vectors + full-text + the
-  structural model all live here). *(0.8.2 fixes a security issue; 0.8.5 fixes HNSW corruption --
-  use the newest you can.)*
+- **Postgres 16 + pgvector >= 0.8.3** — the only required datastore (vectors + full-text + the
+  structural model all live here). Per pgvector's own CHANGELOG: 0.8.2 fixed a buffer overflow in
+  parallel HNSW index builds, **0.8.3 fixed possible index corruption with HNSW vacuuming**, and
+  0.8.4 fixed an `hnsw graph not repaired` error. This project's index is HNSW, so 0.8.3 is the
+  real floor. (0.8.6 is current; its fixes are IVFFlat and cast issues, which do not affect this
+  store. The compose file pins 0.8.5.)
 - **An embedder** producing `bge-m3` (1024-dim) vectors — via **Ollama** (`bge-m3`, GPU/Apple-Silicon
   friendly) or **TEI** (HuggingFace text-embeddings-inference, CPU-capable). Both are cosine-compatible.
 - **(Optional) a reranker** — `bge-reranker-v2-m3` cross-encoder for a precision boost on search.
@@ -69,7 +72,9 @@ export DATABASE_URL="postgresql://postgres:$PGPW@localhost:5432/hypermnesia"
 echo "$DATABASE_URL"   # put this in your shell profile and your MCP client's env
 
 # 2. Schema
-psql "$DATABASE_URL" -f sql/schema.sql -f sql/schema_mem.sql
+# -v ON_ERROR_STOP=1 on every psql call here and below, deliberately: without it psql prints
+# the error, keeps going and exits 0, so a failed statement is indistinguishable from success.
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/schema.sql -f sql/schema_mem.sql
 
 # 3. Embedder: Ollama
 ollama pull bge-m3            # 1.2 GB
@@ -77,14 +82,14 @@ export EMBED_BACKEND=ollama   # http://localhost:11434
 
 # 4. Ingest a repo's markdown, then embed
 python ingest/ingest_repo.py ~/code/myrepo myrepo /tmp/myrepo.sql
-psql "$DATABASE_URL" -f /tmp/myrepo.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f /tmp/myrepo.sql
 python ingest/embed_chunks.py               # fills chunks.embedding
 
 # 5. Build the ANN index — AFTER the first bulk embed, and do not skip it.
 #    schema.sql leaves this commented on purpose: building HNSW before the rows exist is far
 #    slower than building it once they do. Skip it and search still WORKS, so nothing complains
 #    — the dense leg just sequential-scans every vector for the rest of the install's life.
-psql "$DATABASE_URL" -c "CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw \
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw \
   ON chunks USING hnsw (embedding vector_cosine_ops)"
 
 # 6. (optional) reranker on your GPU/Mac
@@ -104,10 +109,12 @@ python3 ci/doctor.py
 Everything (Postgres, TEI embedder, optional reranker) in one compose stack:
 
 ```bash
-cp deploy/docker/.env.example deploy/docker/.env    # set POSTGRES_PASSWORD etc.
+cp deploy/docker/.env.example deploy/docker/.env    # POSTGRES_PASSWORD has no default:
+                                                   # openssl rand -hex 24  (hex, not base64 --
+                                                   # a `/` breaks the postgresql:// URI)
 docker compose -f deploy/docker/docker-compose.yml up -d          # + --profile rerank for the reranker
 docker compose -f deploy/docker/docker-compose.yml exec postgres \
-  psql -U hm -d hypermnesia -f /sql/schema.sql -f /sql/schema_mem.sql
+  psql -v ON_ERROR_STOP=1 -U hm -d hypermnesia -f /sql/schema.sql -f /sql/schema_mem.sql
 ```
 
 Then ingest/embed as in A steps 4 and 5 — including the ANN index, which is easy to miss and
@@ -116,13 +123,18 @@ stack has no Ollama: `export EMBED_BACKEND=tei TEI_URL=http://localhost:8080`. S
 `deploy/docker/docker-compose.yml` for the services and ports. TEI serves `bge-m3` on CPU; add a
 GPU runtime to the compose service for speed.
 
+Every published port binds `${BIND_ADDR:-127.0.0.1}`, so out of the box the stack is reachable
+from this box only. That is the intended default: Postgres holds the personal-memory store, and
+neither TEI nor the reranker has any authentication. Set `BIND_ADDR` in `.env` only when you mean
+to serve the stack to another machine, and put something in front of it when you do.
+
 ## C. Kubernetes
 
 The stack is small; adapt the compose services into your own manifests. **[deploy/k8s/README.md](../deploy/k8s/README.md)**
 describes the shape: a Postgres+pgvector Deployment with a PVC (pin to a node if the PV is
 node-local), a TEI `bge-m3` Deployment, ingest/embed as one-shot Jobs, and the MCP server
 running client-side reaching Postgres via a port-forward or routable Service. Load the schema
-with `kubectl exec ... psql < sql/schema.sql`.
+with `kubectl exec ... psql -v ON_ERROR_STOP=1 < sql/schema.sql`.
 
 ## D. CPU-only minimal (no GPU, no reranker)
 
@@ -163,6 +175,11 @@ that can launch a stdio MCP server runs it with the same `command` and `env` sho
 file the block goes in differs; check your client's own MCP documentation for that path, since
 those move and a list here would go stale without anyone noticing.
 
+It answers `initialize` with `protocolVersion` `2024-11-05` whatever the client asked for, because
+JSON-RPC batching is mandatory from `2025-03-26` and this server does not implement it — echoing a
+later revision would promise something the code does not do. A client that sends a batch anyway
+gets an explicit refusal rather than silence.
+
 Verify a client is really talking to it by calling the `status` tool: it answers from the store,
 so a reply proves the whole chain, not just that the process started.
 
@@ -187,14 +204,15 @@ To auto-capture/inject personal memory, register the hooks in Claude Code settin
 
 | Env | Default | Meaning |
 |-----|---------|---------|
-| `DATABASE_URL` | — | Postgres connection string |
+| `DATABASE_URL` | `postgresql://hm@localhost:5432/hypermnesia` | Postgres connection string. `hm ingest` refuses to run without it; the Python tools, the hooks and the MCP server fall back to that default |
 | `EMBED_BACKEND` | `ollama` | `ollama` or `tei` |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama endpoint |
 | `TEI_URL` | `http://localhost:8080` | TEI endpoint |
 | `HM_RERANK` | unset | path to `rerank/search_reranked.py` (unset = RRF only) |
-| `HM_RERANK_URL` | `http://127.0.0.1:8091` | reranker service |
+| `HM_RERANK_URL` | `http://127.0.0.1:8091` | reranker service; `ci/doctor.py` (and `status`) check it whenever either this or `HM_RERANK` is set, and say so when neither is |
 | `HM_LLM_BACKEND` | auto | `openai` \| `ollama` \| `cli` (auto: openai if HM_LLM_URL set, else cli if HM_LLM_CMD, else ollama) |
-| `HM_LLM_URL`/`HM_LLM_KEY`/`HM_LLM_MODEL` | — | OpenAI-compatible endpoint (memory extraction/consolidation) |
+| `HM_LLM_URL`/`HM_LLM_KEY` | — | OpenAI-compatible endpoint (memory extraction/consolidation) |
+| `HM_LLM_MODEL` | `qwen2.5:7b` | model name for the `openai` and `ollama` backends |
 | `HM_LLM_CMD` | — | CLI distiller (prompt appended as arg, text on stdin) |
 | `HM_RERANK_BIND` | `127.0.0.1` | address the reranker listens on (the endpoint has no auth) |
 | `HM_DB_TIMEOUT_SECS` | `30` | MCP server: ceiling on one `psql` call |
@@ -203,4 +221,4 @@ To auto-capture/inject personal memory, register the hooks in Claude Code settin
 | `HM_STATUS_TIMEOUT_SECS` | `120` | MCP server: ceiling on `status` (every check inside is itself bounded) |
 | `HM_GRAPH_TTL_SECS` | `300` | how long the MCP server may serve a cached component map before re-reading it |
 | `HM_DOC_MAX_CHARS` | `60000` | `get_document` cap; past it the text is cut and the cut is announced |
-| `HM_REPO` | cwd basename | which ingested scope this workspace is — an **exact**, case-sensitive match |
+| `HM_REPO` | cwd basename | which ingested scope this workspace is — an **exact**, case-sensitive match. Unset, the MCP server guesses it from the directory name and strips anything outside `[A-Za-z0-9._-]`; in both cases the scoped tools (`get_project_map`, `get_document`, `search_docs`) open their answer with a `(!) SCOPE:` line saying so |

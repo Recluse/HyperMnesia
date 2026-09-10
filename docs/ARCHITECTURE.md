@@ -111,7 +111,10 @@ that silently unhooked its constraints — the worst case, since the map then li
 than search would), docs ingested behind HEAD, and — informational only — how many constraints
 have no source document, since a full re-ingest nulls those links (the FK is `ON DELETE SET NULL`)
 and many seed rows legitimately carry none. Run it in
-CI or on a schedule against each target repo; it exits non-zero on orphaned globs.
+CI or on a schedule against each target repo; it exits non-zero on orphaned globs, and refuses
+before any of those checks if no component is mapped under the scope it was given — every check is
+scoped by `repo`, so a mistyped or renamed scope would otherwise report zero of everything and
+pass.
 
 **Personal memory (background):** capture hooks enqueue session transcripts; a scheduled job
 distills them to memories via a pluggable LLM; a daily consolidator merges near-duplicates behind

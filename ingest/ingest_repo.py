@@ -378,14 +378,18 @@ def main():
     for relp in oversize:
         sys.stderr.write(f"{repo}: {relp} is over {MAX_FILE_BYTES} bytes -- excluded, and any "
                          f"stored copy will be removed\n")
-    if missing:
-        # Loud and non-zero: the enumeration named files that are not on disk, which means the
-        # listing itself is wrong. Continuing would prune stored documents on the strength of a
-        # broken listing -- the failure this whole path exists to avoid.
-        for relp, exc in missing:
-            sys.stderr.write(f"{repo}: ENUMERATED BUT ABSENT {relp} ({exc})\n")
-        sys.exit(f"{repo}: {len(missing)} enumerated path(s) do not exist -- refusing to emit SQL "
-                 f"that would prune documents based on a listing this broken")
+    for relp, _ in missing:
+        # Listed by the enumeration and absent from disk. The ordinary cause is a file deleted
+        # from the working tree but not yet staged: `git ls-files` reads the index, so it still
+        # names it. Treating that as deleted is CORRECT, and it is what happens -- the path
+        # never entered on_disk, so it falls into `gone` and is pruned.
+        #
+        # (An earlier version exited non-zero here on the theory that any such path meant a
+        # broken listing. That was wrong twice over: it broke ingest for anyone mid-edit with an
+        # unstaged deletion, and the message claimed to be "refusing to emit SQL" from a point
+        # after the SQL had already been written.)
+        sys.stderr.write(f"{repo}: {relp} is listed by git but not on disk -- treating it as "
+                         f"deleted; its stored document will be removed\n")
     if incremental:
         sys.stderr.write(f"{repo}: {n_docs} docs re-emitted ({n_chunks} chunks), "
                          f"{n_kept} unchanged kept, {len(gone)} removed -> {out}\n")
