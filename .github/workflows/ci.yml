@@ -34,6 +34,8 @@ jobs:
         run: python tests/test_doctor.py
       - name: hm ingest (a re-ingest must not silently drop every embedding)
         run: python tests/test_hm_cli.py
+      - name: Latency statistics (no store needed)
+        run: python ci/latency.py --selfcheck
 
   rust:
     runs-on: ubuntu-latest

@@ -11,6 +11,7 @@
 #   ./hm init                  bring up the docker stack, load both schemas, print what to export
 #   ./hm ingest <dir> <scope>  ingest -> embed -> index, incrementally if the scope already exists
 #   ./hm doctor                is this install actually working, or only appearing to
+#   ./hm latency               where the time goes: hook, embedder, database, reranker
 #
 # Env: DATABASE_URL (required by ingest/doctor; init prints the one it just set up).
 set -eu
@@ -136,7 +137,8 @@ sub=$1; shift
 case "$sub" in
     init)   cmd_init "$@" ;;
     ingest) cmd_ingest "$@" ;;
-    doctor) exec "$PY" "$ROOT/ci/doctor.py" "$@" ;;
+    doctor)  exec "$PY" "$ROOT/ci/doctor.py" "$@" ;;
+    latency) exec "$PY" "$ROOT/ci/latency.py" "$@" ;;
     -h|--help|help) usage 0 ;;
     *)      die "unknown command: $sub (try ./hm help)" ;;
 esac

@@ -48,3 +48,28 @@ The abstention probe uses a wholly orthogonal topic, so it proves only that an u
 abstains. It deliberately does NOT exercise the near-topic case the distance tuning above
 addresses: a query that shares one incidental token with a memory is not covered by any probe
 today.
+
+## `ci/latency.py` — where the time goes
+
+Latency, per stage, against your own store: the PreToolUse hook end to end (the one that runs on
+*every* edit, process start included, because that is what you actually wait for), one query
+embedding, the fused RRF statement, `search.py` end to end, and the reranker. Median, p90 and max
+of N runs with the first discarded — a first run measures cold page cache, not this system.
+
+```bash
+DATABASE_URL=... ./hm latency          # or: -n 20 -q "your own query"
+```
+
+Every line is printed next to the corpus it ran against, because a latency figure without a
+document and chunk count cannot be read at all, let alone compared.
+
+## What is deliberately not measured
+
+**Whether any of this makes an agent write better code.** Doing that honestly needs a fixed task
+set, runs with and without injection, and control of everything else that differs between them.
+Nothing here does that, so no number about it appears anywhere in this repo.
+
+The one retrieval-quality figure that does appear — the reranker moving recall@1 by +0.16 — comes
+from a small private evaluation set, and is quoted as what it is: a result on one corpus, not a
+benchmark. `mem_probes.py` above is asserted properties rather than a score for the same reason:
+properties survive being run on a different corpus, and a score does not.

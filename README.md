@@ -159,7 +159,7 @@ See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full system picture
 | `ingest/` | markdown chunker, embedder (Ollama/TEI), hybrid RRF search, `mem_ops`; incremental re-ingest via `--known-hashes` (unchanged docs keep their embeddings) |
 | `rerank/` | optional cross-encoder reranker service + search orchestrator |
 | `hooks/` | Claude Code hooks: constraint inject (`arch_invariants`), profile inject, per-prompt recall, capture, extract, consolidate, reflect (per-project knowledge pages) |
-| `ci/` | `doctor.py` — health check for the faults that leave a working-*looking* install; `freshness.py` — map-staleness / orphan-glob checker (run against a target repo); `check_graph_sql_parity.py` — keeps the Python and Rust copies of the graph query identical |
+| `ci/` | `doctor.py` — health check for the faults that leave a working-*looking* install; `latency.py` — where the time goes (hook, embedder, database, reranker); `freshness.py` — map-staleness / orphan-glob checker (run against a target repo); `check_graph_sql_parity.py` — keeps the Python and Rust copies of the graph query identical |
 | `tests/` | DB-free contract tests, wired into CI: hook I/O, ingest enumeration, incremental ingest |
 | `mcp-server/` | Rust MCP server exposing project map / constraints / search / memory / `status` tools |
 | `deploy/` | docker-compose (single box) + Kubernetes manifests |
