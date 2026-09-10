@@ -67,24 +67,37 @@ def psql(sql, timeout=10):
 STORE_DOWN = os.path.expanduser("~/.claude/hypermnesia-store-down")
 
 
-def store_down_flip(down):
-    """True exactly once per outage -- the first prompt on which the store stopped answering
-    (and again after a recovery followed by a new failure).
+def flag_flip(name, on):
+    """Edge detector on disk: True exactly once per episode of `on`, and again after a
+    recovery followed by a new failure.
 
-    Recall runs on EVERY prompt, so an outage cannot be announced every turn. It must be
-    announced once, though: "nothing was recalled" and "the store never answered" are otherwise
-    the same silence, and the agent then reasons as if memory were empty rather than absent.
+    The hooks run on every prompt and every edit, so a fault cannot be announced each time --
+    that trains the reader to skip the block. But it must be announced ONCE, because
+    "nothing applied" and "nothing was asked" are otherwise the same silence, and the agent
+    then reasons as if the store were empty rather than absent. One marker file per fault
+    kind; its existence IS the state.
     """
+    path = os.path.expanduser(f"~/.claude/hypermnesia-{name}")
     try:
-        was = os.path.exists(STORE_DOWN)
-        if down and not was:
-            open(STORE_DOWN, "w").close()
+        was = os.path.exists(path)
+        if on and not was:
+            # ~/.claude may not exist yet (a fresh machine, a non-Claude host). Without this
+            # the write fails, the flip returns False, and the fault is never announced --
+            # a silent failure in the code whose whole job is to make failure loud.
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, "w").close()
             return True
-        if not down and was:
-            os.remove(STORE_DOWN)
+        if not on and was:
+            os.remove(path)
     except OSError:
         pass
     return False
+
+
+def store_down_flip(down):
+    """The store stopped answering. Shared across hooks on purpose: recall and the invariant
+    hook talk to the same database, so one outage is one announcement between them."""
+    return flag_flip("store-down", down)
 
 
 def read_stdin_json():

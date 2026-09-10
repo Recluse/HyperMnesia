@@ -3,7 +3,7 @@
 Optional. These wire auto-injection of HyperMnesia into Claude Code — the architectural map
 (constraints) *and* personal memory. The store works without them (query via the MCP tools or
 `ingest/mem_ops.py`); the hooks just make delivery hands-free so the agent doesn't have to think
-to ask. All are **fail-open** — they never block a tool call. Silence is not the whole contract, though: on an unreachable store `mem_recall` announces the outage once (not on every prompt) and `mem_profile` says the profile it served came from a stale cache, so a memory-less machine is visible instead of looking like an empty store.
+to ask. All are **fail-open** — they never block a tool call — but none is fail-*silent*. On an unreachable store `mem_recall` announces the outage once (not on every prompt), `mem_profile` says the profile it served came from a stale cache, and `arch_invariants` announces a store that will not answer, a graph that will not parse, and a scope that maps to no component at all. Each of those is announced once per episode, because "this file has no rules" and "the rules never loaded" are otherwise the same silence — and the second one turns the feature off without telling anyone.
 
 | Hook | Claude Code event | What it does |
 |------|-------------------|--------------|
@@ -19,8 +19,12 @@ to ask. All are **fail-open** — they never block a tool call. Silence is not t
 `arch_invariants.py` is what makes constraint delivery *deterministic and unprompted*: before an
 edit, it resolves the file path to its component (Tier 1) and injects the applicable `must`
 invariants as `additionalContext` — the architectural-memory counterpart to `mem_recall`. It reads
-`DATABASE_URL` and `HM_REPO` (or the cwd basename), and shells `psql`; if `psql` or the DB is
-absent it silently exits 0. It injects context and deliberately emits **no** `permissionDecision`: returning `allow` there would auto-approve every edit that happens to carry a `must`, bypassing the normal approval flow. "No opinion" is expressed by omitting the key, and a CI check pins that.
+`DATABASE_URL` and `HM_REPO` (or the cwd basename), and shells `psql`. If the store cannot be
+reached, or the graph will not parse, or `HM_REPO` names a scope no component was ingested
+under, it says so once and exits 0 — the edit is never blocked, but the agent is not left to
+read the silence as "no rules apply". The scope case is worth stating plainly: the match is an
+exact string, so a folder named `Infra` whose docs were ingested as `infra` resolves to nothing
+on every edit, and the notice lists the scopes that do exist so the fix is obvious. It injects context and deliberately emits **no** `permissionDecision`: returning `allow` there would auto-approve every edit that happens to carry a `must`, bypassing the normal approval flow. "No opinion" is expressed by omitting the key, and a CI check pins that.
 
 It injects only `must`, on purpose — `should` constraints are kept out of the every-edit context
 for token budget; call the `get_constraints` MCP tool to see `should`/`info` for a path. It fires

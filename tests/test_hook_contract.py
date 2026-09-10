@@ -42,9 +42,12 @@ GRAPH = {
 }
 
 failures = []
+ran = 0
 
 
 def check(name, ok, detail=""):
+    global ran
+    ran += 1
     print(f"  {'PASS' if ok else 'FAIL'}  {name}" + (f"  -- {detail}" if detail and not ok else ""))
     if not ok:
         failures.append(name)
@@ -56,6 +59,11 @@ def run_hook(script, event, extra_env=None, fake_psql_out=None):
     env.pop("MEM_STALE_DAYS", None)
     env.update(extra_env or {})
     with tempfile.TemporaryDirectory() as tmp:
+        # The hooks keep one-notice-per-fault markers under $HOME/.claude. Never let a test
+        # run write into (or clear) the real one; callers that need the markers to persist
+        # across two runs pass their own HOME.
+        # (setdefault would not do: HOME is already inherited from os.environ.)
+        env["HOME"] = (extra_env or {}).get("HOME", tmp)
         if fake_psql_out is not None:
             shim = os.path.join(tmp, "psql")
             with open(shim, "w", encoding="utf-8") as f:
@@ -112,10 +120,39 @@ def main():
                   "tool_input": {"command": "ls"}}, fake_psql_out=json.dumps(GRAPH))
     check("silent for a non-edit tool", p.stdout.decode().strip() == "" and p.returncode == 0)
 
-    print("== fail-open: a broken store must never block a tool call ==")
-    p = run_hook("arch_invariants.py", ev)  # no psql stub at all
-    check("exits 0 with no store", p.returncode == 0)
-    check("stays silent with no store", p.stdout.decode().strip() == "")
+    print("== fail-open, but not fail-silent ==")
+    # Fail-open is right: a broken store must never block an edit. Fail-SILENT is not -- from
+    # the agent's seat "this file has no rules" and "the rules never loaded" were the same
+    # empty output, so a dead store quietly turned the whole feature off. Announced once.
+    with tempfile.TemporaryDirectory() as home:
+        p = run_hook("arch_invariants.py", ev, extra_env={"HOME": home})  # no psql stub at all
+        check("exits 0 with no store", p.returncode == 0)
+        first = p.stdout.decode().strip()
+        check("says the store did not answer", "did not answer" in first, first[:120])
+        check("the notice is a valid PreToolUse context block",
+              json.loads(first or "{}").get("hookSpecificOutput", {}).get("hookEventName")
+              == "PreToolUse")
+        # ... and only once, or an outage becomes a wall of identical blocks that gets skipped.
+        p2 = run_hook("arch_invariants.py", ev, extra_env={"HOME": home})
+        check("does not repeat the notice on the next edit", p2.stdout.decode().strip() == "")
+
+    print("== a scope with no components is announced, not silently empty ==")
+    # The commonest misconfiguration: the scope is an exact string, so a folder named `Infra`
+    # ingested as `infra` resolves to nothing on every edit, forever, with no signal.
+    with tempfile.TemporaryDirectory() as home:
+        p = run_hook("arch_invariants.py", ev, extra_env={"HOME": home, "HM_REPO": "MyApp"},
+                     fake_psql_out=json.dumps(GRAPH))
+        out_scope = p.stdout.decode()
+        check("names the unmapped scope", "'MyApp'" in out_scope, out_scope[:160])
+        check("lists the scopes that do exist", "myapp" in out_scope, out_scope[:160])
+        check("exits 0", p.returncode == 0)
+
+    print("== an unparseable graph is announced too ==")
+    with tempfile.TemporaryDirectory() as home:
+        p = run_hook("arch_invariants.py", ev, extra_env={"HOME": home},
+                     fake_psql_out="{not json at all")
+        check("says the graph would not parse", "unparseable" in p.stdout.decode())
+        check("exits 0", p.returncode == 0)
 
     print("== SessionStart: mem_profile ==")
     rows = "#PREF# 1|owner prefers one command at a time\n#REVQ# 2|2026-08-29\n#STALE# 0"
@@ -130,7 +167,7 @@ def main():
     check("includes the memory", "one command at a time" in out)
     check("surfaces the pending review queue", "2" in out and "mem_review.py" in out)
 
-    print(f"\n{6 + 11 - len(failures)}/{6 + 11} checks passed"
+    print(f"\n{ran - len(failures)}/{ran} checks passed"
           + (f"; FAILED: {', '.join(failures)}" if failures else ""))
     return 1 if failures else 0
 
