@@ -29,7 +29,22 @@ if not re.fullmatch(r"[a-z_]+", FTS_LANG):   # it is interpolated into SQL liter
     FTS_LANG = "english"
 
 
+# The write path reuses the QUERY embedder, whose 6000-character cut exists because a query is
+# short and must be fast. A memory is neither: a reflect page or a long procedural note runs
+# past it, and the row is then stored in full, full-text indexed in full, and findable
+# semantically only by its opening -- with no error and nothing recorded. Cap it here at the
+# model's real budget instead, and say so on the rare occasion it bites.
+MEM_EMBED_MAX_CHARS = int(os.environ.get("MEM_EMBED_MAX_CHARS", "12000"))
+
+
 def embed(text):
+    text = text or ""
+    if len(text) > MEM_EMBED_MAX_CHARS:
+        sys.stderr.write(
+            f"mem_ops: WARNING embedding only the first {MEM_EMBED_MAX_CHARS} of "
+            f"{len(text)} characters -- the tail of this memory will be findable by exact word "
+            f"but not by meaning. Split it, or raise MEM_EMBED_MAX_CHARS.\n")
+        text = text[:MEM_EMBED_MAX_CHARS]
     return vec_literal(embed_query(text))
 
 

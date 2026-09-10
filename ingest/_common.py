@@ -41,10 +41,19 @@ def embed_texts(texts, timeout=180):
                  timeout=timeout)["embeddings"]
 
 
+EMBED_QUERY_MAX_CHARS = int(os.environ.get("EMBED_QUERY_MAX_CHARS", "12000"))
+
+
 def embed_query(text):
     # Short timeout: a query embedding must be fast; the caller (search) falls back to
     # lexical-only if this raises, so a slow/down embedder can't hang an interactive search.
-    return embed_texts([text[:6000]], timeout=int(os.environ.get("EMBED_QUERY_TIMEOUT", "20")))[0]
+    #
+    # The character cut is for a QUERY, which is short. Callers that embed something longer
+    # (mem_ops embeds whole memories through here) must cap it themselves and say when they do:
+    # a silent cut leaves content stored and lexically indexed in full but semantically
+    # reachable only by its opening.
+    return embed_texts([text[:EMBED_QUERY_MAX_CHARS]],
+                       timeout=int(os.environ.get("EMBED_QUERY_TIMEOUT", "20")))[0]
 
 
 def vec_literal(v):
