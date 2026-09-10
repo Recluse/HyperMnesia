@@ -82,8 +82,17 @@ def list_md(repo_dir, walk=False):
         try:
             commit = subprocess.check_output(["git", "-C", repo_dir, "rev-parse", "HEAD"],
                                              stderr=subprocess.DEVNULL).decode().strip()
-            files = subprocess.check_output(["git", "-C", repo_dir, "ls-files", "*.md"],
-                                            stderr=subprocess.DEVNULL).decode().splitlines()
+            # -z, not splitlines(). git's core.quotePath defaults to TRUE, so a path with any
+            # non-ASCII byte comes back C-escaped and wrapped in double quotes -- the literal
+            # 21-character string "\320\224...md" instead of the filename. open() then fails
+            # with ENOENT, the document is skipped, and on the incremental path that same quoted
+            # string is what lands in the on-disk set: the REAL path is missing from it, so it is
+            # treated as deleted and pruned from the store, embeddings included, while the
+            # warning printed says the opposite. A NUL-separated listing is never quoted, and a
+            # newline in a filename cannot split a record either.
+            files = subprocess.check_output(["git", "-C", repo_dir, "ls-files", "-z", "*.md"],
+                                            stderr=subprocess.DEVNULL).decode("utf-8", "surrogateescape")
+            files = [f for f in files.split("\0") if f]
         except Exception:
             commit, files = "nogit", None
     if files is None:
@@ -109,14 +118,45 @@ def sqlstr(s):
     return "NULL" if s is None else "'" + s.replace("'", "''") + "'"
 
 
+def _hard_slice(para):
+    """Cut a single paragraph that is itself over the ceiling, on line boundaries.
+
+    Splitting on blank lines alone leaves an unbounded chunk whenever the text has none: a
+    generated table, a pasted log, minified JSON, one long fenced block. That chunk is then
+    stored and full-text indexed IN FULL while the embedder silently truncates it to its context
+    window -- TEI is called with truncate=true and Ollama defaults to it -- so the tail is
+    findable by exact word and invisible to the vector leg, and nothing anywhere reports a
+    partial embedding. Lines, not characters: a mid-token cut would corrupt both legs.
+    """
+    if approx_tokens(para) <= HARD_MAX_TOKENS:
+        return [para]
+    out, cur = [], []
+    for line in para.split("\n"):
+        if cur and approx_tokens("\n".join(cur + [line])) > TARGET_TOKENS:
+            out.append("\n".join(cur)); cur = []
+        cur.append(line)
+        # A single line over the ceiling (minified JSON, one enormous table row) cannot be split
+        # further on structure, so cut it on characters rather than emit it whole.
+        while approx_tokens("\n".join(cur)) > HARD_MAX_TOKENS and len(cur) == 1:
+            budget = max(1, int(len(cur[0]) * TARGET_TOKENS / max(1, approx_tokens(cur[0]))))
+            out.append(cur[0][:budget]); cur = [cur[0][budget:]]
+            if not cur[0]:
+                cur = []
+                break
+    if cur and "\n".join(cur).strip():
+        out.append("\n".join(cur))
+    return out or [para]
+
+
 def split_long(text):
     if approx_tokens(text) <= HARD_MAX_TOKENS:
         return [text]
     out, cur = [], ""
     for para in text.split("\n\n"):
-        if cur and approx_tokens(cur + "\n\n" + para) > TARGET_TOKENS:
-            out.append(cur.strip()); cur = ""
-        cur = (cur + "\n\n" + para) if cur else para
+        for piece in _hard_slice(para):
+            if cur and approx_tokens(cur + "\n\n" + piece) > TARGET_TOKENS:
+                out.append(cur.strip()); cur = ""
+            cur = (cur + "\n\n" + piece) if cur else piece
     if cur.strip():
         out.append(cur.strip())
     return out or [text]
@@ -135,7 +175,24 @@ def chunk_md(content):
         for piece in split_long(text):
             chunks.append((hp, piece))
 
+    fence = None            # the ``` or ~~~ run that opened the current code block, if any
     for line in content.split("\n"):
+        # A shell comment, a Python comment or a C preprocessor directive inside a fenced block
+        # starts with '#' and matched HEADING, so every `# comment` in an example split the
+        # chunk mid-fence and pushed a line of code onto the heading path. The result was
+        # unbalanced fences in the stored text and heading_path values like
+        # "Install > #!/bin/sh" -- shown to the agent as the document's structure.
+        stripped = line.lstrip()
+        if fence is None:
+            if stripped.startswith("```") or stripped.startswith("~~~"):
+                fence = stripped[0] * 3
+                buf.append(line)
+                continue
+        else:
+            if stripped.startswith(fence):
+                fence = None
+            buf.append(line)
+            continue
         m = HEADING.match(line)
         if m:
             flush()
@@ -209,7 +266,7 @@ def main():
                  f"If the directory is git-ignored or untracked, re-run with --walk.")
 
     n_docs = n_chunks = n_kept = 0
-    on_disk, replaced, bodies, unreadable, oversize = set(), set(), [], [], []
+    on_disk, replaced, bodies, unreadable, oversize, missing = set(), set(), [], [], [], []
     for rel in files:
         ap = os.path.join(repo_dir, rel)
         relp = rel.replace("\\", "/")
@@ -226,8 +283,17 @@ def main():
             # (EACCES, EIO, too many open files). Letting it fall through to `gone` would DELETE
             # a perfectly good document, its chunks and its embeddings on a transient error, so
             # count it as present and leave the stored row alone.
-            unreadable.append((relp, exc))
-            on_disk.add(relp)
+            #
+            # But only if it IS right there. "Present but unreadable" and "this path does not
+            # exist" are different, and conflating them let a mangled enumeration entry protect
+            # itself: the bogus name went into on_disk, the real document was absent from it and
+            # therefore pruned, and the printed warning claimed the row had been preserved.
+            # Anything that does not exist is a bug in the enumeration, not a transient error.
+            if os.path.exists(ap):
+                unreadable.append((relp, exc))
+                on_disk.add(relp)
+            else:
+                missing.append((relp, exc))
             continue
         if len(raw) > MAX_FILE_BYTES:      # skip giant generated/dumped md
             oversize.append(relp)
@@ -312,6 +378,14 @@ def main():
     for relp in oversize:
         sys.stderr.write(f"{repo}: {relp} is over {MAX_FILE_BYTES} bytes -- excluded, and any "
                          f"stored copy will be removed\n")
+    if missing:
+        # Loud and non-zero: the enumeration named files that are not on disk, which means the
+        # listing itself is wrong. Continuing would prune stored documents on the strength of a
+        # broken listing -- the failure this whole path exists to avoid.
+        for relp, exc in missing:
+            sys.stderr.write(f"{repo}: ENUMERATED BUT ABSENT {relp} ({exc})\n")
+        sys.exit(f"{repo}: {len(missing)} enumerated path(s) do not exist -- refusing to emit SQL "
+                 f"that would prune documents based on a listing this broken")
     if incremental:
         sys.stderr.write(f"{repo}: {n_docs} docs re-emitted ({n_chunks} chunks), "
                          f"{n_kept} unchanged kept, {len(gone)} removed -> {out}\n")

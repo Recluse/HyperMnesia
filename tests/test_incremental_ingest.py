@@ -42,6 +42,11 @@ def git(cwd, *args):
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def write(path, body):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(body)
+
+
 def ingest(repo_dir, out, known=None):
     cmd = [sys.executable, INGEST, repo_dir, "testrepo", out]
     if known:
@@ -128,6 +133,43 @@ def main():
         check("aborts on a snapshot that does not match the DB",
               "DO $do$" in inc and "IF n <> 3 THEN RAISE EXCEPTION" in inc
               and "SELECT count(*) INTO n FROM documents WHERE repo = 'testrepo';" in inc)
+
+    # A path with any non-ASCII byte: git C-escapes and double-quotes it unless asked not to, so
+    # `git ls-files` used to hand back a 21-character literal instead of the filename. The
+    # document was then never ingested, and on the incremental path the bogus string went into
+    # the on-disk set while the REAL path fell into "gone" -- pruning the stored document, its
+    # chunks and its embeddings, under a warning that said the row was being preserved. This
+    # corpus is largely non-English, so that is most of it.
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = os.path.join(tmp, "repo")
+        os.makedirs(repo)
+        git(repo, "init")
+        git(repo, "config", "user.email", "t@t")
+        git(repo, "config", "user.name", "t")
+        # quotePath is git's default; set it explicitly so the test does not depend on the
+        # machine's config being unchanged.
+        git(repo, "config", "core.quotePath", "true")
+        write(os.path.join(repo, "plain.md"), "# Plain\n\nbody\n")
+        write(os.path.join(repo, "Документ.md"), "# Заголовок\n\nтекст\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-m", "init")
+
+        full, report = ingest(repo, os.path.join(tmp, "u.sql"))
+        check("a non-ASCII filename is ingested at all",
+              full.count("INSERT INTO documents") == 2)
+        check("and stored under its real name, not git's C-escaped form",
+              "'Документ.md'" in full and "\\320" not in full)
+
+        known = os.path.join(tmp, "known.tsv")
+        write(known, "plain.md\tdeadbeef\nДокумент.md\tcafebabe\n")
+        inc2, report2 = ingest(repo, os.path.join(tmp, "u2.sql"), known=known)
+        # The snapshot's hashes are deliberately wrong, so both documents are REPLACED (deleted
+        # and re-inserted in the same transaction). What must not happen is a prune: the
+        # non-ASCII path being treated as vanished from disk and dropped without a re-insert.
+        check("an incremental re-ingest prunes nothing", "0 removed" in report2)
+        check("and re-inserts the non-ASCII document rather than dropping it",
+              inc2.count("INSERT INTO documents") == 2
+              and "VALUES ('testrepo','Документ.md'" in inc2)
 
     print(f"\n{ran - len(failures)}/{ran} checks passed"
           + (f"; FAILED: {', '.join(failures)}" if failures else ""))
