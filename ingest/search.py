@@ -152,14 +152,25 @@ def search(query, k=8, repo=None):
         rows.append(r)
         if len(rows) >= k:
             break
-    try:                                     # log for recall tuning (n_results=0 => a gap)
+    _log_query(conn, cur, query, len(rows), rows[0][0] if rows else None)
+    conn.close()
+    return rows
+
+
+def _log_query(conn, cur, query, n_results, top_doc):
+    """Record the search for recall tuning -- n_results=0 is a corpus gap.
+
+    Called from BOTH entry points. It used to be inline in search() only, and the reranked path
+    goes through candidates(), so in the configuration the README recommends the table simply
+    stayed empty -- which reads as "no searches ran", not as "logging is off on this path", and
+    the query it exists to answer ("what did people look for and not find") returned nothing.
+    """
+    try:
         cur.execute("INSERT INTO query_log (query, n_results, top_doc) VALUES (%s,%s,%s)",
-                    (query, len(rows), rows[0][0] if rows else None))
+                    (query, n_results, top_doc))
         conn.commit()
     except Exception:
         conn.rollback()
-    conn.close()
-    return rows
 
 
 def candidates(query, pool, repo):
@@ -167,12 +178,20 @@ def candidates(query, pool, repo):
     emb = _query_vec(query)
     conn = connect(); cur = conn.cursor()
     _tune(cur)
-    cur.execute(RRF_SQL.replace("left(c.content,110)", "left(c.content,512)"),
+    # 3000, not 512. This text IS the passage the cross-encoder scores, and chunks are targeted
+    # at 400 tokens -- roughly 1600 characters of English, more of Cyrillic -- so a 512-character
+    # cut handed the reranker about a third of each passage, three levels upstream of the model
+    # and measured in BYTES. A chunk whose relevant sentence sits after a preamble was scored on
+    # the preamble and pushed under the cutoff, and because the reranker fails open there was no
+    # way to tell that from a working rerank. Let the reranker's own tokenizer do the truncating
+    # at RERANK_MAXLEN, where it is at least token-aware and at the model's configured limit.
+    cur.execute(RRF_SQL.replace("left(c.content,110)", "left(c.content,3000)"),
                 (emb, _no_neg(query), _lex_query(query), repo, pool))
     out = [{"doc": doc, "heading": heading,
             "score": float(score) if score is not None else None,
             "srank": srank, "lrank": lrank, "text": snippet}
            for doc, heading, score, srank, lrank, snippet in cur.fetchall()]
+    _log_query(conn, cur, query, len(out), out[0]["doc"] if out else None)
     conn.close()
     return out
 

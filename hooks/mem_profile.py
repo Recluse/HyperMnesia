@@ -24,17 +24,20 @@ DOWN_NOTE = ("Long-term memory is CURRENTLY UNAVAILABLE (the store did not answe
 STALE_NOTE = "NOTE: the store did not answer; this profile is a cached copy, {age} old."
 STALE_DAYS = int(os.environ.get("MEM_STALE_DAYS", "180"))
 STALE_LINE = ("[Possibly stale] {n} fact(s) older than {d} days have gone unrecalled -- check: python3 hooks/mem_review.py stale")
-TRUNC = 220  # NB: content is whitespace-collapsed in SQL --
+TRUNC = 220  # chars per memory line, and a line longer than this is marked ' ...[cut]'
+# so an amputated rule cannot read as a whole one -- the exception clause of a
+# preference is exactly the part that falls off a 220-character cut.
+# NB: content is whitespace-collapsed in SQL --
 # a multi-line memory (e.g. a reflect page) otherwise emits continuation lines
 # that match no #TAG# prefix and were silently dropped by the parser below.  # chars per memory line
 
 SQL = r"""
-SELECT '#PREF# ' || id || '|' || left(regexp_replace(content, '\s+', ' ', 'g'), %(t)s) FROM mem.active_memories
+SELECT '#PREF# ' || id || '|' || CASE WHEN length(regexp_replace(content, '\s+', ' ', 'g')) > %(t)s THEN left(regexp_replace(content, '\s+', ' ', 'g'), %(t)s) || ' ...[cut]' ELSE regexp_replace(content, '\s+', ' ', 'g') END FROM mem.active_memories
  WHERE memory_type='preference' ORDER BY importance DESC, created_at DESC LIMIT 10;
-SELECT '#FACT# ' || id || '|' || left(regexp_replace(content, '\s+', ' ', 'g'), %(t)s) FROM mem.active_memories
+SELECT '#FACT# ' || id || '|' || CASE WHEN length(regexp_replace(content, '\s+', ' ', 'g')) > %(t)s THEN left(regexp_replace(content, '\s+', ' ', 'g'), %(t)s) || ' ...[cut]' ELSE regexp_replace(content, '\s+', ' ', 'g') END FROM mem.active_memories
  WHERE memory_type IN ('semantic','procedural') AND importance >= 0.6
  ORDER BY importance DESC, created_at DESC LIMIT 10;
-SELECT '#PLAN# ' || id || '|' || left(regexp_replace(content, '\s+', ' ', 'g'), %(t)s) FROM mem.active_memories
+SELECT '#PLAN# ' || id || '|' || CASE WHEN length(regexp_replace(content, '\s+', ' ', 'g')) > %(t)s THEN left(regexp_replace(content, '\s+', ' ', 'g'), %(t)s) || ' ...[cut]' ELSE regexp_replace(content, '\s+', ' ', 'g') END FROM mem.active_memories
  WHERE memory_type='prospective' ORDER BY importance DESC, created_at DESC LIMIT 5;
 SELECT '#REVQ# ' || count(*) || '|' || coalesce(min(created_at)::date::text,'')
   FROM mem.review_queue WHERE status='pending';

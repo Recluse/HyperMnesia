@@ -15,7 +15,7 @@ rerank timeout; a cold search just falls open to RRF and the next one is reranke
   GET  /health -> {"status":"ok", "model":..., "device":..., "loaded": bool}
 
 Env: RERANK_MODEL (default BAAI/bge-reranker-v2-m3), PORT (8091), HM_RERANK_BIND (127.0.0.1),
-     RERANK_MAXLEN (512),
+     RERANK_MAXLEN (1024, the model card's recommendation),
      RERANK_IDLE_SEC (600; 0 disables idle-unload -> always resident).
 A cross-encoder rerank of the top RRF candidates measurably improves recall@1.
 """
@@ -30,7 +30,10 @@ MODEL = os.environ.get("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 # scoring your search can change under you between restarts. Pin it when that matters.
 REVISION = os.environ.get("RERANK_REVISION") or None
 PORT = int(os.environ.get("PORT", "8091"))
-MAXLEN = int(os.environ.get("RERANK_MAXLEN", "512"))
+# 1024 is what the model card recommends for bge-reranker-v2-m3, and the caller now sends whole
+# chunks rather than a 512-byte prefix, so the truncation that does happen happens here -- in
+# tokens, by the model's own tokenizer, at the model's own documented limit.
+MAXLEN = int(os.environ.get("RERANK_MAXLEN", "1024"))
 IDLE_SEC = int(os.environ.get("RERANK_IDLE_SEC", "600"))
 DEV = "mps" if torch.backends.mps.is_available() else "cpu"
 

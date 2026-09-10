@@ -65,14 +65,22 @@ def main():
         return
     cands, degraded = get_candidates(query, k, repo)
     order = cands
+    rerank_failed = ""
     if cands:
-        try:  # fail open to RRF order on any reranker problem
+        # Fail open to RRF order on any reranker problem -- but NOT fail silent. This file
+        # already prints a banner when the embedder degrades; the reranker degrading the same
+        # way printed nothing, so an unreranked answer was formatted exactly like a reranked
+        # one. The common case is not even an outage: the model idle-unloads after 600s and the
+        # next cold request can exceed the timeout.
+        try:
             scores = rerank_scores(query, [c["text"] for c in cands])
             if len(scores) == len(cands):
                 order = [c for _, c in sorted(zip(scores, cands),
                                               key=lambda x: x[0], reverse=True)]
-        except Exception:
-            order = cands
+            else:
+                rerank_failed = (f"returned {len(scores)} scores for {len(cands)} passages")
+        except Exception as exc:
+            rerank_failed = f"{type(exc).__name__}: {exc}"
     per_doc, picked = {}, []
     for c in order:
         d = c["doc"]
@@ -86,6 +94,9 @@ def main():
     if degraded:
         print(f"!! EMBEDDER UNREACHABLE ({degraded}) -- this search was LEXICAL-ONLY: ranking is "
               f"degraded, and few or no results does NOT mean the corpus lacks the topic")
+    if rerank_failed:
+        print(f"!! RERANKER UNAVAILABLE ({rerank_failed}) -- these results are in plain RRF "
+              f"order, NOT reranked: ranking is worse than this deployment normally gives")
     if not picked:
         print("(no results)")
     for c in picked:

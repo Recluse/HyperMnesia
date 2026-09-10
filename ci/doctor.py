@@ -27,7 +27,14 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://hm@localhost:5432/hy
 BACKEND = os.environ.get("EMBED_BACKEND", "ollama").lower()
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 TEI_URL = os.environ.get("TEI_URL", "http://localhost:8080").rstrip("/")
-RERANK_URL = os.environ.get("HM_RERANK_URL", "").rstrip("/")
+# Default it, do not leave it empty. The documented .mcp.json sets HM_RERANK (the script path
+# that routes search through the reranker) and never HM_RERANK_URL, whose default lives in
+# rerank/search_reranked.py -- so the reranker check was skipped in exactly the configuration
+# the docs recommend, and `status`, which advertises "reranker reachable", said nothing at all
+# while search quietly fell back to plain RRF.
+RERANK_DEFAULT_URL = "http://127.0.0.1:8091"
+RERANK_URL = (os.environ.get("HM_RERANK_URL")
+              or (RERANK_DEFAULT_URL if os.environ.get("HM_RERANK") else "")).rstrip("/")
 REPO = os.environ.get("HM_REPO", "")
 
 OK, WARN, FAIL = "ok", "warn", "fail"
@@ -210,7 +217,11 @@ def check_embedder(out):
 
 def check_reranker(out):
     if not RERANK_URL:
-        return                                  # optional by design; not configured is not a fault
+        # Not configured at all is not a fault -- but say that it was not checked, rather than
+        # let a silent skip read as a pass in a report whose whole job is to be complete.
+        out.append(finding(OK, "Reranker not configured", "neither HM_RERANK nor HM_RERANK_URL is set",
+                           ""))
+        return
     ok, how = http_ok(f"{RERANK_URL}/health")
     if ok:
         out.append(finding(OK, "Reranker reachable", RERANK_URL))
