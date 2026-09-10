@@ -90,6 +90,18 @@ def run_ingest(doccount):
 
 
 def main():
+    print("== a scope that would break the SQL is refused before any query runs ==")
+    # The scope goes into a single-quoted SQL literal, so a quote in it is a syntax error at
+    # best. The check must happen in hm, before the first psql call -- ingest_repo.py validates
+    # the same alphabet, but only after two queries have already gone out.
+    for bad in ["o'brien", "x; DROP TABLE documents; --", "with space", ""]:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src"); os.makedirs(src)
+            p = subprocess.run(["sh", HM, "ingest", src, bad], capture_output=True, timeout=60,
+                               env=dict(os.environ, DATABASE_URL="postgresql://stub/stub"))
+            check(f"refuses scope {bad!r}",
+                  p.returncode != 0 and b"scope must match" in p.stderr, p.stderr[:120].decode())
+
     print("== first ingest of an empty scope ==")
     lines, p = run_ingest(0)
     check("exits 0", p.returncode == 0, p.stderr.decode()[-300:])

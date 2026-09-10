@@ -26,7 +26,7 @@ from _llm import complete        # noqa: E402
 MIN_MEMS = int(os.environ.get("MEM_REFLECT_MIN", "5"))   # skip projects with fewer active memories
 MAX_MEMS = int(os.environ.get("MEM_REFLECT_MAX", "80"))  # cap what we feed the LLM
 LOCK = os.path.expanduser("~/.claude/mem-reflect.lock")
-PROFILE_CACHE = "/tmp/hypermnesia-profile-cache.txt"
+PROFILE_CACHE = os.path.expanduser("~/.claude/hypermnesia-profile-cache.txt")  # keep in sync with mem_profile.py
 
 PROMPT = """You maintain a long-term-memory "page" for an AI coding agent about ONE project. Below \
 are its active memory records (type + text). Write a concise, well-organized overview a teammate \

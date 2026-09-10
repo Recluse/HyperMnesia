@@ -38,7 +38,10 @@ cmd_init() {
         step "Writing $env_file"
         cp "$ROOT/deploy/docker/.env.example" "$env_file"
         # Generated, not chosen: a password typed in a hurry outlives the hurry.
-        pw=$(openssl rand -base64 24 2>/dev/null | tr -d '\n/+=' | cut -c1-24) \
+        # Hex, not base64: a '/' or '+' in the password has to be percent-encoded in the
+        # postgresql:// URI this prints, and a password that silently breaks the URI is worse
+        # than a shorter one.
+        pw=$(openssl rand -hex 16 2>/dev/null | tr -d '\n') \
             || die "could not generate a password -- set POSTGRES_PASSWORD in $env_file yourself"
         [ -n "$pw" ] || die "empty password generated -- set POSTGRES_PASSWORD in $env_file yourself"
         # BSD and GNU sed disagree about -i, so write a new file and move it.
@@ -87,6 +90,13 @@ cmd_ingest() {
     [ $# -eq 2 ] || usage
     dir=$1; scope=$2
     [ -d "$dir" ] || die "no such directory: $dir"
+    # Before the first psql call, not inside the python step that runs after it: the scope is
+    # interpolated into a single-quoted SQL literal below, so a quote in it produces a syntax
+    # error at best and executes as written at worst. ingest_repo.py checks the same alphabet,
+    # but by then two queries have already run.
+    case "$scope" in
+        *[!A-Za-z0-9._-]*|"") die "scope must match [A-Za-z0-9._-]+ (got: $scope)" ;;
+    esac
     need psql
     [ -n "${DATABASE_URL:-}" ] || die "DATABASE_URL is not set (./hm init prints it)"
 
@@ -97,8 +107,13 @@ cmd_ingest() {
     # embedding -- a one-file edit costing a full re-embed, quietly. Taking the snapshot from the
     # database we are about to write to is the point: one from anywhere else would mark documents
     # "already stored" that were never there.
-    n=$(psql "$DATABASE_URL" -tAX -v ON_ERROR_STOP=1 \
-        -c "SELECT count(*) FROM documents WHERE repo='$scope'") || die "cannot reach the store"
+    # Do not collapse this into `|| die "cannot reach the store"`: a query that fails for any
+    # other reason would then send the reader to debug Postgres connectivity while the store is
+    # perfectly healthy.
+    if ! n=$(psql "$DATABASE_URL" -tAX -v ON_ERROR_STOP=1 \
+             -c "SELECT count(*) FROM documents WHERE repo='$scope'" 2>&1); then
+        die "could not count documents for scope '$scope': $n"
+    fi
     if [ "$n" -gt 0 ]; then
         step "Scope '$scope' already holds $n document(s) -- ingesting incrementally"
         psql "$DATABASE_URL" -tAX -v ON_ERROR_STOP=1 -F'	' \

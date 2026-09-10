@@ -1,4 +1,9 @@
 # hypermnesia -- single-box stack: Postgres+pgvector, TEI embedder, optional reranker.
+#
+# Every published port binds to 127.0.0.1 unless BIND_ADDR says otherwise. Docker's plain
+# `HOST:CONTAINER` form means 0.0.0.0, and none of these three services should be reachable
+# from the network by default: Postgres holds the personal-memory store, and neither the
+# embedder nor the reranker has any authentication at all.
 #   docker compose up -d                      # Postgres + embedder
 #   docker compose --profile rerank up -d     # + cross-encoder reranker
 # Then load the schema (see docs/INSTALL.md section B).
@@ -9,7 +14,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-hm}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
       POSTGRES_DB: ${POSTGRES_DB:-hypermnesia}
-    ports: ["${PG_PORT:-5432}:5432"]
+    ports: ["${BIND_ADDR:-127.0.0.1}:${PG_PORT:-5432}:5432"]
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ../../sql:/sql:ro
@@ -25,7 +30,7 @@ services:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.7
     command: ["--model-id", "BAAI/bge-m3", "--port", "80",
               "--auto-truncate", "--max-batch-tokens", "4096"]
-    ports: ["${TEI_PORT:-8080}:80"]
+    ports: ["${BIND_ADDR:-127.0.0.1}:${TEI_PORT:-8080}:80"]
     volumes:
       - tei-cache:/data
     environment:
@@ -36,15 +41,18 @@ services:
     profiles: ["rerank"]
     build:
       context: ../../rerank
-    ports: ["${RERANK_PORT:-8091}:8091"]
+    ports: ["${BIND_ADDR:-127.0.0.1}:${RERANK_PORT:-8091}:8091"]
     environment:
       RERANK_MODEL: BAAI/bge-reranker-v2-m3
       RERANK_IDLE_SEC: ${RERANK_IDLE_SEC:-600}
-      # The server defaults to 127.0.0.1, which INSIDE a container means "this container
-      # only" -- the published port above would refuse every connection, and search fails
-      # OPEN to plain RRF, so you would get unreranked results while believing otherwise.
-      # Safe here because only the published port reaches it; do not publish it to 0.0.0.0
-      # on a shared network without a proxy, as the endpoint has no auth.
+      # 0.0.0.0 INSIDE the container, which is not the same as on the host: the server
+      # defaults to 127.0.0.1, and inside a container that means "this container only", so the
+      # published port would refuse every connection -- and search fails OPEN to plain RRF, so
+      # you would get unreranked results while believing you were reranking.
+      #
+      # What actually decides exposure is the host side of `ports:` above, which is why every
+      # one of them is pinned to 127.0.0.1 by default. This endpoint has no authentication;
+      # setting BIND_ADDR to anything else puts it, Postgres and the embedder on that network.
       HM_RERANK_BIND: 0.0.0.0
     volumes:
       - hf-cache:/root/.cache/huggingface

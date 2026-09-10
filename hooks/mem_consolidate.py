@@ -18,7 +18,7 @@ from _mem_common import mem_ops, psql, defang
 from _llm import complete
 
 LOCK = os.path.expanduser("~/.claude/mem-consolidate.lock")
-PROFILE_CACHE = "/tmp/hypermnesia-profile-cache.txt"
+PROFILE_CACHE = os.path.expanduser("~/.claude/hypermnesia-profile-cache.txt")  # keep in sync with mem_profile.py
 SIM_DIST = 0.35          # cosine distance ceiling for "similar enough to review"
 
 GROUPS_SQL = f"""

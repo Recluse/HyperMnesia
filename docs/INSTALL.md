@@ -59,9 +59,14 @@ Read on for the manual steps, for the non-Docker paths, and for Kubernetes.
 
 ```bash
 # 1. Postgres + pgvector (docker) — or a native install with the pgvector extension
-docker run -d --name hm-pg -e POSTGRES_PASSWORD=hm -e POSTGRES_DB=hypermnesia \
-  -p 5432:5432 pgvector/pgvector:0.8.5-pg16
-export DATABASE_URL="postgresql://postgres:hm@localhost:5432/hypermnesia"
+# Bound to loopback and with a generated password, deliberately. `-p 5432:5432` is shorthand
+# for 0.0.0.0 -- on a laptop that means every network you ever join can reach a Postgres whose
+# `postgres` account is the cluster SUPERUSER, and this database holds your personal memory.
+PGPW=$(openssl rand -hex 16)
+docker run -d --name hm-pg -e POSTGRES_PASSWORD="$PGPW" -e POSTGRES_DB=hypermnesia \
+  -p 127.0.0.1:5432:5432 pgvector/pgvector:0.8.5-pg16
+export DATABASE_URL="postgresql://postgres:$PGPW@localhost:5432/hypermnesia"
+echo "$DATABASE_URL"   # put this in your shell profile and your MCP client's env
 
 # 2. Schema
 psql "$DATABASE_URL" -f sql/schema.sql -f sql/schema_mem.sql

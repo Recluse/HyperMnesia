@@ -10,7 +10,13 @@ import os, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _mem_common import psql, read_stdin_json, fence
 
-CACHE = "/tmp/hypermnesia-profile-cache.txt"
+# Under ~/.claude, like every other piece of hook state here (the queue, the locks, the
+# fault markers) -- and NOT in /tmp. This file holds the owner's pinned preferences, key facts
+# and open plans, and it is injected into the model labelled as the owner's own memory. In a
+# world-writable directory with a predictable name that is two problems: anyone on the box
+# reads it, and anyone can pre-create it so the TTL branch below serves THEIR text as the
+# owner's pinned memory without the store ever being consulted.
+CACHE = os.path.expanduser("~/.claude/hypermnesia-profile-cache.txt")
 TTL = 300
 REVIEW_LINE = ("[Waiting for your review] {n} consolidation proposal(s) queued (oldest {d}) -- run: python3 hooks/mem_review.py list")
 DOWN_NOTE = ("Long-term memory is CURRENTLY UNAVAILABLE (the store did not answer). Proceed "
@@ -93,7 +99,11 @@ def main():
         profile = build_profile()
         if profile is not None:
             try:
-                with open(CACHE, "w", encoding="utf-8") as f:
+                # 0600 explicitly: a plain open() takes whatever the umask allows, which is
+                # world-readable on a default 022.
+                os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+                fd = os.open(CACHE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(profile)
             except OSError:
                 pass
