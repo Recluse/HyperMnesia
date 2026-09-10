@@ -6,13 +6,21 @@
 //!
 //! Lean by design: speaks MCP stdio directly (newline-delimited JSON-RPC) -- no async
 //! runtime. Postgres is reached via `psql "$DATABASE_URL"`; doc/memory search shells to
-//! the bundled python scripts. The structural graph is fetched once and cached.
+//! the bundled python scripts.
+//!
+//! Nothing outward is unbounded, and each bound exists because the unbounded version fails
+//! by looking fine: every child process is on a clock (a hung `psql` otherwise hangs the
+//! client with no error), `get_document` is capped with the cut ANNOUNCED (a silently
+//! truncated file is worse than a huge one, because the agent believes it read the whole
+//! thing), and the component map is re-read on a TTL (cached forever, a server alive for
+//! days serves the map it loaded on the day it started).
 
 use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 const GRAPH_SQL: &str = r#"
 SELECT json_build_object(
@@ -34,7 +42,11 @@ SELECT json_build_object(
 );
 "#;
 
-static GRAPH: Mutex<Option<Value>> = Mutex::new(None);
+// The graph is cached WITH the moment it was read. It used to be cached forever: a server
+// process that stays alive for days kept serving the map it loaded on the day it started, so a
+// component added or a key_path fixed in the store never reached the agent until someone
+// restarted the client. Re-read on a TTL instead.
+static GRAPH: Mutex<Option<(Value, Instant)>> = Mutex::new(None);
 
 // -- local process / DB access ----------------------------------------------
 // Everything runs locally: db_query shells to `psql "$DATABASE_URL"`, the search/memory
@@ -74,6 +86,66 @@ fn repo() -> String {
     if safe.is_empty() { "default".to_string() } else { safe }
 }
 
+fn env_secs(key: &str, default: u64) -> u64 {
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or(default)
+}
+
+/// Wait for a child with a deadline, draining both pipes. Returns (ok, stdout, stderr).
+///
+/// The pipes are drained on their own threads, and that is not decoration. Polling try_wait()
+/// while the child writes more than a pipe buffer (64 KiB) deadlocks: the child blocks in
+/// write(), the parent never reads, and the timeout then kills a perfectly HEALTHY process --
+/// a "safety" feature that manufactures the failure it was added to prevent. Read first, wait
+/// second.
+fn wait_with_timeout(mut child: std::process::Child, secs: u64, what: &str)
+    -> Result<(bool, String, String), String> {
+    // Channels, not join handles: the reader must never be something we WAIT on past the
+    // deadline. Killing the child does not necessarily close the pipe -- anything it spawned
+    // inherits the same handle, so a `psql` wrapper or a script with a background job keeps
+    // stdout open after its parent dies, and a join() here would sit there for as long as the
+    // grandchild lives. That turned a 3s timeout into a 30s one, measured.
+    let (tx_out, rx_out) = std::sync::mpsc::channel();
+    let (tx_err, rx_err) = std::sync::mpsc::channel();
+    let mut so = child.stdout.take();
+    let mut se = child.stderr.take();
+    std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(h) = so.as_mut() { let _ = h.read_to_end(&mut b); }
+        let _ = tx_out.send(String::from_utf8_lossy(&b).into_owned());
+    });
+    std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(h) = se.as_mut() { let _ = h.read_to_end(&mut b); }
+        let _ = tx_err.send(String::from_utf8_lossy(&b).into_owned());
+    });
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {
+                if Instant::now() >= deadline { break None; }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(format!("{what}: wait failed: {e}")),
+        }
+    };
+    let Some(st) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        // Return NOW, without collecting output: we are reporting a timeout, and the reader
+        // threads may be stuck on a pipe held by something we did not spawn. They end when it
+        // does. Say the timeout plainly -- one surfacing as an empty result is exactly the
+        // failure mode this project is about.
+        return Err(format!("{what}: no answer within {secs}s, process killed"));
+    };
+    // The child is gone, so EOF is normally immediate. The grace covers the same inherited-pipe
+    // case: take what arrived rather than block the caller on a process we no longer control.
+    let grace = Duration::from_secs(5);
+    Ok((st.success(),
+        rx_out.recv_timeout(grace).unwrap_or_default(),
+        rx_err.recv_timeout(grace).unwrap_or_default()))
+}
+
 fn db_query(sql: &str) -> Result<String, String> {
     use std::process::{Command, Stdio};
     let mut child = Command::new("psql")
@@ -85,21 +157,33 @@ fn db_query(sql: &str) -> Result<String, String> {
         let mut stdin = child.stdin.take().ok_or("no stdin")?;
         stdin.write_all(sql.as_bytes()).map_err(|e| format!("write sql: {e}"))?;
     }
-    let out = child.wait_with_output().map_err(|e| format!("wait: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("psql failed: {}", String::from_utf8_lossy(&out.stderr)));
+    let (ok, out, err) = wait_with_timeout(child, env_secs("HM_DB_TIMEOUT_SECS", 30), "psql")?;
+    if !ok {
+        return Err(format!("psql failed: {err}"));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    Ok(out)
 }
 
 fn graph() -> Result<Value, String> {
+    let ttl = Duration::from_secs(env_secs("HM_GRAPH_TTL_SECS", 300));
     let mut g = GRAPH.lock().unwrap();
-    if g.is_none() {
-        let raw = db_query(GRAPH_SQL)?;
-        let v: Value = serde_json::from_str(raw.trim()).map_err(|e| format!("parse graph: {e}"))?;
-        *g = Some(v);
+    if let Some((v, at)) = g.as_ref() {
+        if at.elapsed() < ttl {
+            return Ok(v.clone());
+        }
     }
-    Ok(g.clone().unwrap())
+    match db_query(GRAPH_SQL).and_then(|raw| {
+        serde_json::from_str::<Value>(raw.trim()).map_err(|e| format!("parse graph: {e}"))
+    }) {
+        Ok(v) => { *g = Some((v.clone(), Instant::now())); Ok(v) }
+        // A refresh that fails must not throw away a map we already have: serving a map five
+        // minutes stale beats serving nothing while the store reboots. A first load has nothing
+        // to fall back to, so that error still propagates.
+        Err(e) => match g.as_ref() {
+            Some((v, _)) => Ok(v.clone()),
+            None => Err(e),
+        },
+    }
 }
 
 // -- Resolver: path -> component (longest-match glob) ------------------------
@@ -322,7 +406,19 @@ fn tool_get_document(path: &str) -> Result<String, String> {
         "SELECT coalesce(string_agg(content, E'\\n\\n' ORDER BY ordinal), '(not found)') \
          FROM chunks c JOIN documents d ON d.id=c.document_id \
          WHERE d.repo='{r}' AND d.path='{esc}';");
-    db_query(&sql).map(|s| s.trim_end().to_string())
+    let doc = db_query(&sql)?;
+    let doc = doc.trim_end();
+    // A whole document goes straight into the caller's context, and some are enormous. Cap it,
+    // and SAY that it was capped: a silently truncated document is worse than a large one,
+    // because the agent then reasons about a file it believes it read in full.
+    let max = std::env::var("HM_DOC_MAX_CHARS").ok().and_then(|v| v.parse().ok()).unwrap_or(60_000usize);
+    if doc.chars().count() <= max {
+        return Ok(doc.to_string());
+    }
+    let cut: String = doc.chars().take(max).collect();
+    Ok(format!("{cut}\n\n[TRUNCATED by the MCP server at {max} characters -- this document is \
+longer. Do not treat the text above as the whole file; search_docs for the section you need, or \
+raise HM_DOC_MAX_CHARS.]"))
 }
 
 fn tool_search_docs(query: &str, k: u32) -> Result<String, String> {
@@ -343,11 +439,11 @@ fn tool_search_docs(query: &str, k: u32) -> Result<String, String> {
         si.write_all(query.as_bytes()).map_err(|e| format!("write: {e}"))?;
         si.write_all(b"\n").ok();
     }
-    let out = child.wait_with_output().map_err(|e| format!("wait: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("search failed: {}", String::from_utf8_lossy(&out.stderr)));
+    let (ok, so, se) = wait_with_timeout(child, env_secs("HM_SEARCH_TIMEOUT_SECS", 60), "search")?;
+    if !ok {
+        return Err(format!("search failed: {se}"));
     }
-    let s = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+    let s = so.trim_end().to_string();
     // Don't assert a cause. Empty stdout means the search printed nothing at all; blaming
     // indexing was a guess that reads as a diagnosis, and it hid the common case (the embedder
     // being down, which search.py now reports in its own output as LEXICAL-ONLY).
@@ -366,11 +462,12 @@ fn tool_memory(cmd: &str, payload: &Value) -> Result<String, String> {
         let mut si = child.stdin.take().ok_or("no stdin")?;
         si.write_all(payload.to_string().as_bytes()).map_err(|e| format!("write: {e}"))?;
     }
-    let out = child.wait_with_output().map_err(|e| format!("wait: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("mem_ops {cmd} failed: {}", String::from_utf8_lossy(&out.stderr)));
+    let (ok, so, se) = wait_with_timeout(child, env_secs("HM_MEMOPS_TIMEOUT_SECS", 60),
+                                         &format!("mem_ops {cmd}"))?;
+    if !ok {
+        return Err(format!("mem_ops {cmd} failed: {se}"));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    Ok(so.trim_end().to_string())
 }
 
 fn tool_status() -> Result<String, String> {
@@ -379,15 +476,15 @@ fn tool_status() -> Result<String, String> {
     // and a health check that drifts reports health it no longer measures.
     use std::process::{Command, Stdio};
     let script = script_path("HM_DOCTOR", "ci/doctor.py");
-    let out = Command::new(py()).arg(&script).arg("--json")
+    let child = Command::new(py()).arg(&script).arg("--json")
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .output().map_err(|e| format!("spawn doctor ({script}): {e}"))?;
+        .spawn().map_err(|e| format!("spawn doctor ({script}): {e}"))?;
+    // Generous, because every check inside is itself bounded and a slow store is the finding.
+    let (_ok, so, se) = wait_with_timeout(child, env_secs("HM_STATUS_TIMEOUT_SECS", 120), "doctor")?;
     // A non-zero exit means the doctor FOUND something, not that it failed to run -- so the
-    // status code is deliberately not checked here; empty output is the real failure.
-    let body = String::from_utf8_lossy(&out.stdout);
-    let findings: Vec<Value> = serde_json::from_str(body.trim()).map_err(|e| {
-        format!("doctor returned no usable findings ({e}): {}", String::from_utf8_lossy(&out.stderr))
-    })?;
+    // status code is deliberately ignored here; empty output is the real failure.
+    let findings: Vec<Value> = serde_json::from_str(so.trim())
+        .map_err(|e| format!("doctor returned no usable findings ({e}): {se}"))?;
     let mut lines = Vec::new();
     // Faults first: an agent reading this needs the problem, not the inventory of what is fine.
     for want in ["fail", "warn", "ok"] {
@@ -541,6 +638,51 @@ const GLOB_CASES: &[(&str, &str, bool)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sh(script: &str) -> std::process::Child {
+        use std::process::{Command, Stdio};
+        Command::new("sh").arg("-c").arg(script)
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().expect("spawn sh")
+    }
+
+    /// The bug this guards: polling try_wait() without draining stdout deadlocks as soon as the
+    /// child writes past the pipe buffer (64 KiB). The child blocks in write(), the parent never
+    /// reads, and the deadline then kills a process that was working perfectly. So: a child that
+    /// prints far more than one buffer must come back whole, and must NOT be reported as timing
+    /// out even with a short deadline.
+    #[test]
+    fn large_output_does_not_deadlock() {
+        let child = sh("i=0; while [ $i -lt 4000 ]; do \
+                        echo 0123456789012345678901234567890123456789012345678901234567890123; \
+                        i=$((i+1)); done");
+        let (ok, out, _) = wait_with_timeout(child, 20, "big").expect("must not time out");
+        assert!(ok, "child should have exited 0");
+        assert!(out.len() > 200_000, "expected >200KB through the pipe, got {}", out.len());
+    }
+
+    /// ... and a child that really is stuck must be killed and SAID to have been killed, not
+    /// returned as an empty result.
+    #[test]
+    fn hung_child_is_killed_and_reported() {
+        let started = Instant::now();
+        let err = wait_with_timeout(sh("sleep 30"), 1, "sleeper").unwrap_err();
+        assert!(err.contains("no answer within 1s"), "unclear message: {err}");
+        assert!(started.elapsed() < Duration::from_secs(10), "did not return near the deadline");
+    }
+
+    /// The one that actually shipped broken: killing the child does not close the pipe if
+    /// something it spawned inherited stdout. Joining the reader then waits for the GRANDchild,
+    /// so a 1s timeout returned after 30s -- the caller hangs exactly as if there were no
+    /// timeout at all. Measured through the real server before this was fixed.
+    #[test]
+    fn timeout_is_not_extended_by_an_inherited_pipe() {
+        let started = Instant::now();
+        let err = wait_with_timeout(sh("sleep 30 & sleep 30"), 1, "orphan").unwrap_err();
+        assert!(err.contains("no answer within 1s"), "unclear message: {err}");
+        assert!(started.elapsed() < Duration::from_secs(5),
+                "returned after {:?} -- the deadline is not being honoured", started.elapsed());
+    }
 
     #[test]
     fn glob_parity() {

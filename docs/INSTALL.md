@@ -150,3 +150,11 @@ To auto-capture/inject personal memory, register the hooks in Claude Code settin
 | `HM_LLM_BACKEND` | auto | `openai` \| `ollama` \| `cli` (auto: openai if HM_LLM_URL set, else cli if HM_LLM_CMD, else ollama) |
 | `HM_LLM_URL`/`HM_LLM_KEY`/`HM_LLM_MODEL` | — | OpenAI-compatible endpoint (memory extraction/consolidation) |
 | `HM_LLM_CMD` | — | CLI distiller (prompt appended as arg, text on stdin) |
+| `HM_RERANK_BIND` | `127.0.0.1` | address the reranker listens on (the endpoint has no auth) |
+| `HM_DB_TIMEOUT_SECS` | `30` | MCP server: ceiling on one `psql` call |
+| `HM_SEARCH_TIMEOUT_SECS` | `60` | MCP server: ceiling on one search |
+| `HM_MEMOPS_TIMEOUT_SECS` | `60` | MCP server: ceiling on one memory operation |
+| `HM_STATUS_TIMEOUT_SECS` | `120` | MCP server: ceiling on `status` (every check inside is itself bounded) |
+| `HM_GRAPH_TTL_SECS` | `300` | how long the MCP server may serve a cached component map before re-reading it |
+| `HM_DOC_MAX_CHARS` | `60000` | `get_document` cap; past it the text is cut and the cut is announced |
+| `HM_REPO` | cwd basename | which ingested scope this workspace is — an **exact**, case-sensitive match |
