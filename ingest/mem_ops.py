@@ -201,6 +201,21 @@ _COMPOUND = re.compile(r"[\w\-]+(?:[./][\w\-]+)+", flags=re.U)
 _WORD = re.compile(r"[\w\-]+", flags=re.U)
 
 
+def _no_neg(q):
+    """Strip leading/trailing dashes from every token so nothing becomes a NEGATED lexeme.
+
+    search.py has had this on the stemmed leg for a while; memory search did not, and passed the
+    raw prompt straight to websearch_to_tsquery. A prompt containing a `-flag`-style token ("why
+    did -O2 break the build") therefore produced a negated lexeme, and the & -> | rewrite turned
+    the lexical leg into "every memory NOT containing that word": the lexical ranks feeding RRF
+    became arbitrary. Bounded by the lexical distance floor, so the symptom is quietly worse
+    ordering rather than an error -- which is why it survived.
+    """
+    toks = [t.strip("-") for t in _WORD.findall(q or "")]
+    toks = [t for t in toks if t]
+    return " ".join(toks) if toks else "zzz-no-lexemes-zzz"
+
+
 def _simple_query(q):
     q, out, pos = q or "", [], 0
     for m in _COMPOUND.finditer(q):
@@ -208,7 +223,9 @@ def _simple_query(q):
         out.append((m.group(0), True))
         pos = m.end()
     out += [(t, False) for t in _WORD.findall(q[pos:])]
-    toks = [t for t, comp in out if comp or (len(t) > 2 and t.lower() not in _STOP)]
+    toks = [t if comp else t.strip("-") for t, comp in out
+            if comp or (len(t) > 2 and t.lower() not in _STOP)]
+    toks = [t for t in toks if t]
     return " ".join(toks) if toks else "zzz-no-lexemes-zzz"   # nothing meaningful -> matches nothing
 
 
@@ -230,7 +247,7 @@ def do_search(cur, p):
     cur.execute("SET hnsw.ef_search = 100")
     cur.execute("SET hnsw.iterative_scan = relaxed_order")
     cur.execute(SEARCH_SQL.format(src=src, maxdist=maxdist, lexdist=lexdist, lang=FTS_LANG),
-                (emb, q, _simple_query(q), proj, proj, types, types, p.get("k", 8)))
+                (emb, _no_neg(q), _simple_query(q), proj, proj, types, types, p.get("k", 8)))
     rows = cur.fetchall()
     ids = [r[0] for r in rows]
     if ids and not p.get("include_inactive"):

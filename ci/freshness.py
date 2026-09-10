@@ -69,6 +69,23 @@ def main():
     conn = connect()
     cur = conn.cursor()
 
+    # 0. does this scope exist at all? An empty component set makes every check below report
+    #    zero, so a repo whose tag is one character off -- a directory named `Infra` ingested as
+    #    `infra`, a renamed folder, a typo in the CI invocation -- passes forever with "MAP
+    #    ORPHANS (0)". That is the exact state arch_invariants.py treats as the commonest and
+    #    best-hidden misconfiguration, and the checker whose stated job is making decay LOUD had
+    #    no equivalent. Name the scopes that do exist, because the fix is nearly always one.
+    cur.execute("SELECT count(*) FROM components WHERE repo=%s", (repo,))
+    if cur.fetchone()[0] == 0:
+        cur.execute("SELECT repo, count(*) FROM components GROUP BY repo ORDER BY repo")
+        known = ", ".join(f"{r} ({n})" for r, n in cur.fetchall()) or "(none)"
+        print(f"-- freshness [{repo} @ {commit[:8]}] --")
+        print(f"NO MAP: nothing is mapped under the scope '{repo}', so every check below would "
+              f"report zero regardless of the map's real state.")
+        print(f"        ingested scopes: {known}")
+        conn.close()
+        return 1
+
     # 1. map orphans -- scope to THIS repo (files is only this repo's tree, so other repos'
     #    components would always "not match" and get falsely flagged under multi-repo).
     cur.execute("SELECT slug, key_paths FROM components WHERE repo=%s AND key_paths <> '{}'", (repo,))

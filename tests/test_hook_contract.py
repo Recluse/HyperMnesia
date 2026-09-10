@@ -159,13 +159,25 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         p = run_hook("mem_profile.py", {"hook_event_name": "SessionStart", "source": "startup"},
                      extra_env={"HOME": tmp}, fake_psql_out=rows)
+        # ... and a second run with a broken store must serve THAT cache, not invent one.
+        p2 = run_hook("mem_profile.py", {"hook_event_name": "SessionStart", "source": "startup"},
+                      extra_env={"HOME": tmp}, fake_psql_out="GARBAGE")
     out = p.stdout.decode()
     check("exits 0", p.returncode == 0, p.stderr.decode()[-200:])
+    # The profile is served from a cache with a 300s TTL, so this block must run against a HOME
+    # of its own -- it used to cache to a fixed /tmp path that run_hook did not isolate, and
+    # every assertion below could then be satisfied by whatever a previous run (or the real
+    # SessionStart hook, minutes earlier) had left there. Verified at the time: with a stub psql
+    # printing only GARBAGE, the full previous profile still came out and the block still passed.
+    check("the profile came from THIS run, not a cache left by another",
+          "one command at a time" in out and "GARBAGE" not in out)
     check("emits a nonce-fenced block", "<personal-memory-profile nonce=" in out
           and "</personal-memory-profile nonce=" in out)
     check("marks the content as data, not instructions", "not instructions" in out or "не инструкции" in out)
     check("includes the memory", "one command at a time" in out)
     check("surfaces the pending review queue", "2" in out and "mem_review.py" in out)
+    check("a cached profile is served rather than a garbled one",
+          "one command at a time" in p2.stdout.decode())
 
     print(f"\n{ran - len(failures)}/{ran} checks passed"
           + (f"; FAILED: {', '.join(failures)}" if failures else ""))

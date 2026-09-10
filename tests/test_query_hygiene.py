@@ -58,6 +58,25 @@ check("an all-stopword query cannot match everything",
       _lex_query("и в на с") == "zzz-no-lexemes-zzz")
 check("ordinary words are kept", _lex_query("деплоится воркер") == "деплоится воркер")
 
+# The same two jobs exist a second time in ingest/mem_ops.py for memory search, and that copy
+# was tested by nothing -- and was NOT equivalent: it passed the raw prompt to the stemmed leg,
+# so a `-flag` token became a negated lexeme and the OR'd leg matched every memory LACKING that
+# word. Two implementations of one rule drift; this pins both to the same contract.
+print("\nmemory search (ingest/mem_ops.py) must behave the same way:")
+msrc = open(os.path.join(ROOT, "ingest", "mem_ops.py"), encoding="utf-8").read()
+mns = {"re": re}
+exec(compile(msrc[msrc.index("_STOP = "):msrc.index("def do_search(")], "mem_ops.py", "exec"), mns)
+m_no_neg, m_simple = mns["_no_neg"], mns["_simple_query"]
+
+check("a leading dash cannot become a negated lexeme there either",
+      "-" not in m_no_neg("-secret деплой"))
+check("nor through the compound/stopword path", "-O2" not in m_simple("why did -O2 break"))
+check("compounds survive whole in memory search too", m_simple("example.com") == "example.com")
+check("a dotted filename survives", m_simple("search.py") == "search.py")
+check("stopwords are still dropped", m_simple("the on of a") == "zzz-no-lexemes-zzz")
+check("an all-punctuation query matches nothing rather than everything",
+      m_no_neg("---") == "zzz-no-lexemes-zzz")
+
 print(f"\n{ran - len(failures)}/{ran} checks passed"
       + (f"; FAILED: {', '.join(failures)}" if failures else ""))
 sys.exit(1 if failures else 0)

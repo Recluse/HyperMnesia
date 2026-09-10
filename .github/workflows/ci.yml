@@ -38,6 +38,17 @@ jobs:
         run: python tests/test_chunker.py
       - name: Latency statistics (no store needed)
         run: python ci/latency.py --selfcheck
+      # Four modules ship an executable self-check and only one of them was run. For each of
+      # the three below, that self-check is the ONLY automated coverage its behaviour has:
+      # Tier-1 selection (longest-match order, 1-hop propagation, cross-repo isolation),
+      # secret redaction, and the novelty gate with its negation guard. A change that leaked
+      # another repo's constraints or broke a redaction pattern passed everything else green.
+      - name: Tier-1 selection (1-hop propagation and cross-repo isolation)
+        run: python hooks/_arch.py
+      - name: Secret redaction patterns
+        run: python ingest/_redact.py
+      - name: Novelty gate and its negation guard
+        run: python hooks/mem_extract.py --selfcheck
 
   rust:
     runs-on: ubuntu-latest
@@ -88,3 +99,11 @@ jobs:
           python ci/check_graph_sql_parity.py --print > /tmp/graph.sql
           psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -tAf /tmp/graph.sql > /tmp/graph.json
           python -c "import json; g=json.load(open('/tmp/graph.json')); c={x['slug'] for x in g['components'] if x['repo']=='myapp'}; assert {'myapp-api','myapp-db','myapp-docs','myapp-root'}<=c, c; assert any(x['scope']=='global' and x['severity']=='must' for x in g['constraints']), 'seed global must missing'; print('GRAPH_SQL golden OK:', sorted(c))"
+      # Nothing in CI executed a single mem.* statement, so abstention and
+      # supersede-not-overwrite -- both headline claims -- were asserted only by a probe that
+      # needs a live embedder and therefore never ran. This needs no embedder: pgvector takes a
+      # literal vector, which isolates the SQL and the view from the model.
+      - name: Memory SQL contract (the view hides what it promises, the gate abstains)
+        env:
+          DATABASE_URL: postgresql://hm:hm@localhost:5432/hypermnesia
+        run: python tests/test_memory_sql.py
