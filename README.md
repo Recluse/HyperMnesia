@@ -12,46 +12,50 @@ memory for AI coding agents — a
 Postgres-backed store that gives an agent (Claude Code, or any MCP client) two things:
 
 1. **Architectural memory (doc-RAG + Tier 0/1)** — your repos' docs made searchable, plus a
-   deterministic *component -> constraint* model so the agent knows the rules that apply to a
-   file **before** it edits, without a search.
-2. **Personal memory** — durable facts/preferences/decisions distilled from work sessions and
-   injected back automatically, so the agent stops re-learning the same things every session.
+   *component -> constraint* map that resolves a file path to the rules covering it, so the
+   applicable invariants reach the agent **before** it edits, without a search.
+2. **Personal memory** — durable facts, preferences and decisions distilled from work sessions
+   and available in later ones, instead of being re-explained.
 
 One store (Postgres + [pgvector](https://github.com/pgvector/pgvector)), local-model friendly
 (embeddings via [Ollama](https://ollama.com) or [TEI](https://github.com/huggingface/text-embeddings-inference)),
-MCP-native, no cloud dependency. Runs on a laptop, one server, or Kubernetes.
+no cloud dependency. Runs on a laptop, one server, or Kubernetes.
 
-> Not a vector-DB wrapper. The value is the **delivery**: constraints for the file you're about
-> to edit are injected by a **PreToolUse hook** (deterministic, unprompted — the agent doesn't
-> have to think to ask), and personal memory is captured/recalled by hooks too — "storage is
-> solved, injection isn't."
+**Two interfaces, and they are not the same thing.** Search, the map and memory are exposed as
+MCP tools, so any MCP client can *ask* for them. The automatic half — constraints injected before
+an edit, memory recalled per prompt, sessions captured — is a set of **Claude Code hooks**.
+Another client gets the data through the same tools, but only when the agent decides to call one,
+which is the weakness the hooks exist to remove.
 
 ## Why
 
-Everything an agent gets wrong twice, it got wrong because nobody handed it the thing it needed
-at the moment it needed it. Three shapes of that:
+A coding agent repeats mistakes when the rule, the earlier decision or the stated preference is
+not in its context at the moment it acts. Having it there is not a guarantee — an agent can be
+handed a rule and break it anyway — but not having it guarantees the miss. Three common gaps:
 
 - **The rule was written down and not read.** Your repo documents that only the data layer talks
-  to Postgres. The agent opens a handler, writes a query, and the rule was two directories away in
-  a file it had no reason to open. It did not disobey; it never saw it.
+  to Postgres. The agent opens a handler, writes a query, and the rule was two directories away
+  in a file it had no reason to open. In that case it did not disobey; it never saw it.
 - **You explain yourself again every session.** The preference you stated last week, the decision
   you took last month, the reason the old approach was abandoned — all of it left with the
   context window.
 - **Search does not fire when it matters.** Retrieval only helps if something calls it, and an
   agent mid-edit does not stop to wonder whether it should. Storage is solved. Delivery is not.
 
-The usual answer is one big instructions file. That works until it doesn't: every rule costs
-tokens on every request whether or not the file being edited has anything to do with it, so the
-file gets trimmed to the rules that apply everywhere — and those are the vaguest ones. It also
-rots in silence. Nothing tells you a path in it moved.
+The usual answer is one big instructions file, and it loses for a specific reason: every rule in
+it costs tokens on every request whether or not the file being edited has anything to do with it,
+so the file gets trimmed to the rules that apply everywhere — and those are the vaguest ones. It
+also goes stale without saying so. Nothing tells you a path in it moved.
 
-HyperMnesia's bet is that **relevance should be computed, not curated**. A file path resolves to
-its component by glob and pulls exactly that component's invariants, one hop of the dependency
-graph included, injected before the edit by a hook rather than waited for. Prose and past
-decisions stay searchable behind that. And because a map like this decays quietly, the decay is
-made loud: globs matching no file are reported, a store that will not answer says so instead of
-looking like a project with no rules, and `./hm doctor` names the faults that leave the system
-working-*looking* rather than broken.
+**The map here is written by hand too. What is automatic is the selection and the delivery.** You
+author the components and their invariants once; from then on a file path is matched against the
+component globs, and that component's `must` rules — plus those reached through one hop of the
+dependency graph — are injected before the edit by a hook, rather than waited for. Documentation
+and past decisions stay reachable behind that, by search.
+
+A hand-authored map rots, so the rot is made visible rather than assumed away: globs that match
+no file are reported, a store that will not answer says so instead of resembling a project with
+no rules, and `./hm doctor` names the faults that leave an install working-*looking*.
 
 If you want to see it rather than read about it: **[docs/DEMO.md](docs/DEMO.md)** — two minutes,
 real output, no install beyond a Postgres.
@@ -100,7 +104,8 @@ flowchart TB
 - **Tier 2 search** fuses dense (bge-m3 embeddings, HNSW) and lexical (composite `tsvector`,
   works for code identifiers and non-English) via **Reciprocal Rank Fusion**, then an optional
   **cross-encoder reranker** ([bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3))
-  reorders the top candidates (measured +0.16 recall@1 on our eval set).
+  reorders the top candidates. (It measurably helped on a private evaluation set; the figure is
+  in [eval/README.md](eval/README.md) with what it is and is not — one corpus, not a benchmark.)
 - **Personal memory** is bi-temporal (event time vs ingestion time), **supersede-not-overwrite**
   (corrections don't destroy history), with an abstention gate (an irrelevant query returns
   nothing, not noise). A background pass consolidates near-duplicates; low-confidence merges wait
@@ -110,38 +115,24 @@ flowchart TB
 - **Constraint injection** is a hook too: a `PreToolUse` hook (`hooks/arch_invariants.py`) resolves
   the file you're about to edit to its component and injects the applicable `must` invariants
   before the edit — so Tier 1 is delivered deterministically, not left to the agent to ask for.
-- **Map freshness** is checkable: `ci/freshness.py` flags component globs that match no file
-  (a moved file silently unhooking its constraints) and documents indexed at an older commit, so
-  the map decays *loudly*, not silently. Asked about a scope nothing is mapped under — a tag one
-  character off, where every check below would report zero — it refuses and names the scopes that
-  do exist.
-- **The install is checkable too**: `ci/doctor.py` (and the `status` MCP tool, which runs the very
-  same script) reports the faults that leave a *working-looking* system — an ANN index that was
-  never built, so the dense leg sequential-scans forever; chunks with no embedding, findable only
-  by the lexical leg; two embedding models in one table, whose vectors cannot be compared; a
-  scope name that differs from the ingested one only in case, so no invariant ever resolves.
-  None of those raises an error anywhere, which is exactly why they need a checker.
-- **Nothing outward is unbounded.** Every child process the MCP server spawns is on a clock, a
-  document comes back capped with an explicit truncation notice rather than 80k tokens of text,
-  and the structural map is re-read on a TTL — a server process that lives for days used to serve
-  the map it loaded on the day it started. When that re-read fails, the cached copy is still
-  served (a store rebooting should not stop the rules arriving) but carries a `(!) STALE MAP`
-  line naming the error and the age, and past ten TTLs it stops being an answer at all.
-- **Failure never looks like an empty answer.** The recurring bug in a system like this is a
-  silence that reads as a fact: search says "no results" when the embedder is down, a hook
-  injects nothing because the query broke, an ingest indexes zero documents and then deletes the
-  corpus it should have refreshed. So: `psql` runs with `ON_ERROR_STOP` (without it a failed
-  query exits 0 and returns an empty string, indistinguishable from "nothing matched"); search
-  announces when it fell back to lexical-only, and when the reranker was unreachable so the
-  results are in plain RRF order; recall says once per outage that memory did not answer; an
-  empty enumeration refuses to write rather than emptying the store; and the
-  consolidator reports a model that gave no verdict instead of recording it as "keep".
+- **Diagnostics, and what happens when something breaks.** A hand-authored map and a
+  self-hosted store both fail in ways that still answer, so the failures are reported rather than
+  inferred: `ci/freshness.py` flags globs matching no file and documents indexed at an older
+  commit, and refuses a scope nothing is mapped under; `./hm doctor` (and the `status` MCP tool,
+  which runs the same script) checks the ANN index, embedding coverage, model consistency and the
+  scope name; search says when it fell back to lexical-only or to plain RRF order; a cached map
+  carries its staleness and expires; an empty enumeration refuses to write rather than emptying
+  the store. Each of those, and why it exists, is in
+  **[docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md)**.
+- **Timeouts, output limits and cache expiry.** Every child process the MCP server spawns is on a
+  clock, a document comes back capped with the cut announced, and the structural map is re-read
+  on a TTL rather than held for the life of the process.
 
 ## Where code fits
 
 HyperMnesia indexes **docs, the architecture map, and memory** — not code symbols. Live code
 structure ("where is `foo` defined, who calls it") is best answered by a **language server**, which
-already keeps a precise, always-fresh index and updates it as you type. Pair HyperMnesia with an
+already keeps a precise index and updates it as you type. Pair HyperMnesia with an
 LSP-backed symbol MCP such as [Serena](https://github.com/oraios/serena): both run as MCP servers
 in the same client, with no overlap —
 
@@ -176,41 +167,36 @@ See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full system picture
 See **[docs/INSTALL.md](docs/INSTALL.md)** for the four deployment options (laptop, single
 server, Kubernetes, CPU-only-minimal) and the hardware / OS / software requirements table.
 
-TL;DR (single box):
+TL;DR (single box). This ends at the first thing you can *see*: an invariant arriving before an
+edit.
 
 ```bash
 cp deploy/docker/.env.example deploy/docker/.env   # POSTGRES_PASSWORD: openssl rand -hex 24
-docker compose -f deploy/docker/docker-compose.yml up -d
-
-# Every client below reads DATABASE_URL, and an unset one is not an error -- psql would quietly
-# connect to your local default database instead of the stack you just started.
-export DATABASE_URL="postgresql://hm:<the password you generated>@localhost:5432/hypermnesia"
-
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/schema.sql -f sql/schema_mem.sql
-python ingest/ingest_repo.py /path/to/your/repo myrepo out.sql \
-  && psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f out.sql
-python ingest/embed_chunks.py     # fill embeddings
+./hm init                          # compose up, wait for Postgres, load both schemas
+export DATABASE_URL=...            # init prints the exact line
+./hm ingest /path/to/your/repo myrepo    # ingest -> embed -> ANN index -> doctor
 ```
 
-Two flags worth knowing before your first run:
+`hm` is the recommended path because the *order* of those steps is load-bearing and getting it
+wrong is silent: the ANN index must be built after the first bulk embed, and a re-ingest without
+a known-hashes snapshot deletes the scope's documents and every embedding with them.
+[docs/INSTALL.md](docs/INSTALL.md) has the same steps by hand, the non-Docker and Kubernetes
+paths, and the flags (`--walk`, `--known-hashes`) that matter on later runs.
 
-- `--walk` enumerates the tree directly instead of asking git. Needed when the corpus is
-  `.gitignore`d (working notes, scratch docs), which `git ls-files` reports as an empty tree.
-  Without it the ingester refuses rather than emitting an empty corpus — a full ingest opens
-  with `DELETE FROM documents WHERE repo = <tag>`, so "empty" would mean "delete everything".
-- `--known-hashes known.tsv` re-emits only new and changed documents. Chunks carry the
-  embeddings, so a plain re-ingest after editing one file re-embeds the whole corpus. Produce
-  the file against the database you are about to load into:
+Documents alone are the cheap half. What pays is the Tier 0/1 map — which files belong to which
+component, and which rules must hold for them — and nothing can generate it honestly from a
+directory listing. Seed one from [examples/seed_example.sql](examples/seed_example.sql), point
+your MCP client at `mcp-server` and register the hooks
+([docs/INSTALL.md](docs/INSTALL.md#mcp-client)), and then watch a rule arrive before an edit:
 
-  ```bash
-  psql "$DATABASE_URL" -tAF$'\t' -v ON_ERROR_STOP=1 \
-    -c "SELECT path, content_hash FROM documents WHERE repo='myrepo'" > known.tsv
-  ```
+```bash
+printf '{"hook_event_name":"PreToolUse","tool_name":"Edit","cwd":"%s",
+        "tool_input":{"file_path":"%s/src/api/users.py"}}' "$PWD" "$PWD" \
+  | HM_REPO=myapp python3 hooks/arch_invariants.py
+```
 
-  The emitted SQL opens with a guard that the scope still holds exactly as many documents as
-  the snapshot describes, and raises — aborting the whole transaction — if it does not. That
-  guard only reaches you if psql is run with `-v ON_ERROR_STOP=1`: the file is one
-  `BEGIN; … COMMIT;`, so without it psql prints the error, rolls back at COMMIT and exits 0.
+If that prints a `hookSpecificOutput` block naming your invariant, the whole chain works.
+**[docs/DEMO.md](docs/DEMO.md)** walks the same path in two minutes with real output.
 
 ## Design docs
 
