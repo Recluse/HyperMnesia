@@ -26,6 +26,36 @@ MCP-native, no cloud dependency. Runs on a laptop, one server, or Kubernetes.
 > have to think to ask), and personal memory is captured/recalled by hooks too — "storage is
 > solved, injection isn't."
 
+## Why
+
+Everything an agent gets wrong twice, it got wrong because nobody handed it the thing it needed
+at the moment it needed it. Three shapes of that:
+
+- **The rule was written down and not read.** Your repo documents that only the data layer talks
+  to Postgres. The agent opens a handler, writes a query, and the rule was two directories away in
+  a file it had no reason to open. It did not disobey; it never saw it.
+- **You explain yourself again every session.** The preference you stated last week, the decision
+  you took last month, the reason the old approach was abandoned — all of it left with the
+  context window.
+- **Search does not fire when it matters.** Retrieval only helps if something calls it, and an
+  agent mid-edit does not stop to wonder whether it should. Storage is solved. Delivery is not.
+
+The usual answer is one big instructions file. That works until it doesn't: every rule costs
+tokens on every request whether or not the file being edited has anything to do with it, so the
+file gets trimmed to the rules that apply everywhere — and those are the vaguest ones. It also
+rots in silence. Nothing tells you a path in it moved.
+
+HyperMnesia's bet is that **relevance should be computed, not curated**. A file path resolves to
+its component by glob and pulls exactly that component's invariants, one hop of the dependency
+graph included, injected before the edit by a hook rather than waited for. Prose and past
+decisions stay searchable behind that. And because a map like this decays quietly, the decay is
+made loud: globs matching no file are reported, a store that will not answer says so instead of
+looking like a project with no rules, and `./hm doctor` names the faults that leave the system
+working-*looking* rather than broken.
+
+If you want to see it rather than read about it: **[docs/DEMO.md](docs/DEMO.md)** — two minutes,
+real output, no install beyond a Postgres.
+
 ## How it works
 
 ```mermaid

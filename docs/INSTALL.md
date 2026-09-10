@@ -127,7 +127,7 @@ setup; you lose the reranker's precision bump but nothing else.
 
 ---
 
-## MCP client (Claude Code)
+## MCP client
 
 Add HyperMnesia's MCP server to your client. For Claude Code, in the repo's `.mcp.json`
 (absolute paths; the server shells to `psql` and the bundled python scripts):
@@ -149,6 +149,27 @@ Build the server once: `cd mcp-server && cargo build --release`. Needs the `psql
 PATH (Tier 0/1 map/constraints/get_document read the DB via `psql "$DATABASE_URL"`); the
 `HM_SEARCH`/`HM_MEM_OPS` scripts need `psycopg2` on `HM_PYTHON` (default `python3`). Omit
 `HM_RERANK` to skip reranking (plain RRF).
+
+### Other MCP clients
+
+The server is a plain **stdio** MCP server. It has no client-specific behaviour, reads its whole
+configuration from the environment above, and speaks newline-delimited JSON-RPC — so any client
+that can launch a stdio MCP server runs it with the same `command` and `env` shown above. Only the
+file the block goes in differs; check your client's own MCP documentation for that path, since
+those move and a list here would go stale without anyone noticing.
+
+Verify a client is really talking to it by calling the `status` tool: it answers from the store,
+so a reply proves the whole chain, not just that the process started.
+
+**What does not port: the hooks.** `PreToolUse` injection, per-prompt recall and the session
+profile are Claude Code features, and they are the part that makes this more than a search index —
+they deliver without being asked. In a client with no hook mechanism you get the same data through
+the same tools, but only when the agent decides to call one, which is exactly the weakness the
+hooks exist to remove. If your client supports any pre-edit or pre-prompt extension point, wire
+`hooks/arch_invariants.py` into it: it reads one JSON object on stdin (`tool_name`, `cwd`,
+`tool_input.file_path`) and prints one JSON object, so adapting it is a matter of renaming fields.
+If it supports none, tell the agent in its system prompt to call `get_constraints` before editing
+and accept that it will sometimes forget.
 
 ## Personal-memory hooks (optional, Claude Code)
 
