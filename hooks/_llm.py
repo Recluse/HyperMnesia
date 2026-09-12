@@ -9,6 +9,15 @@ Backends (auto-selected, or force with HM_LLM_BACKEND = openai | ollama | cli):
 """
 import json, os, subprocess, urllib.request
 
+# The shared settings file, applied before the constants below are computed. Its callers happen
+# to import _mem_common first today, which applies it -- but "happens to, in this import order"
+# is not a property worth resting the model choice on.
+try:
+    from _mem_common import load_env_file
+    load_env_file()
+except Exception:
+    pass
+
 URL = os.environ.get("HM_LLM_URL", "").rstrip("/")
 KEY = os.environ.get("HM_LLM_KEY", "")
 MODEL = os.environ.get("HM_LLM_MODEL", "qwen2.5:7b")

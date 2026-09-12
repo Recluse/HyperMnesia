@@ -318,7 +318,7 @@ fn run_with_timeout(cmd: &str, stdin_text: &str, timeout: Duration) -> Result<St
 // of scanner is the cheaper half of that trade.
 
 #[derive(Debug, Clone, PartialEq)]
-enum Json {
+pub(crate) enum Json {
     Null,
     Bool(bool),
     Num(f64),
@@ -328,25 +328,25 @@ enum Json {
 }
 
 impl Json {
-    fn get(&self, key: &str) -> Option<&Json> {
+    pub(crate) fn get(&self, key: &str) -> Option<&Json> {
         match self {
             Json::Obj(kv) => kv.iter().find(|(k, _)| k == key).map(|(_, v)| v),
             _ => None,
         }
     }
-    fn as_i64(&self) -> Option<i64> {
+    pub(crate) fn as_i64(&self) -> Option<i64> {
         match self {
             Json::Num(n) => Some(*n as i64),
             _ => None,
         }
     }
-    fn as_str(&self) -> Option<&str> {
+    pub(crate) fn as_str(&self) -> Option<&str> {
         match self {
             Json::Str(s) => Some(s),
             _ => None,
         }
     }
-    fn as_arr(&self) -> Option<&[Json]> {
+    pub(crate) fn as_arr(&self) -> Option<&[Json]> {
         match self {
             Json::Arr(v) => Some(v),
             _ => None,
@@ -488,7 +488,7 @@ impl<'a> Scanner<'a> {
     }
 }
 
-fn parse_json(raw: &str) -> Result<Json, String> {
+pub(crate) fn parse_json(raw: &str) -> Result<Json, String> {
     let mut sc = Scanner::new(raw);
     let v = sc.value()?;
     sc.ws();

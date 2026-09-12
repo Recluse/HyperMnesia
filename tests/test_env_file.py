@@ -9,10 +9,12 @@ the runs".
 But it is read by processes that start with no person present, so it has two limits, and both
 are checked here rather than assumed:
 
-  * only names from known prefixes are accepted. Otherwise the settings file is a way to set
-    PATH or PYTHONPATH for a scheduled job;
-  * a file writable by anyone but its owner is ignored ENTIRELY and loudly. A partly-applied
-    file carrying someone else's values is worse than none.
+  * only an exact list of names is accepted. A prefix list was not a boundary -- HM_PYTHON is
+    argv[0] of every mem_ops call and HM_LLM_CMD is executed outright, and both carry the
+    allowed HM_ prefix;
+  * a file that is not the owner's own private file, in the owner's own private directory, is
+    ignored ENTIRELY and loudly. A partly-applied file carrying someone else's values is worse
+    than none.
 
 And a third, not about safety: an explicit environment variable beats the file. Without that you
 could not run one pass with a different threshold without editing the shared settings.
@@ -37,20 +39,24 @@ def check(name, ok, detail=""):
         failures.append(name)
 
 
-def run(env_text, mode=0o600, extra_env=None):
+def run(env_text, mode=0o600, extra_env=None, dir_mode=0o700):
     """Load the settings file in a fresh process; returns (environment as the hook sees it, stderr)."""
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "hypermnesia.env")
         with open(path, "w", encoding="utf-8") as f:
             f.write(env_text)
         os.chmod(path, mode)
+        os.chmod(tmp, dir_mode)
         env = dict(os.environ, HYPERMNESIA_ENV_FILE=path)
-        for k in ("MEM_REFLECT_MIN", "MEM_STALE_DAYS", "PYTHONPATH"):
+        # PATH is popped too, and that is the point of popping it: the loader skips any name
+        # already in the environment, so a PATH check run with PATH set passes whatever the
+        # allowlist does -- it was measuring the wrong rule.
+        for k in ("MEM_REFLECT_MIN", "MEM_STALE_DAYS", "PYTHONPATH", "PATH", "HM_PYTHON"):
             env.pop(k, None)
         env.update(extra_env or {})
         code = ("import sys, os, json; sys.path.insert(0, %r); import _mem_common; "
                 "print(json.dumps({k: os.environ.get(k) for k in "
-                "['MEM_REFLECT_MIN','MEM_STALE_DAYS','PATH','PYTHONPATH']}))"
+                "['MEM_REFLECT_MIN','MEM_STALE_DAYS','PATH','PYTHONPATH','HM_PYTHON']}))"
                 % os.path.join(ROOT, "hooks"))
         p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                            env=env, timeout=60)
@@ -69,13 +75,26 @@ def main():
     seen, _ = run("MEM_REFLECT_MIN=9\n", extra_env={"MEM_REFLECT_MIN": "3"})
     check("the environment wins", seen.get("MEM_REFLECT_MIN") == "3", str(seen))
 
+    print("\n== an empty variable counts as unset, here and in the console ==")
+    # The console's settings screen skips an empty variable and shows the file's value. The
+    # loader used to see the name as present and hand the hook "" -- the two disagreeing about
+    # which value is in force, which is the one thing this console exists to prevent.
+    seen, _ = run("MEM_REFLECT_MIN=9\n", extra_env={"MEM_REFLECT_MIN": ""})
+    check("the file value applies", seen.get("MEM_REFLECT_MIN") == "9", str(seen))
+
     print("\n== foreign names are refused ==")
-    # A settings file able to set PATH for a scheduled job is not a setting, it is a way to
-    # swap out the executables it runs.
+    # A settings file able to choose the interpreter is not a setting file, it is a way to swap
+    # out the executables a scheduled job runs.
     before = os.environ.get("PATH")
-    seen, _ = run("PATH=/evil\nPYTHONPATH=/evil\nMEM_REFLECT_MIN=9\n")
+    seen, err = run("PATH=/evil\nPYTHONPATH=/evil\nHM_PYTHON=/tmp/evil-python\n"
+                    "MEM_REFLECT_MIN=9\n")
     check("PATH is not replaced", seen.get("PATH") != "/evil", str(seen.get("PATH")))
     check("PYTHONPATH is not replaced", seen.get("PYTHONPATH") != "/evil")
+    # The one that mattered: HM_PYTHON passed the old prefix allowlist and became argv[0] of
+    # every mem_ops call the scheduled hooks make.
+    check("HM_PYTHON is not replaced", seen.get("HM_PYTHON") != "/tmp/evil-python",
+          str(seen.get("HM_PYTHON")))
+    check("and it said which names it ignored", "ignored" in err, err[:200])
     check("and an allowed key from the same file did apply", seen.get("MEM_REFLECT_MIN") == "9")
     check("the parent process PATH is untouched", os.environ.get("PATH") == before)
 
@@ -83,6 +102,13 @@ def main():
     seen, err = run("MEM_REFLECT_MIN=9\n", mode=0o666)
     check("not one value was applied", seen.get("MEM_REFLECT_MIN") is None, str(seen))
     check("and it said so on stderr", "ignored entirely" in err, err[:160])
+
+    print("\n== a file in a directory others can write is ignored too ==")
+    # The file's own mode is not the whole story: anyone who can write the directory can replace
+    # the file with their own mode-600 one.
+    seen, err = run("MEM_REFLECT_MIN=9\n", dir_mode=0o777)
+    check("not one value was applied", seen.get("MEM_REFLECT_MIN") is None, str(seen))
+    check("and the reason names the directory", "writable by others" in err, err[:200])
 
     print("\n== a missing file is not an error ==")
     env = dict(os.environ, HYPERMNESIA_ENV_FILE="/nope/hypermnesia.env")

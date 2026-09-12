@@ -17,27 +17,62 @@ import json, os, re, secrets, subprocess, sys
 # first), and it does NOT override what the environment already holds: an explicit variable
 # beats the file, so a one-off run with a different threshold needs no edit here.
 #
-# It is read by processes that start without a person present, hence two limits that are not
-# perfectionism: only names from known prefixes are accepted (otherwise this file is a way to
-# set PATH or PYTHONPATH for a scheduled job), and a file writable by anyone but its owner is
-# ignored ENTIRELY and loudly -- a partly-applied file carrying someone else's values is worse
-# than none.
+# It is read by processes that start without a person present, so what may come out of it is an
+# exact list, not a prefix. A prefix list was never a boundary: HM_PYTHON is argv[0] of every
+# mem_ops call, HM_MEM_OPS is argv[1], and HM_LLM_CMD is executed by _llm.py -- all three carry
+# the allowed HM_ prefix and are each strictly stronger than the PATH the prefix was there to
+# block. The boundary is the stat below: the file is ignored ENTIRELY and loudly unless it is
+# owned by this user, unwritable by anyone else, and sitting in a directory with the same
+# property. A partly-applied file carrying someone else's values is worse than none.
 ENV_FILE = os.path.expanduser(os.environ.get("HYPERMNESIA_ENV_FILE", "~/.claude/hypermnesia.env"))
-_ENV_PREFIXES = ("MEM_", "EMBED_", "HM_", "OLLAMA_", "TEI_")
+
+# The knobs the console offers (console/src/settings.rs, KNOBS) plus the endpoints a deployment
+# has to name somewhere. tests/test_settings_knobs.py keeps this list and that one in step.
+_SETTABLE = frozenset((
+    "HM_LLM_MODEL", "HM_LLM_BACKEND", "HM_LLM_URL", "HM_LLM_KEY",
+    "MEM_NOVELTY_MAXDIST", "MEM_REVIEW_THRESHOLD",
+    "MEM_REFLECT_MIN", "MEM_REFLECT_MAX", "MEM_STALE_DAYS",
+    "MEM_SEM_MAXDIST", "MEM_LEX_MAXDIST",
+    "EMBED_BATCH", "EMBED_MODEL", "EMBED_BACKEND",
+    "OLLAMA_URL", "TEI_URL",
+))
+# Named so the refusal can say WHY, rather than look like a typo: these decide what gets
+# executed, and the settings file is not allowed to decide that.
+_NEVER_FROM_FILE = frozenset(("HM_PYTHON", "HM_MEM_OPS", "HM_SEARCH", "HM_RERANK", "HM_LLM_CMD",
+                              "PATH", "PYTHONPATH", "DATABASE_URL"))
+
+
+def _file_fault(path):
+    """Why the settings file must be ignored, or None. Same verdict the console reports."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None                          # no file is not a fault: there are defaults
+    if st.st_mode & 0o022:
+        return f"{path} is writable by others (chmod 600)"
+    if st.st_uid != os.getuid():
+        return f"{path} is owned by uid {st.st_uid}, not by you ({os.getuid()})"
+    try:
+        d = os.stat(os.path.dirname(path) or ".")
+    except OSError:
+        return None
+    # A directory anyone can write is a file anyone can replace, whatever the file's own mode.
+    if d.st_mode & 0o022 or d.st_uid != os.getuid():
+        return f"{os.path.dirname(path)} is writable by others, so the file can be replaced"
+    return None
 
 
 def load_env_file(path=None):
     """Apply KEY=value lines from the settings file to os.environ. Returns what it applied."""
     path = path or ENV_FILE
     applied = {}
-    try:
-        st = os.stat(path)
-    except OSError:
+    fault = _file_fault(path)
+    if fault:
+        sys.stderr.write(f"_mem_common: {fault} -- the settings file was ignored entirely\n")
         return applied
-    if st.st_mode & 0o022:
-        sys.stderr.write(f"_mem_common: {path} is writable by others -- the settings file was "
-                         f"ignored entirely (chmod 600)\n")
+    if not os.path.exists(path):
         return applied
+    refused = []
     try:
         with open(path, encoding="utf-8") as fh:
             for line in fh:
@@ -46,14 +81,21 @@ def load_env_file(path=None):
                     continue
                 k, _, v = line.partition("=")
                 k, v = k.strip(), v.strip().strip('"').strip("'")
-                if not k.startswith(_ENV_PREFIXES) or not re.fullmatch(r"[A-Z][A-Z0-9_]*", k):
+                if k in _NEVER_FROM_FILE or k not in _SETTABLE:
+                    refused.append(k)
                     continue
-                if k in os.environ:          # an explicit variable beats the file
+                # An empty variable counts as unset -- the console's settings screen decides the
+                # same way, and the two disagreeing about which value is in force is the whole
+                # thing this console exists to prevent.
+                if os.environ.get(k):        # an explicit variable beats the file
                     continue
                 os.environ[k] = v
                 applied[k] = v
     except OSError:
         pass
+    if refused:
+        sys.stderr.write(f"_mem_common: {path}: ignored, nothing here reads them as settings: "
+                         f"{', '.join(sorted(set(refused)))}\n")
     return applied
 
 

@@ -35,8 +35,14 @@ def check(name, ok, detail=""):
 
 
 def psql(sql):
-    p = subprocess.run(["psql", DATABASE_URL, "-tAX", "-v", "ON_ERROR_STOP=1"],
-                       input=sql.encode(), capture_output=True, timeout=60)
+    try:
+        p = subprocess.run(["psql", DATABASE_URL, "-tAX", "-v", "ON_ERROR_STOP=1"],
+                           input=sql.encode(), capture_output=True, timeout=60)
+    except FileNotFoundError:
+        # Say which of the two it is. A stack trace ending in FileNotFoundError reads like a
+        # broken test, and this test needs a live store on purpose.
+        raise SystemExit("psql is not on PATH -- this test needs a live database "
+                         "(DATABASE_URL) and is meant to be skipped without one")
     if p.returncode != 0:
         raise SystemExit(f"psql failed:\n{p.stderr.decode()}\n--- sql ---\n{sql}")
     return p.stdout.decode().strip()

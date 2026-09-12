@@ -258,7 +258,10 @@ def do_search(cur, p):
     # memories start ~0.52 on bge-m3, so a looser lexical gate re-admits exactly the noise the
     # semantic gate rejects. The lexical leg still re-ranks (RRF) and can surface plausible hits
     # outside the semantic top-30; identifier queries sit well inside the gate anyway.
-    lexdist = float(os.environ.get("MEM_LEX_MAXDIST", 0) or maxdist)
+    # `.get(KEY) or maxdist`, not `.get(KEY, 0) or maxdist`: the second form made an explicit
+    # MEM_LEX_MAXDIST=0 fall back to maxdist, because the default 0 it returned was an int and
+    # falsy -- so the console displayed a setting of 0 as in force while 0.5 was in force.
+    lexdist = float(os.environ.get("MEM_LEX_MAXDIST") or maxdist)
     cur.execute("SET hnsw.ef_search = 100")
     cur.execute("SET hnsw.iterative_scan = relaxed_order")
     cur.execute(SEARCH_SQL.format(src=src, maxdist=maxdist, lexdist=lexdist, lang=FTS_LANG),

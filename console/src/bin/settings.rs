@@ -32,7 +32,17 @@ fn main() {
         Some("unset") => {
             let Some(k) = args.get(1) else { fail("give a key") };
             match settings::unset(k) {
-                Ok(()) => println!("{k} removed; the default value is in effect"),
+                Ok(()) => {
+                    println!("{k} removed from {}", settings::env_file().display());
+                    // "the default is in effect" is false in exactly the case the set branch
+                    // already warns about: the same variable set in this shell.
+                    match std::env::var(k) {
+                        Ok(v) if !v.is_empty() => println!(
+                            "! but {k}={v} is set in this session's environment, so the default \
+                             is NOT in effect here. It is in effect for what launchd starts."),
+                        _ => println!("the default value is in effect"),
+                    }
+                }
                 Err(e) => fail(&e),
             }
         }
@@ -51,32 +61,46 @@ fn show() {
     let path = settings::env_file();
     println!("Settings file: {}{}", path.display(),
              if path.exists() { "" } else { "  (not created yet)" });
+    // The loader refuses the whole file on this, so every value in it is out of force. Without
+    // this line the screen showed each one as "file" while the pipeline ran on defaults.
+    let ignored = settings::fault();
+    if let Some(why) = &ignored {
+        println!("! the hooks IGNORE this file entirely: {why}");
+        println!("! so everything below marked (file) is NOT in force -- the default is.");
+        println!("  fix it with: chmod 600 {}", path.display());
+    }
     println!();
 
     for k in KNOBS {
-        let (val, src) = settings::effective(k, &file);
+        let (mut val, src) = settings::effective(k, &file);
         let mark = match src {
-            Source::Env(_) => "environment",
+            Source::Env(_) => "this shell",
+            // A file the loader refuses is not a source of anything: the value column has to
+            // show what is actually in force, which is the default.
+            Source::File(_) if ignored.is_some() => {
+                val = format!("{} (file: {val})", k.default);
+                "default"
+            }
             Source::File(_) => "file",
             Source::Default => "default",
         };
-        println!("  {:<22} {:<12} {:<12} {}", k.key, val, mark, k.what);
+        println!("  {:<22} {:<20} {:<12} {}", k.key, val, mark, k.what);
         println!("  {:<22} read by {}", "", k.read_by);
-        if matches!(src, Source::Env(_)) && file.contains_key(k.key) {
-            // Otherwise the value in the file looks like the one in effect, when it has been
-            // overridden.
-            println!("  {:<22} ! the file says {:?}, but the environment is stronger", "",
-                     file.get(k.key).cloned().unwrap_or_default());
+        if matches!(src, Source::Env(_)) {
+            // "environment" means this shell. launchd starts its jobs with a minimal one, so for
+            // the scheduled half of the pipeline the file (or the default) is what is in force.
+            let for_jobs = file.get(k.key).cloned()
+                .filter(|_| ignored.is_none())
+                .unwrap_or_else(|| format!("{} (the default)", k.default));
+            println!("  {:<22} ! only in this shell; jobs launchd starts use {for_jobs}", "");
         }
     }
     println!();
     // The one limit that is invisible otherwise, and the reason this is a line of output rather
     // than a comment in the source: the file sets the environment of processes that start on
-    // THIS machine. If you deployed ingest/mem_ops.py into a container or a pod, its own
-    // environment wins there and nothing written here reaches it.
-    println!("These reach a process only if it starts on this machine. If you run");
-    println!("ingest/mem_ops.py in a container or a pod, that environment wins for the two knobs");
-    println!("it reads, whatever this screen says.");
+    // THIS machine.
+    println!("These reach a process only if it starts on this machine. A script you run inside a");
+    println!("container or a pod reads that environment, whatever this screen says.");
     println!();
     println!("hypermnesia-settings set <KEY> <value> -- write it; unset <KEY> -- back to the default");
 }
@@ -88,7 +112,11 @@ hypermnesia-settings -- the shared settings of the memory pipeline.
     hypermnesia-settings set <KEY> <value>   write it into ~/.claude/hypermnesia.env
     hypermnesia-settings unset <KEY>         remove it, going back to the default value
 
-Where a value came from matters more than the value itself: an environment variable is
-stronger than the file, the file is stronger than the default. Knobs that are read inside
-a cluster pod are shown read-only -- the local file does not reach them.
+Where a value came from matters more than the value itself: a variable set in this shell is
+stronger than the file, the file is stronger than the default -- but this shell is only this
+shell. Jobs started by launchd get a minimal environment, so for them the file's value is the
+one in force.
+
+The hooks ignore the whole file unless it is your own private file in your own private
+directory. The screen says so when it is not.
 ";

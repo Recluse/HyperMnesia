@@ -8,7 +8,21 @@ Env:
   OLLAMA_URL     http://localhost:11434     (+ EMBED_MODEL, default 'bge-m3')
   TEI_URL        http://localhost:8080
 """
-import json, os, urllib.request
+import json, os, sys, urllib.request
+
+# The shared settings file is applied HERE as well, not only in the hooks.
+#
+# It used to be applied in exactly one place -- hooks/_mem_common, on import -- and neither this
+# module nor embed_chunks.py nor mem_ops.py goes through it when it is started by the MCP server
+# or by hand. So EMBED_BACKEND, EMBED_MODEL, EMBED_BATCH, MEM_SEM_MAXDIST and MEM_LEX_MAXDIST were
+# offered by the console, displayed as "in effect", and read by processes the file never reached.
+# This is the module all three import, which makes it the one place that fixes all five.
+try:
+    sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hooks"))
+    from _mem_common import load_env_file   # noqa: E402  (applies the file on import)
+    load_env_file()
+except Exception:                            # a deployment that ships ingest/ without hooks/
+    pass                                     # keeps working on its own environment
 
 import psycopg2
 
