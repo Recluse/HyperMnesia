@@ -103,3 +103,28 @@ Without it, psql prints the error, carries on to `COMMIT` (which becomes a rollb
 **0**. A failed query then returns an empty string, indistinguishable from "nothing matched" — and
 every guard inside the transaction, including the snapshot check above, is silenced along with it.
 Every invocation in this repo's code and documentation sets it. If you write your own, set it too.
+
+## What the console tells you about itself
+
+The console is a tool for noticing silence, so silence in the console is the worst bug it can
+have. What it says, and what each line means:
+
+| On screen | What it means |
+|-----------|---------------|
+| `! not updated: <reason>, showing state from 4m ago` | the reading failed; these numbers are old and this is how old |
+| `! no answer about a reading for 2m -- the reader is stuck` | the worker thread is alive and has stopped answering |
+| `! the reader thread has died` | nothing will update again; restart the tray |
+| `never ran (installed 3 d ago)` | launchd has started this job zero times and it has written no log |
+| `! the period has already passed and launchd still never ran it` | a whole period and a half with no run — the complaint, as opposed to the observation above |
+| `! it ran at some point, but the log has not moved for more than a period` | it worked once and stopped |
+| `! unreadable plist: <plutil said>` | launchd refused this job too; it is not running |
+| `! exit 2, 5m ago` | the last run failed. `freshness` exits 1 by design, meaning discrepancies were found |
+| `! the hooks IGNORE this file entirely: <why>` | the settings file is out of force; the defaults are running |
+| `file (IGNORED)` / `5 (file: 9)` | the file says 9, the default 5 is what is actually in effect |
+| `this shell` as a source | set here, but launchd's jobs do not inherit it — the line below says what they use |
+| `the answer parsed but has no "memories"` | something answered, but it was not this query's result. Not a store full of zeros |
+
+Two readings that are NOT complaints, and are deliberately not marked: a job with no schedule
+(`on demand`) never being "overdue", and a positive run counter with no log to date it by. The
+run counter is per-bootstrap — launchd resets it at every login — so it can only ever prove that
+something ran, never that nothing did.

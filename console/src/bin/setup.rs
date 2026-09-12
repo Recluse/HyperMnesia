@@ -250,6 +250,9 @@ fn run_hm(args: &[&str]) -> bool {
 fn connect() -> bool {
     println!("\nDeployments differ by exactly one thing: the command that runs psql.");
     println!("Pick the shape closest to yours:\n");
+    println!("  (A password inside the command ends up in psql's argv, where any process running");
+    println!("   as you can read it. ~/.pgpass or PGPASSWORD in the command's own environment");
+    println!("   keeps it out of sight.)\n");
     for (i, (name, _)) in PRESETS.iter().enumerate() {
         println!("  {}) {}", i + 1, describe(name));
     }
@@ -514,8 +517,14 @@ surfaces as someone else's broken install.
 It never writes outside this repository without printing the exact text first, and it refuses to
 merge into a config file you already have.
 
-Connection settings go to ~/.config/hypermnesia/console.conf (mode 600 -- the string can carry a
-password). HM_PSQL_CMD in the environment beats the file.
+Connection settings go to ~/.config/hypermnesia/console.conf, created mode 600 -- the string can
+carry a password. The file is REFUSED, whole, if another account can write it or it is not yours:
+what it holds is a command this console runs unattended at login.
+
+A password written into the command reaches psql's argv, which any process running as you can
+read. ~/.pgpass, or PGPASSWORD set in the command's own environment, keeps it out of sight.
+
+HM_PSQL_CMD in the environment beats the file.
 ";
 
 #[cfg(test)]

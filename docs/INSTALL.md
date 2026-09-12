@@ -200,6 +200,41 @@ To auto-capture/inject personal memory, register the hooks in Claude Code settin
 `mem_extract` / `mem_consolidate` schedule. Configure the distiller via `HM_LLM_BACKEND` + `HM_LLM_URL`/`HM_LLM_MODEL` (OpenAI-compatible),
 `HM_LLM_MODEL` (Ollama), or `HM_LLM_CMD` (a CLI) — see `hooks/_llm.py`. Everything is fail-open: if the store is unreachable, the agent keeps working.
 
+## The console (optional, macOS menu bar + CLI)
+
+`console/` is the operator's side: what the store holds, whether the scheduled passes are running,
+and what the tunables are set to.
+
+```bash
+cd console && cargo build --release
+./target/release/hypermnesia-setup          # the walkthrough, including the connection
+./target/release/hypermnesia-stats          # the numbers, once
+./target/release/hypermnesia --install      # the menu-bar tray, at login (macOS)
+```
+
+It reaches the database through ONE setting: a command that receives SQL on stdin and prints
+unaligned rows. The wizard offers the four usual shapes — direct psql, `docker exec`,
+`kubectl exec`, ssh to a machine that has kubectl — and tries the command before saving it.
+
+| File | What |
+|------|------|
+| `~/.config/hypermnesia/console.conf` | the console's own settings: `HM_PSQL_CMD`, `HM_JOB_PREFIX`. Created mode 600 |
+| `~/.claude/hypermnesia.env` | the pipeline's shared tunables, the file `hypermnesia-settings` writes |
+
+Both are **refused entirely** — loudly, falling back to defaults — unless the file is yours, is
+unwritable by any other account, and sits in a directory with the same property. The first holds a
+command run through `sh -c` at every refresh and at login with nobody present; the second sets the
+environment of the jobs launchd starts. `HM_PSQL_CMD` in the environment beats the config file.
+
+A password inside the psql command ends up in psql's argv, where any process running as you can
+read it. `~/.pgpass` or `PGPASSWORD` in the command's own environment avoids that.
+
+`~/.claude/hypermnesia.env` may set only the tunables in the table below plus the endpoint
+variables; names that decide what gets EXECUTED (`HM_PYTHON`, `HM_MEM_OPS`, `HM_SEARCH`,
+`HM_RERANK`, `HM_LLM_CMD`, `PATH`, `PYTHONPATH`) are refused by name. A variable already set in the
+environment beats the file — but "the environment" means the shell that started the process, and
+launchd gives its jobs none of yours, so for the scheduled passes the file is what is in force.
+
 ## Configuration reference
 
 | Env | Default | Meaning |

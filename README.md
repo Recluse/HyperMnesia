@@ -160,6 +160,7 @@ See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full system picture
 | `ci/` | `doctor.py` — health check for faults that leave an install answering normally (missing index, partial embeddings, mixed models, wrong scope); `latency.py` — where the time goes (hook, embedder, database, reranker); `freshness.py` — map-staleness / orphan-glob checker (run against a target repo); `check_graph_sql_parity.py` — keeps the Python and Rust copies of the graph query identical |
 | `tests/` | contract tests, all wired into CI: hook I/O, ingest enumeration, incremental ingest, chunk bounds, glob parity, query hygiene, `doctor`, `hm ingest` — all DB-free except `test_memory_sql.py`, which asserts the `mem.*` view (supersede, validity window) and the abstention gate against a live pgvector, with no embedder |
 | `mcp-server/` | Rust MCP server exposing project map / constraints / search / memory / `status` tools |
+| `console/` | the operator's side: a menu-bar tray and four command-line tools (`stats`, `jobs`, `settings`, `setup`) over any deployment — volumes, scheduled jobs, tunables, and a first-run wizard |
 | `deploy/` | docker-compose (single box) + Kubernetes manifests |
 | `examples/` | an example structural-tier seed for a project |
 | `skills/` | `onboard-project` — the six steps to connect a new repo; `just` — answer-only / audit mode (agent-readable skills) |
@@ -209,6 +210,36 @@ hook, or that your MCP client reached the server — for the first, make an edit
 and look for the same block; for the second, call the `status` tool, which answers from the store.
 
 **[docs/DEMO.md](docs/DEMO.md)** walks the same path in two minutes with real output.
+
+## The console
+
+Everything above answers questions asked of it. The console is the other direction: what the store
+holds, whether the scheduled passes are running, and what the tunables are set to — without
+writing a query.
+
+```bash
+cd console && cargo build --release       # two dependencies, both only for the tray
+./target/release/hypermnesia-setup        # the walkthrough: from nothing to a menu-bar icon
+```
+
+It reaches the database exactly one way: a command that receives SQL on stdin. Direct psql,
+`docker exec`, `kubectl exec`, ssh to a machine that has kubectl — all of them are one string with
+different contents, which is why there is one setting and not five. The wizard tries the command
+before writing it, because an untried setting is a guess, and a console showing an empty screen
+cannot be told from an empty store.
+
+| Command | What |
+|---------|------|
+| `hypermnesia` | the menu-bar tray: volumes, a Run-now button per job, schedules, refresh |
+| `hypermnesia-stats` | the same numbers on stdout |
+| `hypermnesia-jobs` | scheduled passes: what is configured, when each last worked, run one now, change a schedule |
+| `hypermnesia-settings` | the tunables, each with the value in force and where that value came from |
+| `hypermnesia-setup` | the first-run walkthrough, and `--connect` / `--show` / `--test` on their own |
+
+The rule it is written to is the one this project is about: **stale must not look fresh, and
+missing must not look empty.** A reading that failed keeps the old numbers and labels them with
+their age; a job that never ran says so rather than showing launchd's zero as success; a settings
+file the hooks refuse is reported as refused, not displayed knob by knob as if it applied.
 
 ## Design docs
 
