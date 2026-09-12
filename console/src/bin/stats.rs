@@ -85,7 +85,12 @@ fn render(s: &Stats) {
              if s.review_pending > 0 {
                  format!(", oldest {} days", s.review_oldest_days)
              } else { String::new() });
+    // 180 is written into stats.sql, while MEM_STALE_DAYS governs the list the session-start
+    // hook prints. Naming both is the only way the two surfaces cannot quietly disagree about
+    // what "stale" means.
     println!("STALE             {} (active, older than 180 days, confirmed by nobody)", s.stale);
+    println!("                  this figure is fixed at 180 days; MEM_STALE_DAYS governs the \
+              list the session-start hook prints");
     println!("STORE SIZE        {}", s.db_size);
     println!();
     println!("(the reading took {:.1}s)", s.took.as_secs_f32());

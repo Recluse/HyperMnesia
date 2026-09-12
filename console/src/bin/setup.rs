@@ -77,24 +77,55 @@ fn walkthrough() {
     }
 
     step(3, "A repository to remember");
-    if hm_path().is_some() && yes("Ingest a repository now? (runs ./hm ingest)", true) {
+    // `hm ingest` requires DATABASE_URL in its own environment -- it connects directly, not
+    // through the command configured in step 2. Shelling into a certain failure and then
+    // narrating success for four more steps is worse than saying this now.
+    let mut ingested: Option<String> = None;
+    let have_url = std::env::var("DATABASE_URL").map(|v| !v.is_empty()).unwrap_or(false);
+    if hm_path().is_none() {
+        println!("Skipped: ./hm is not next to this binary. `./hm ingest <dir> <scope>` from a");
+        println!("checkout does it later.");
+    } else if !have_url {
+        println!("Skipped: DATABASE_URL is not set in this shell, and `hm ingest` connects with");
+        println!("it directly -- the command from step 2 is the console's, not the ingester's.");
+        println!("Export it (./hm init prints the line) and run: ./hm ingest <dir> <scope>");
+    } else if yes("Ingest a repository now? (runs ./hm ingest)", true) {
         let dir = ask("Path to the repository", "");
         let scope = ask("Scope name to store it under", "myrepo");
-        if !dir.trim().is_empty() {
-            run_hm(&["ingest", dir.trim(), scope.trim()]);
+        let (dir, scope) = (dir.trim().to_string(), scope.trim().to_string());
+        if dir.is_empty() {
+            println!("Skipped: no path given.");
+        } else if run_hm(&["ingest", &dir, &scope]) {
+            ingested = Some(scope);
+        } else {
+            println!("! The repository was NOT ingested. The steps below still apply, but there");
+            println!("  is nothing to find until `./hm ingest {dir} {scope}` succeeds.");
         }
     } else {
         println!("Skipped. `./hm ingest <dir> <scope>` does it later.");
     }
 
     step(4, "Your MCP client");
-    offer_mcp_block();
+    offer_mcp_block(ingested.as_deref());
 
     step(5, "The hooks");
     offer_hooks_block();
 
     step(6, "The menu bar");
     if yes("Add the tray to autostart?", true) {
+        // launchd starts the tray with a minimal environment: no login shell, none of your
+        // exports. A command that reads $DATABASE_URL was verified HERE, where you have it.
+        let cmd = config().get("HM_PSQL_CMD").cloned().unwrap_or_default();
+        if let Some(var) = shell_variable_in(&cmd) {
+            println!("! The command you configured uses ${var}, which this shell supplies and");
+            println!("  launchd does not: it starts jobs with a minimal environment. In the tray");
+            println!("  that command will fail where it works here. Either write the value into");
+            println!("  the command (hypermnesia-setup --connect) or keep using the CLI tools.");
+            if !yes("Install it anyway?", false) {
+                println!("Not installed.");
+                return finish(false);
+            }
+        }
         match jobs::install_self(jobs::DEFAULT_TRAY_LABEL) {
             Ok(msg) => println!("{msg}"),
             Err(e) => println!("! could not install it: {e}"),
@@ -102,11 +133,45 @@ fn walkthrough() {
     }
 
     step(7, "Check, rather than assume");
-    if hm_path().is_some() {
-        run_hm(&["doctor"]);
+    // `hm doctor` connects with DATABASE_URL, not with the command from step 2. Saying which
+    // store it is about to look at is the difference between a check and a decoration.
+    let checked = if hm_path().is_none() {
+        println!("Skipped: ./hm is not next to this binary, so there is nothing to run the");
+        println!("checks with. `hypermnesia-stats` is the next best look.");
+        None
+    } else if !have_url {
+        println!("Skipped: doctor reads DATABASE_URL directly and it is not set in this shell.");
+        println!("The console itself does not need it -- it uses the command from step 2.");
+        None
+    } else {
+        println!("This checks DATABASE_URL, which is how `hm` connects -- not the command");
+        println!("configured in step 2.\n");
+        Some(run_hm(&["doctor"]))
+    };
+    finish(checked != Some(false));
+}
+
+/// The last word of the walkthrough. "Done." is for the case where nothing said otherwise.
+fn finish(ok: bool) {
+    if ok {
+        println!("\nDone. `hypermnesia-stats` prints the same numbers the tray shows.");
+    } else {
+        println!("\nFinished with complaints above -- fix those first. The tray will show");
+        println!("whatever the store answers, including nothing.");
     }
-    println!("\nDone. `hypermnesia-stats` prints the same numbers the tray shows.");
     println!("If something above was skipped, each step is its own command -- see --help.");
+}
+
+/// The name of an environment variable the command depends on, if it has one. Deliberately
+/// simple: `$NAME` and `${NAME}`, which is what the presets and a hand-written psql line use.
+fn shell_variable_in(cmd: &str) -> Option<String> {
+    let i = cmd.find('$')?;
+    let rest = &cmd[i + 1..];
+    let rest = rest.strip_prefix('{').unwrap_or(rest);
+    let name: String = rest.chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
 }
 
 fn step(n: u8, title: &str) {
@@ -134,6 +199,16 @@ fn mark(b: bool) -> &'static str { if b { "found" } else { "NOT found" } }
 fn which(bin: &str) -> bool {
     Command::new("sh").arg("-c").arg(format!("command -v {bin} >/dev/null 2>&1"))
         .status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// The repository root, or None. Resolved to an absolute path: `hm_path` can return the plain
+/// relative name `hm`, and `Path::new("hm").parent()` is `Some("")`, not `None` -- so the
+/// placeholder never fired and every interpolated path in the blocks below came out rooted at
+/// "/", which reads like a real absolute path rather than an unfilled template.
+fn repo_root() -> Option<PathBuf> {
+    let p = hm_path()?;
+    let abs = std::fs::canonicalize(&p).unwrap_or(p);
+    abs.parent().filter(|d| !d.as_os_str().is_empty()).map(Path::to_path_buf)
 }
 
 /// `hm` lives at the repository root, and this binary at console/target/release/. Resolved from
@@ -180,11 +255,19 @@ fn connect() -> bool {
     }
     println!("  {}) type the whole command yourself", PRESETS.len() + 1);
 
-    let idx: usize = ask("\nNumber", "1").trim().parse().unwrap_or(1);
+    // Asked until the answer is one of the offered numbers. Substituting preset 1 for a typo
+    // discards the choice without a word -- and 0 used to be an arithmetic overflow besides.
+    let idx = loop {
+        let a = ask("\nNumber", "1");
+        match a.trim().parse::<usize>() {
+            Ok(n) if (1..=PRESETS.len() + 1).contains(&n) => break n,
+            _ => println!("! pick a number between 1 and {}", PRESETS.len() + 1),
+        }
+    };
     let cmd = if idx == PRESETS.len() + 1 {
         ask("Command (receives SQL on stdin)", DEFAULT_PSQL_CMD)
     } else {
-        fill(PRESETS.get(idx - 1).unwrap_or(&PRESETS[0]).1)
+        fill(PRESETS[idx - 1].1)
     };
 
     println!("\nThat gives:\n  {cmd}\n");
@@ -210,7 +293,20 @@ fn connect() -> bool {
     let mut cfg: BTreeMap<String, String> = config();
     cfg.insert("HM_PSQL_CMD".into(), cmd);
     match save_config(&cfg) {
-        Ok(()) => println!("Written to {}", config_path().display()),
+        Ok(()) => {
+            println!("Written to {}", config_path().display());
+            // The file is not the last word: HM_PSQL_CMD in the environment beats it. --show
+            // warns about this; the walkthrough, which is where a first-time user actually is,
+            // did not.
+            if let Some(env) = std::env::var("HM_PSQL_CMD").ok().filter(|v| !v.is_empty()) {
+                if env != cfg["HM_PSQL_CMD"] {
+                    println!("! HM_PSQL_CMD is exported in this shell and beats the file, so what");
+                    println!("  you just tested is NOT what the next run here will use:");
+                    println!("    {env}");
+                    println!("  Unset it, or update your shell profile to match.");
+                }
+            }
+        }
         Err(e) => {
             println!("! Not written: {e}");
             return false;
@@ -241,29 +337,50 @@ fn fill(template: &str) -> String {
         ("{db}", "database", "hypermnesia"),
     ] {
         if out.contains(slot) {
-            out = out.replace(slot, ask(prompt, default).trim());
+            // Quoted: the filled template is handed to `sh -c`, so a space, a `;` or a `$` in an
+            // answer would change the command's word structure rather than the value.
+            out = out.replace(slot, &shell_quote(ask(prompt, default).trim()));
         }
     }
     out
 }
 
+/// Wrap a value so `sh` treats it as one literal word.
+fn shell_quote(v: &str) -> String {
+    format!("'{}'", v.replace('\'', "'\\''"))
+}
+
 // -- the two blocks that touch someone else's files ------------------------------------------
 
-fn offer_mcp_block() {
-    let root = hm_path().and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("/path/to/hypermnesia"));
+fn offer_mcp_block(scope: Option<&str>) {
+    let known_root = repo_root();
+    let root = known_root.clone().unwrap_or_else(|| PathBuf::from("/path/to/hypermnesia"));
+    // The scope is known if step 3 ingested one; otherwise it stays a placeholder and the text
+    // below says so.
+    let repo = scope.unwrap_or("myrepo");
     let block = format!(r#"{{ "mcpServers": {{ "hypermnesia": {{
   "command": "{root}/mcp-server/target/release/hypermnesia-mcp",
   "env": {{
-    "HM_REPO": "myrepo",
+    "HM_REPO": "{repo}",
     "DATABASE_URL": "postgresql://...",
     "HM_SEARCH":  "{root}/ingest/search.py",
     "HM_MEM_OPS": "{root}/ingest/mem_ops.py"
-  }} }} }} }}"#, root = root.display());
+  }} }} }} }}"#, root = root.display(), repo = repo);
     println!("Add this to your MCP client's config (for Claude Code, the repo's .mcp.json):\n");
     println!("{block}\n");
-    println!("HM_REPO must be the scope you ingested under -- it is an exact, case-sensitive");
-    println!("match, and a name one character off resolves to nothing on every edit.");
+    if scope.is_some() {
+        println!("HM_REPO is filled in with the scope you just ingested under. The match is exact");
+        println!("and case-sensitive: a name one character off resolves to nothing on every edit.");
+    } else {
+        println!("HM_REPO must be the scope you ingested under -- it is an exact, case-sensitive");
+        println!("match, and a name one character off resolves to nothing on every edit.");
+    }
+    println!("DATABASE_URL above is still a placeholder: the MCP server connects directly, not");
+    println!("through the command this wizard configured. Fill it in before you use the block.");
+    if known_root.is_none() {
+        println!("! The paths above are placeholders too -- this binary is not next to a checkout,");
+        println!("  so the wizard does not know where the repository is.");
+    }
     let target = ask("Write it to which file? (empty to skip)", "");
     let target = target.trim();
     if target.is_empty() {
@@ -278,14 +395,19 @@ fn offer_mcp_block() {
         return;
     }
     match std::fs::write(target, format!("{block}\n")) {
-        Ok(()) => println!("Written to {target}"),
+        // Said every time, because what is on disk is not yet usable: the connection string is a
+        // placeholder, and so are the paths when the repository could not be located.
+        Ok(()) => {
+            println!("Written to {target}");
+            println!("! It still needs DATABASE_URL filled in{}.",
+                     if known_root.is_none() { ", and the four paths" } else { "" });
+        }
         Err(e) => println!("! Not written: {e}"),
     }
 }
 
 fn offer_hooks_block() {
-    let root = hm_path().and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("/path/to/hypermnesia"));
+    let root = repo_root().unwrap_or_else(|| PathBuf::from("/path/to/hypermnesia"));
     println!("The hooks are what makes this more than a search index: they deliver without being");
     println!("asked. For Claude Code, add to its settings:\n");
     println!(r#"  "hooks": {{
@@ -311,9 +433,13 @@ fn show() {
     match (&from_env, cfg.get("HM_PSQL_CMD")) {
         (Some(v), _) => {
             println!("Command (from the environment, HM_PSQL_CMD):\n  {v}");
-            if cfg.contains_key("HM_PSQL_CMD") {
-                // Otherwise what is written in the file looks like what is in effect.
-                println!("! the file holds a different one, but the environment wins");
+            // Compared, not assumed: the two are usually identical right after --connect, and
+            // announcing a disagreement that was never measured is its own small lie.
+            match cfg.get("HM_PSQL_CMD") {
+                Some(f) if f != v => println!("! the file holds a different one, and the \
+                                               environment wins:\n  {f}"),
+                Some(_) => println!("  the file holds the same command."),
+                None => {}
             }
         }
         (None, Some(v)) => println!("Command (from the file):\n  {v}"),
@@ -343,8 +469,21 @@ fn ask(prompt: &str, default: &str) -> String {
     }
     let _ = io::stdout().flush();
     let mut line = String::new();
-    if io::stdin().read_line(&mut line).is_err() {
-        return default.to_string();
+    match io::stdin().read_line(&mut line) {
+        // Ok(0) is EOF, not an empty line. Taking the default there meant that piping this
+        // wizard anything -- or running it with no terminal at all -- answered every question
+        // with its default, and the defaults are the ones that ACT: bring up docker, ingest a
+        // repository, install a launchd job. An unattended install is not a thing to guess at.
+        Ok(0) => {
+            eprintln!("\nhypermnesia-setup: no one to ask (end of input). \
+                       Run it in a terminal, or configure it with --connect.");
+            std::process::exit(1);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("\nhypermnesia-setup: cannot read the answer: {e}");
+            std::process::exit(1);
+        }
     }
     let line = line.trim();
     if line.is_empty() { default.to_string() } else { line.to_string() }
@@ -378,3 +517,33 @@ merge into a config file you already have.
 Connection settings go to ~/.config/hypermnesia/console.conf (mode 600 -- the string can carry a
 password). HM_PSQL_CMD in the environment beats the file.
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The filled template is handed to `sh -c`. An answer with a space, a `;` or a `$` in it
+    /// must stay one word, or the answer stops being a value and becomes part of the command.
+    /// Verified by hand before this test: `my container; touch FILE` as a container name created
+    /// the file.
+    #[test]
+    fn an_answer_cannot_become_part_of_the_command() {
+        assert_eq!(shell_quote("hypermnesia-pg"), "'hypermnesia-pg'");
+        assert_eq!(shell_quote("two words"), "'two words'");
+        assert_eq!(shell_quote("a; touch /tmp/x"), "'a; touch /tmp/x'");
+        assert_eq!(shell_quote("$HOME"), "'$HOME'");
+        // The one case single quotes cannot hold on their own.
+        assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
+    }
+
+    /// launchd starts the tray with a minimal environment. A command resting on a variable this
+    /// shell happens to export was verified here and will fail there.
+    #[test]
+    fn a_command_resting_on_the_shell_is_recognised() {
+        assert_eq!(shell_variable_in("psql \"$DATABASE_URL\" -tAX").as_deref(),
+                   Some("DATABASE_URL"));
+        assert_eq!(shell_variable_in("psql \"${DATABASE_URL}\"").as_deref(), Some("DATABASE_URL"));
+        assert_eq!(shell_variable_in("docker exec -i pg psql -U hm -d hm"), None);
+        assert_eq!(shell_variable_in("psql 'postgresql://hm@localhost/hm'"), None);
+    }
+}
