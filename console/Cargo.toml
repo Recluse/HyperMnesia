@@ -1,0 +1,40 @@
+[package]
+name = "hypermnesia-console"
+version = "0.1.0"
+edition = "2021"
+description = "Menu-bar console for a HyperMnesia store: volumes, scheduled jobs, settings"
+license = "MIT"
+
+[dependencies]
+
+# Two dependencies in the whole crate, and only the tray binary uses them. A menu, not a window:
+# everything this console has to show is a dozen lines and a dozen buttons, and a window would
+# mean a GUI framework for the same result. The data layer below has no dependencies at all --
+# a console that takes a minute to build is a console nobody rebuilds.
+tray-icon = "0.25"
+winit = "0.30"
+
+[[bin]]
+name = "hypermnesia-stats"
+path = "src/bin/stats.rs"
+
+[[bin]]
+name = "hypermnesia-jobs"
+path = "src/bin/jobs.rs"
+
+[[bin]]
+name = "hypermnesia-settings"
+path = "src/bin/settings.rs"
+
+[[bin]]
+name = "hypermnesia-setup"
+path = "src/bin/setup.rs"
+
+[[bin]]
+name = "hypermnesia"
+path = "src/bin/tray.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

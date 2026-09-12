@@ -38,6 +38,10 @@ jobs:
         run: python tests/test_chunker.py
       - name: Latency statistics (no store needed)
         run: python ci/latency.py --selfcheck
+      - name: Settings knobs must name files that exist and variables the code reads
+        run: python tests/test_settings_knobs.py
+      - name: Shared settings file (prefix allowlist, mode check, env precedence)
+        run: python tests/test_env_file.py
       # Four modules ship an executable self-check and only one of them was run. For each of
       # the three below, that self-check is the ONLY automated coverage its behaviour has:
       # Tier-1 selection (longest-match order, 1-hop propagation, cross-repo isolation),
@@ -60,6 +64,15 @@ jobs:
         run: cargo build --release --locked
       - name: Rust unit tests (glob parity with the Python hook)
         working-directory: mcp-server
+        run: cargo test --locked
+      # The console is a separate crate: its own build and its own tests. Kept in the same job
+      # because it shares the toolchain, and a console that does not compile is a console nobody
+      # notices is broken until they try to open it.
+      - name: Build the console
+        working-directory: console
+        run: cargo build --release --locked
+      - name: Console unit tests
+        working-directory: console
         run: cargo test --locked
 
   schema:

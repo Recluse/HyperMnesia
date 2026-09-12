@@ -4,7 +4,60 @@ All hooks are FAIL-OPEN: any error/timeout -> empty output, exit 0. A broken mem
 must never block the agent. DB access is local: mem_ops() shells to the bundled mem_ops.py
 (which connects via DATABASE_URL), psql() shells to `psql "$DATABASE_URL"`.
 """
-import json, os, re, secrets, subprocess
+import json, os, re, secrets, subprocess, sys
+
+# -- shared pipeline settings ------------------------------------------------
+# The tunables below (HM_LLM_MODEL, MEM_NOVELTY_MAXDIST, EMBED_BATCH and the rest) are read
+# from the environment by five different scripts that are launched in five different ways:
+# some from a scheduler with its own environment block, some from the MCP client, some by hand
+# from a terminal. There was no single place to set them, which means "change a setting" would
+# have meant "changed it for some of the runs" -- worse than having no setting at all.
+#
+# This file is read BEFORE any module computes its constants (every hook imports this one
+# first), and it does NOT override what the environment already holds: an explicit variable
+# beats the file, so a one-off run with a different threshold needs no edit here.
+#
+# It is read by processes that start without a person present, hence two limits that are not
+# perfectionism: only names from known prefixes are accepted (otherwise this file is a way to
+# set PATH or PYTHONPATH for a scheduled job), and a file writable by anyone but its owner is
+# ignored ENTIRELY and loudly -- a partly-applied file carrying someone else's values is worse
+# than none.
+ENV_FILE = os.path.expanduser(os.environ.get("HYPERMNESIA_ENV_FILE", "~/.claude/hypermnesia.env"))
+_ENV_PREFIXES = ("MEM_", "EMBED_", "HM_", "OLLAMA_", "TEI_")
+
+
+def load_env_file(path=None):
+    """Apply KEY=value lines from the settings file to os.environ. Returns what it applied."""
+    path = path or ENV_FILE
+    applied = {}
+    try:
+        st = os.stat(path)
+    except OSError:
+        return applied
+    if st.st_mode & 0o022:
+        sys.stderr.write(f"_mem_common: {path} is writable by others -- the settings file was "
+                         f"ignored entirely (chmod 600)\n")
+        return applied
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if not k.startswith(_ENV_PREFIXES) or not re.fullmatch(r"[A-Z][A-Z0-9_]*", k):
+                    continue
+                if k in os.environ:          # an explicit variable beats the file
+                    continue
+                os.environ[k] = v
+                applied[k] = v
+    except OSError:
+        pass
+    return applied
+
+
+load_env_file()
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PY = os.environ.get("HM_PYTHON", "python3")
