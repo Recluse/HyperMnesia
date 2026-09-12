@@ -10,8 +10,10 @@ use hypermnesia_console::jobs::{self, Job};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let prefix = std::env::var("HM_JOB_PREFIX")
-        .unwrap_or_else(|_| jobs::DEFAULT_JOB_PREFIX.to_string());
+    // Through jobs::job_prefix rather than the variable: only that path also consults the
+    // config file, and the tray -- started by launchd with a minimal environment -- has
+    // nothing else to read.
+    let prefix = jobs::job_prefix();
     let all = match jobs::list(&prefix) {
         Ok(j) => j,
         Err(e) => fail(&e),
@@ -239,5 +241,6 @@ old one is in force. Before the edit a .bak is put down next to the file, and on
 file is restored.
 
 The name is the tail of the label: extract, consolidate, reflect, freshness, rerank.
-The label prefix is changed with the HM_JOB_PREFIX variable.
+The label prefix comes from HM_JOB_PREFIX, then the console config file, then the
+default com.hypermnesia.
 ";

@@ -21,11 +21,21 @@ pub const DEFAULT_JOB_PREFIX: &str = "com.hypermnesia";
 /// Label of the tray's own autostart job, passed to `install_self`.
 pub const DEFAULT_TRAY_LABEL: &str = "com.hypermnesia.tray";
 
-/// The label prefix to look for. Environment, then the default -- an installation that names its
-/// jobs differently can say so without a rebuild.
+/// The label prefix to look for: environment, then the config file, then the default -- the same
+/// order as every other setting here.
+///
+/// The config file matters more than it looks. The tray is started by launchd, which gives it a
+/// minimal environment and none of a login shell's variables, so an installation whose jobs are
+/// named differently could set HM_JOB_PREFIX in its shell forever and the tray would still show
+/// an empty job list -- while every command run by hand showed the right one.
 pub fn job_prefix() -> String {
-    std::env::var("HM_JOB_PREFIX").ok().filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_JOB_PREFIX.to_string())
+    if let Some(v) = std::env::var("HM_JOB_PREFIX").ok().filter(|s| !s.is_empty()) {
+        return v;
+    }
+    if let Some(v) = crate::config().get("HM_JOB_PREFIX") {
+        return v.clone();
+    }
+    DEFAULT_JOB_PREFIX.to_string()
 }
 
 #[derive(Debug, Clone, PartialEq)]
