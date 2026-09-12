@@ -12,6 +12,11 @@
 //!    arrive, instead of letting yesterday's numbers look current. A console whose stale state
 //!    is indistinguishable from its fresh state is worse than no console.
 
+// The tray is macOS-only, and not by accident: the schedules it shows and edits are launchd's,
+// and the icon lives in the system menu bar. The four command-line tools work anywhere psql
+// does, so the crate still builds without a single GUI library present.
+#[cfg(target_os = "macos")]
+mod mac {
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -42,7 +47,7 @@ const PRESETS: &[(&str, jobs::Schedule)] = &[
     ("weekly, Mon 06:10", jobs::Schedule::At { hour: 6, minute: 10, weekday: Some(1) }),
 ];
 
-fn main() {
+pub fn main() {
     // Install and uninstall run before the event loop exists: both finish immediately and ask
     // for no window.
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -553,4 +558,15 @@ mod tests {
         j.last_output = None;
         assert!(job_line(&j).contains("never run yet"), "{}", job_line(&j));
     }
+}
+}
+
+#[cfg(target_os = "macos")]
+fn main() { mac::main() }
+
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("hypermnesia: the menu-bar tray is macOS-only -- it reads launchd and draws in the \
+               system menu bar. hypermnesia-stats, -jobs, -settings and -setup work here.");
+    std::process::exit(1);
 }

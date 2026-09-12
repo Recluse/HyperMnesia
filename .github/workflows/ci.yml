@@ -68,7 +68,11 @@ jobs:
       # The console is a separate crate: its own build and its own tests. Kept in the same job
       # because it shares the toolchain, and a console that does not compile is a console nobody
       # notices is broken until they try to open it.
-      - name: Build the console
+      #
+      # On this runner that means the data layer and the four command-line tools -- the tray and
+      # its two dependencies are declared for macOS only, since the schedules it reads are
+      # launchd's. Everything the tests cover is in the part that builds here.
+      - name: Build the console (data layer + CLI tools; the tray is macOS-only)
         working-directory: console
         run: cargo build --release --locked
       - name: Console unit tests

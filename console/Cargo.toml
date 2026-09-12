@@ -7,10 +7,15 @@ license = "MIT"
 
 [dependencies]
 
-# Two dependencies in the whole crate, and only the tray binary uses them. A menu, not a window:
-# everything this console has to show is a dozen lines and a dozen buttons, and a window would
-# mean a GUI framework for the same result. The data layer below has no dependencies at all --
-# a console that takes a minute to build is a console nobody rebuilds.
+# The data layer has no dependencies at all: a console that takes a minute to build is a console
+# nobody rebuilds.
+
+# Two dependencies in the whole crate, only the tray binary uses them, and only on macOS -- which
+# is where the tray belongs anyway, since the schedules it reads are launchd's. Declaring them
+# per-target keeps the command-line tools buildable on a machine with no GUI libraries at all,
+# which is what CI is. A menu, not a window: everything this console has to show is a dozen lines
+# and a dozen buttons, and a window would mean a GUI framework for the same result.
+[target.'cfg(target_os = "macos")'.dependencies]
 tray-icon = "0.25"
 winit = "0.30"
 
