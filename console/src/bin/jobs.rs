@@ -159,6 +159,9 @@ fn parse_weekday(s: &str) -> Option<u32> {
 
 fn find<'a>(all: &'a [Job], name: &str) -> &'a Job {
     match all.iter().find(|j| j.short() == name || j.label == name) {
+        Some(j) if j.broken() => fail(&format!(
+            "{name}: this plist cannot be read ({}), so launchd has not loaded it either. \
+             Fix the file first.", j.fault.clone().unwrap_or_default())),
         Some(j) => j,
         None => fail(&format!("no such job: {name}. There is: {}",
                               all.iter().map(Job::short).collect::<Vec<_>>().join(", "))),
@@ -173,15 +176,22 @@ fn fail(e: &str) -> ! {
 fn list(all: &[Job]) {
     println!("{:<13} {:<22} {:<14} {}", "JOB", "SCHEDULE", "LAST OUTPUT", "STATE");
     for j in all {
+        if let Some(why) = &j.fault {
+            // An unreadable plist is one launchd also refused at login: the job is not running.
+            // It used to be dropped from the list entirely, which is the one case the console had
+            // nothing at all to say about.
+            println!("{:<13} {:<22} {:<14} ! unreadable plist: {why}", j.short(), "—", "—");
+            continue;
+        }
         let when = match j.since_last_output() {
             Some(d) => ago(d),
             None => "—".to_string(),
         };
         let state = if j.running() {
             format!("running (pid {})", j.pid.unwrap_or(0))
-        } else if j.runs == Some(0) {
-            // This has to come before the exit-code check: `launchctl list` prints 0 both for
-            // "finished successfully" and for "never finished at all".
+        } else if j.never_ran() {
+            // Not `runs == Some(0)`: that counter restarts at every login, so on its own it
+            // reports every healthy job as never having run after a reboot.
             match j.since_installed() {
                 Some(d) => format!("never ran (installed {})", ago(d)),
                 None => "never ran".to_string(),
@@ -199,10 +209,15 @@ fn list(all: &[Job]) {
         };
         println!("{:<13} {:<22} {:<14} {}", j.short(), j.schedule.human(), when, state);
         if j.overdue() {
-            // We only shout when a whole period has passed with no runs. A job installed later
-            // than its own last slot honestly shows a zero and is not a complaint: a false alarm
-            // here would teach one to scroll past this line.
-            println!("{:<13} ! the period has already passed and launchd still never ran it", "");
+            // We only shout when a period and a half has passed with nothing to show for it. A
+            // job installed later than its own last slot honestly shows a zero and is not a
+            // complaint: a false alarm here would teach one to scroll past this line.
+            let what = if j.never_ran() {
+                "the period has already passed and launchd still never ran it"
+            } else {
+                "it ran at some point, but the log has not moved for more than a period"
+            };
+            println!("{:<13} ! {what}", "");
         }
     }
     println!();
