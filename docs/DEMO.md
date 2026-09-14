@@ -8,7 +8,7 @@ You need a store with the schema loaded (`./hm init`) and `DATABASE_URL` exporte
 ## 1. Load the example map (10 seconds)
 
 ```bash
-psql "$DATABASE_URL" -f examples/seed_example.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/seed_example.sql
 ```
 
 Four components for a fictional `myapp`, one dependency edge (`api depends_on db`), and two

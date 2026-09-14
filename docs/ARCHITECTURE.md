@@ -118,7 +118,23 @@ pass.
 
 **Personal memory (background):** capture hooks enqueue session transcripts; a scheduled job
 distills them to memories via a pluggable LLM; a daily consolidator merges near-duplicates behind
-a confidence gate + review queue. Recall/profile hooks inject relevant memories into the prompt.
+a confidence gate + review queue; a weekly reflect pass synthesizes each project's memories into
+one knowledge page, published as a document under a sibling `<project>~mem` tag so doc search can
+reach it. Recall/profile hooks inject relevant memories into the prompt.
+
+**Configuration (shared):** the tunables the passes read — thresholds, model names, batch sizes —
+come from one file, `~/.claude/hypermnesia.env`, loaded on import by `hooks/_mem_common.py` and
+`ingest/_common.py`. A variable already in the environment beats it, so a one-off run needs no
+edit. The loader refuses the file entirely unless it is the owner's private file in a private
+directory, and accepts only an exact list of names: the file must not be able to choose an
+interpreter, a destination or a credential. See the table in [INSTALL.md](INSTALL.md).
+
+**Operator's view (optional):** `console/` is a menu-bar tray and four command-line tools over the
+same store — volumes, scheduled jobs, the settings above, and a first-run wizard. It reaches the
+database through one setting, a command that receives SQL on stdin, so it works against a local
+psql, a container, or a pod without knowing which. It is the surface where this system's own
+failures are meant to become visible; [DIAGNOSTICS.md](DIAGNOSTICS.md) lists every complaint it
+can print.
 
 See [DESIGN.md](DESIGN.md) for the reasoning behind the tiers and [MEMORY.md](MEMORY.md) for the
 personal-memory model.
@@ -172,10 +188,13 @@ and the fix is to re-embed the minority — not to tune the ranking.
 
 HyperMnesia is self-hosted memory + architectural control for **coding agents**, where you own
 the store. That's a different niche from managed consumer-chat memory. For context, Anthropic's
-[Claude memory update (Aug 2026)](https://www.anthropic.com/news) unified memory across Claude
-chat and Cowork, on by default, with topic-by-topic view/edit/delete, real-time capture, and
-sensitive-topic protection — a polished managed feature for end-user chat. HyperMnesia differs on
-purpose: the store is your Postgres (inspectable and editable in SQL), it runs on local models
-with no data leaving your box, it is bi-temporal with supersede-not-overwrite + a review gate, and
-it is built around a coding agent's needs (doc-RAG + a deterministic constraint map), not chat.
-Complementary philosophies, different problems.
+[Bringing memory to Claude](https://claude.com/blog/memory) (11 September 2025, updated 23 October
+2025) gives Claude's own apps a memory that is **optional** rather than on by default, with a
+memory summary you can read and edit, memories scoped per project, incognito chats that are never
+remembered, and import/export. HyperMnesia differs on purpose: the store is your Postgres
+(inspectable and editable in SQL), it runs on local models with no data leaving your box, it is
+bi-temporal with supersede-not-overwrite + a review gate, and it is built around a coding agent's
+needs (doc-RAG + a deterministic constraint map), not chat. Complementary philosophies, different
+problems.
+
+For the neighbours that solve this same problem, see [COMPARISON.md](COMPARISON.md).

@@ -257,3 +257,40 @@ launchd gives its jobs none of yours, so for the scheduled passes the file is wh
 | `HM_GRAPH_TTL_SECS` | `300` | how long the MCP server may serve a cached component map before re-reading it |
 | `HM_DOC_MAX_CHARS` | `60000` | `get_document` cap; past it the text is cut and the cut is announced |
 | `HM_REPO` | cwd basename | which ingested scope this workspace is — an **exact**, case-sensitive match. Unset, the MCP server guesses it from the directory name and strips anything outside `[A-Za-z0-9._-]`; in both cases the scoped tools (`get_project_map`, `get_document`, `search_docs`) open their answer with a `(!) SCOPE:` line saying so |
+| `HM_FTS_LANG` | `english` | the Postgres text-search configuration for the memory query; change it and the two search legs must agree |
+| `MEM_EMBED_MAX_CHARS` | `12000` | how much of a memory's text is embedded (`ingest/mem_ops.py`) |
+| `EMBED_QUERY_MAX_CHARS` / `EMBED_QUERY_TIMEOUT` | `12000` / `20` s | caps on embedding one query (`ingest/_common.py`) |
+
+### The memory pipeline's tunables
+
+These are the knobs `hypermnesia-settings` offers. They come from the environment, or from the
+shared settings file below, or from the default — in that order.
+
+| Env | Default | Read by | Meaning |
+|-----|---------|---------|---------|
+| `MEM_NOVELTY_MAXDIST` | `0.12` | `hooks/mem_extract.py` | novelty gate on write: closer than this counts as the same fact |
+| `MEM_REVIEW_THRESHOLD` | `0.8` | `hooks/mem_consolidate.py` | below this confidence a merge waits in the review queue instead of being applied |
+| `MEM_REFLECT_MIN` | `5` | `hooks/mem_reflect.py` | the fewest memories a project needs before it gets a knowledge page |
+| `MEM_REFLECT_MAX` | `80` | `hooks/mem_reflect.py` | the most memories handed to the model in one pass |
+| `MEM_STALE_DAYS` | `180` | `hooks/mem_profile.py` | the age past which an unconfirmed, unrecalled fact is listed as stale |
+| `MEM_SEM_MAXDIST` | `0.5` | `ingest/mem_ops.py` | abstention gate: past this distance memory search returns nothing at all |
+| `MEM_LEX_MAXDIST` | = `MEM_SEM_MAXDIST` | `ingest/mem_ops.py` | lexical floor; unset it follows the gate above |
+| `EMBED_BATCH` | `16` | `ingest/embed_chunks.py` | chunks per request during a bulk embed |
+| `EMBED_MODEL` | `bge-m3` | `ingest/_common.py` | model name for Ollama, and the string stamped into `embedding_model` |
+
+### The shared settings file
+
+`~/.claude/hypermnesia.env` — one `KEY=value` file for the tunables above, written by
+`hypermnesia-settings set <KEY> <value>`, loaded on import by `hooks/_mem_common.py` and
+`ingest/_common.py`. `HYPERMNESIA_ENV_FILE` moves it. The rules it is read under are in
+[The console](#the-console-optional-macos-menu-bar--cli) above: refused whole unless it is
+your own private file, and only the exact names listed here are accepted.
+
+### The console
+
+| Env | Default | Meaning |
+|-----|---------|---------|
+| `HM_PSQL_CMD` | `psql "$DATABASE_URL" -tAX -v ON_ERROR_STOP=1` | the command the console sends SQL to on stdin. The one setting that differs between deployments |
+| `HM_JOB_PREFIX` | `com.hypermnesia` | the launchd label prefix the job tools manage |
+| `HM_CONSOLE_CONFIG` | `~/.config/hypermnesia/console.conf` | where the two settings above are stored. Refused whole if another account can write it: it holds a command the tray runs at login |
+| `HM_TIMEOUT_SECS` | `30` | ceiling on one reading of the store |

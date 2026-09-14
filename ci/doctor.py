@@ -128,7 +128,7 @@ def check_ann_index(out):
     else:
         out.append(finding(WARN, "No ANN index on chunks.embedding",
                            "the dense leg is a sequential scan over every vector",
-                           'psql "$DATABASE_URL" -c "CREATE INDEX chunks_embedding_hnsw ON '
+                           'psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "CREATE INDEX chunks_embedding_hnsw ON '
                            'chunks USING hnsw (embedding vector_cosine_ops)"'))
 
 

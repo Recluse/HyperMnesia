@@ -12,7 +12,7 @@ new/changed files are re-emitted; unchanged documents keep their chunks and thei
 vanished ones are deleted. Produce that file however you can reach the DB -- the ingester
 still needs no database connection of its own:
 
-    psql "$DATABASE_URL" -tAF$'\t' \
+    psql "$DATABASE_URL" -tAF$'\t' -v ON_ERROR_STOP=1 \
       -c "SELECT path, content_hash FROM documents WHERE repo='myrepo'" > known.tsv
     python ingest_repo.py ~/code/myrepo myrepo out.sql --known-hashes known.tsv
 

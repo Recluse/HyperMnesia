@@ -81,6 +81,15 @@ So profile + recall are portable as-is; capture and the constraint hook need a p
 The hooks read `DATABASE_URL` / `EMBED_BACKEND` from their environment (Claude Code passes the
 shell env through). Keep those exported, or set them in the hook command.
 
+The pipeline's tunables — thresholds, model names, batch sizes — come from one shared file
+instead, `~/.claude/hypermnesia.env`, which `_mem_common.py` loads on import, before any module
+computes its constants. A variable already in the environment beats it, so a one-off run with a
+different threshold needs no edit. That matters most for the scheduled passes below: launchd and
+cron give them a minimal environment with none of your shell's exports, so for them the file is
+the only place a setting can come from. `hypermnesia-settings` (in `console/`) reads and writes
+it; [docs/INSTALL.md](../docs/INSTALL.md#the-shared-settings-file) lists the names it accepts and
+the permissions it demands.
+
 ## Schedule the background jobs
 
 `mem_extract.py`, `mem_consolidate.py` and `mem_reflect.py` are NOT hooks — run them out of band so they never
@@ -94,6 +103,8 @@ cron:
 ```
 
 systemd timer, launchd agent, or any scheduler works equally — they just invoke the three scripts.
+On macOS, `hypermnesia-jobs` (in `console/`) lists whatever launchd holds, runs one now, and
+changes a schedule without hand-editing a plist.
 
 ## Review queue
 
