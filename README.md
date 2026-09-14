@@ -238,6 +238,10 @@ cannot be told from an empty store.
 
 ### The tray
 
+<p align="center">
+  <img src="docs/assets/tray.jpg" alt="the HyperMnesia tray, open, over a live store" width="440">
+</p>
+
 A menu, not a window. Everything the console has to show is a dozen lines and a dozen buttons; a
 window would mean a GUI framework for the same result. Two dependencies, both macOS-only, and the
 data layer under them has none at all — a console that takes a minute to build is a console nobody
