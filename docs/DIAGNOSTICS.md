@@ -119,10 +119,17 @@ have. What it says, and what each line means:
 | `! it ran at some point, but the log has not moved for more than a period` | it worked once and stopped |
 | `! unreadable plist: <plutil said>` | launchd refused this job too; it is not running |
 | `! exit 2, 5m ago` | the last run failed. `freshness` exits 1 by design, meaning discrepancies were found |
+| `loaded; no run since this login` | launchd has the job and has not started it since the last login. Its exit column says 0, which it prints for "never finished" as well as for "finished well" |
+| `? the configured log is not there` | the job ran, but the file that would date its last run is gone. Neither health nor failure: the evidence is missing, and that is its own answer |
 | `! the hooks IGNORE this file entirely: <why>` | the settings file is out of force; the defaults are running |
 | `file (IGNORED)` / `5 (file: 9)` | the file says 9, the default 5 is what is actually in effect |
 | `this shell` as a source | set here, but launchd's jobs do not inherit it — the line below says what they use |
 | `the answer parsed but has no "memories"` | something answered, but it was not this query's result. Not a store full of zeros |
+
+Schedules are read the way launchd means them: an omitted `StartCalendarInterval` field is a
+wildcard, so `{Minute: 15}` is "hourly at :15" and `{Day: 1, Hour: 3}` is "monthly day 1 03:00".
+The period follows the coarsest pinned field, which is what keeps a monthly job from being called
+overdue every day of the month.
 
 Two readings that are NOT complaints, and are deliberately not marked: a job with no schedule
 (`on demand`) never being "overdue", and a positive run counter with no log to date it by. The
