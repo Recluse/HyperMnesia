@@ -245,8 +245,11 @@ impl ApplicationHandler for App {
                     self.awaiting = None;
                     match u {
                         Update::Data(s) => {
-                            self.status = format!("updated just now, in {:.1}s",
-                                                  s.stats.took.as_secs_f32());
+                            // Not a sentence: the sentence is rendered at rebuild time from
+                            // `last.at`. Frozen, it said "updated just now" for the whole
+                            // refresh cycle -- and after the Mac slept, for as long as the nap
+                            // lasted, because the refresh timer is monotonic and stops with it.
+                            self.status = String::new();
                             self.last = Some(*s);
                         }
                         Update::Failed(e) => {
@@ -344,7 +347,7 @@ impl App {
         let menu = Menu::new();
         let mut items = Items::default();
 
-        let _ = menu.append(&MenuItem::new(&self.status, false, None));
+        let _ = menu.append(&MenuItem::new(self.status_line(), false, None));
         // The outcome of the last button press keeps its own line, with its age, until another
         // press replaces it.
         if let Some((note, when)) = &self.note {
@@ -423,20 +426,47 @@ impl App {
         }
     }
 
+    /// The first line of the menu: how old the numbers are, said in the present tense.
+    ///
+    /// Computed here rather than stored, because a stored sentence cannot age. `at` is wall
+    /// clock, so a Mac that slept for two hours reports two hours, not "just now".
+    fn status_line(&self) -> String {
+        if !self.status.is_empty() {
+            return self.status.clone();
+        }
+        match &self.last {
+            None => "loading…".into(),
+            Some(s) => {
+                let age = age_of(s.at);
+                let took = s.stats.took.as_secs_f32();
+                if age < Duration::from_secs(5) {
+                    format!("updated just now, in {took:.1}s")
+                } else {
+                    format!("updated {} ago, in {took:.1}s", ago(age))
+                }
+            }
+        }
+    }
+
     /// What is visible without opening the menu. A mark matters more than a number here: the
     /// menu bar is where a problem is NOTICED, not where a report is read.
     fn title(&self) -> String {
-        if self.status.starts_with('!') || self.note.as_ref().is_some_and(|(n, _)| n.starts_with('!')) {
+        if self.status_line().starts_with('!')
+            || self.note.as_ref().is_some_and(|(n, _)| n.starts_with('!')) {
             return "HM !".into();
         }
         match &self.last {
             None => "HM …".into(),
             Some(s) => {
-                // A non-zero exit code is deliberately NOT a mark here: the freshness job exits 1
-                // to mean "discrepancies found", by design, and a permanent "!" is a "!" nobody
-                // looks at. The code is on the job's own line instead.
-                let warn = s.stats.review_pending > 0
-                    || s.stats.embedding_models.len() > 1
+                // Derived from the lines the menu actually shows, not recomputed beside them.
+                // Recomputing is what let the two drift: "! not embedded: 4300" sat in the menu
+                // under a calm "HM", while "! embedding models: 2" -- printed by the same
+                // function, two lines later -- did mark the title.
+                //
+                // A non-zero exit code is deliberately NOT a mark: the freshness job exits 1 to
+                // mean "discrepancies found", by design, and a permanent "!" is one nobody looks
+                // at. The code is on the job's own line instead.
+                let warn = summary(&s.stats).iter().any(|l| l.starts_with('!'))
                     || s.jobs_error.is_some()
                     || s.jobs.iter().any(Job::broken)
                     || s.jobs.iter().any(Job::overdue);
@@ -462,10 +492,13 @@ fn summary(s: &Stats) -> Vec<String> {
         // Two models in one store means part of the corpus cannot be reached by meaning at all.
         out.push(format!("! embedding models: {}", s.embedding_models.len()));
     }
-    out.push(format!("Review queue: {}{}", s.review_pending,
-                     if s.review_pending > 0 {
-                         format!(" (oldest {} days)", s.review_oldest_days)
-                     } else { String::new() }));
+    // Marked when there is something in it, so the title can be derived from these lines rather
+    // than from a second list of conditions kept in step by hand.
+    out.push(if s.review_pending > 0 {
+        format!("! Review queue: {} (oldest {} days)", s.review_pending, s.review_oldest_days)
+    } else {
+        "Review queue: 0".to_string()
+    });
     out.push(format!("Stale: {}", s.stale));
     out.push(format!("Database: {}", s.db_size));
     out

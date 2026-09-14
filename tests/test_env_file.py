@@ -110,6 +110,13 @@ def main():
     check("not one value was applied", seen.get("MEM_REFLECT_MIN") is None, str(seen))
     check("and the reason names the directory", "writable by others" in err, err[:200])
 
+    print("\n== a repeated key: the first one wins, and the console agrees ==")
+    # The loader sets the variable on the first occurrence; the second then hits its own
+    # "an explicit variable beats the file" check. The console used to keep the LAST value and
+    # print it as the one in force -- 99 on screen, 9 in the hook.
+    seen, _ = run("MEM_REFLECT_MIN=9\nMEM_REFLECT_MIN=99\n")
+    check("the first value is the one applied", seen.get("MEM_REFLECT_MIN") == "9", str(seen))
+
     print("\n== a missing file is not an error ==")
     env = dict(os.environ, HYPERMNESIA_ENV_FILE="/nope/hypermnesia.env")
     env.pop("MEM_REFLECT_MIN", None)

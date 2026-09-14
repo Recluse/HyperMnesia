@@ -27,7 +27,12 @@ OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 
 def _backend():
     b = os.environ.get("HM_LLM_BACKEND", "").lower()
-    if b:
+    # "auto" is a VALUE people set, not just the absence of one -- the console offers it, the
+    # docs describe it, and returning it verbatim made it match neither branch in complete(),
+    # which then fell through to ollama on localhost. A deployment with HM_LLM_URL set would
+    # post every extraction to a port with nothing on it, get "" back, and -- the hooks being
+    # fail-open -- mark the transcripts processed with nothing written.
+    if b and b != "auto":
         return b
     if URL:
         return "openai"

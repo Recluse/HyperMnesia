@@ -106,11 +106,32 @@ pub const KNOBS: &[Knob] = &[
            kind: Kind::OneOf(&["ollama", "tei"]) },
 ];
 
+/// The settings file's path, resolved the way the LOADER resolves it.
+///
+/// Two rules copied from `hooks/_mem_common.py`, because the console reporting a different file
+/// than the one the pipeline reads is the exact failure this screen exists to prevent:
+///
+///   * a leading `~/` is expanded (Python's `expanduser`). Taken literally, the console reported
+///     "not created yet" over a file the hooks were reading happily;
+///   * a variable that is SET BUT EMPTY is honoured as an empty path, not treated as unset. The
+///     loader reads nothing in that case, so the console must not go on displaying the default
+///     file's contents as the values in force.
 pub fn env_file() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-    match std::env::var("HYPERMNESIA_ENV_FILE") {
-        Ok(p) if !p.is_empty() => PathBuf::from(p),
-        _ => PathBuf::from(home).join(".claude/hypermnesia.env"),
+    let raw = match std::env::var("HYPERMNESIA_ENV_FILE") {
+        Ok(p) => p,
+        Err(_) => format!("{home}/.claude/hypermnesia.env"),
+    };
+    PathBuf::from(expand_home(&raw, &home))
+}
+
+fn expand_home(p: &str, home: &str) -> String {
+    if p == "~" {
+        home.to_string()
+    } else if let Some(rest) = p.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else {
+        p.to_string()
     }
 }
 
@@ -154,8 +175,12 @@ pub fn read() -> BTreeMap<String, String> {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') { continue; }
         if let Some((k, v)) = line.split_once('=') {
-            out.insert(k.trim().to_string(),
-                       v.trim().trim_matches('"').trim_matches('\'').to_string());
+            // FIRST occurrence wins, because that is what the loader does: it sets the variable
+            // on the first line and the second then hits its own "an explicit variable beats the
+            // file" check and is skipped. Keeping the last one here meant the screen printed 99
+            // while the hooks ran on 9 -- verified before this was changed.
+            out.entry(k.trim().to_string())
+               .or_insert_with(|| v.trim().trim_matches('"').trim_matches('\'').to_string());
         }
     }
     out
@@ -330,6 +355,46 @@ mod tests {
             assert!(k.kind.fault(k.default).is_none(),
                     "{}: the default {:?} is not valid for its own kind", k.key, k.default);
         }
+    }
+
+    /// The console and the loader must agree about which line of a repeated key is in force.
+    /// The loader sets the variable on the FIRST occurrence and then skips the rest through its
+    /// own "an explicit variable beats the file" check. Keeping the last one here printed 99
+    /// while the hooks ran on 9 -- reproduced before this was changed.
+    #[test]
+    fn a_repeated_key_is_read_the_way_the_loader_reads_it() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join("hm-dup-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("hypermnesia.env");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "MEM_REFLECT_MIN=9\nMEM_REFLECT_MIN=99").unwrap();
+        drop(f);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut map = BTreeMap::new();
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                map.entry(k.trim().to_string()).or_insert_with(|| v.trim().to_string());
+            }
+        }
+        assert_eq!(map.get("MEM_REFLECT_MIN").map(String::as_str), Some("9"),
+                   "first wins, as in hooks/_mem_common.py");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The path must be resolved the way the loader resolves it, or the console reports on a
+    /// different file than the pipeline reads -- which is the one thing this screen exists to
+    /// prevent. Python's expanduser expands a leading `~/`; a variable that is set but empty is
+    /// an empty path there, not an absent one.
+    #[test]
+    fn the_settings_path_is_resolved_like_the_loader() {
+        assert_eq!(expand_home("~/.claude/hypermnesia.env", "/Users/x"),
+                   "/Users/x/.claude/hypermnesia.env");
+        assert_eq!(expand_home("~", "/Users/x"), "/Users/x");
+        assert_eq!(expand_home("/etc/hm.env", "/Users/x"), "/etc/hm.env");
+        // Not expanded by expanduser either: only a leading ~ or ~user is.
+        assert_eq!(expand_home("./~/x", "/Users/x"), "./~/x");
     }
 
     #[test]

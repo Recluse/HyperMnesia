@@ -73,6 +73,16 @@ fn show() {
 
     for k in KNOBS {
         let (mut val, src) = settings::effective(k, &file);
+        // A value the reader cannot parse is not a setting in force: every numeric knob is
+        // parsed at module level in its hook, outside any try, so the hook dies at import. `set`
+        // refuses such a value, but the file is a plain text file people edit by hand -- and an
+        // empty value or a trailing "# comment" was displayed in the value column as if it
+        // applied. Verified: MEM_STALE_DAYS=42 # a comment makes mem_profile.py raise ValueError
+        // at import while the screen showed "42 # a comment  file".
+        let value_fault = match &src {
+            Source::File(v) | Source::Env(v) => k.kind.fault(v),
+            Source::Default => None,
+        };
         let mark = match src {
             Source::Env(_) => "this shell",
             // A file the loader refuses is not a source of anything: the value column has to
@@ -86,6 +96,11 @@ fn show() {
         };
         println!("  {:<22} {:<20} {:<12} {}", k.key, val, mark, k.what);
         println!("  {:<22} read by {}", "", k.read_by);
+        if let Some(why) = value_fault {
+            println!("  {:<22} ! {why}", "");
+            println!("  {:<22} ! so the reader crashes on it -- {} is what will be in force once \
+                      this is fixed", "", k.default);
+        }
         if matches!(src, Source::Env(_)) {
             // "environment" means this shell. launchd starts its jobs with a minimal one, so for
             // the scheduled half of the pipeline the file (or the default) is what is in force.
@@ -95,6 +110,20 @@ fn show() {
             println!("  {:<22} ! only in this shell; jobs launchd starts use {for_jobs}", "");
         }
     }
+    // Lines in the file that no knob claims. `set` refuses them, so they arrive by hand -- a
+    // typo in a key name is otherwise completely invisible: the console shows the knob at its
+    // default, and the loader refuses the line to a stderr nobody reads.
+    let unknown: Vec<&String> = file.keys()
+        .filter(|k| !KNOBS.iter().any(|n| n.key == k.as_str()))
+        .collect();
+    if !unknown.is_empty() {
+        println!();
+        println!("! the file also sets {} nothing here reads: {}",
+                 if unknown.len() == 1 { "a name" } else { "names" },
+                 unknown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+        println!("  a mistyped key looks exactly like this. The loader refuses them too.");
+    }
+
     println!();
     // The one limit that is invisible otherwise, and the reason this is a line of output rather
     // than a comment in the source: the file sets the environment of processes that start on
