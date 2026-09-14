@@ -43,8 +43,8 @@ const PRESETS: &[(&str, jobs::Schedule)] = &[
     ("hourly", jobs::Schedule::Every(3600)),
     ("every 4 hours", jobs::Schedule::Every(14_400)),
     ("every 12 hours", jobs::Schedule::Every(43_200)),
-    ("daily at 05:30", jobs::Schedule::At { hour: 5, minute: 30, weekday: None }),
-    ("weekly, Mon 06:10", jobs::Schedule::At { hour: 6, minute: 10, weekday: Some(1) }),
+    ("daily at 05:30", jobs::Schedule::Calendar(jobs::Cal { hour: Some(5), minute: Some(30), day: None, weekday: None, month: None })),
+    ("weekly, Mon 06:10", jobs::Schedule::Calendar(jobs::Cal { hour: Some(6), minute: Some(10), day: None, weekday: Some(1), month: None })),
 ];
 
 pub fn main() {
@@ -497,6 +497,16 @@ fn job_line(j: &Job) -> String {
         "! overdue".to_string()
     } else if j.never_ran() {
         "never run yet".to_string()
+    } else if let Some(_) = j.freshness_unknown() {
+        // Neither fresh nor stale: the log that would date it is gone or undatable. Drawing
+        // that as health is how a job that quietly stopped stays invisible.
+        "? cannot be dated".to_string()
+    } else if j.last_exit.is_none() {
+        "not loaded".to_string()
+    } else if j.runs == Some(0) {
+        // launchd prints exit 0 both for "finished successfully" and for "never finished at
+        // all". With no run since this login there is nothing to call successful.
+        "no run since login".to_string()
     } else {
         // The exit code belongs here. Without it a job that fails on every single run reads
         // exactly like one that works: same schedule, same fresh log timestamp.
@@ -522,7 +532,8 @@ mod tests {
         Job {
             label: "com.hypermnesia.extract".into(), plist: PathBuf::new(), schedule,
             program: vec![], log: Some(PathBuf::from("/nope")), last_exit: Some(0), pid: None,
-            last_output: Some(SystemTime::now() - Duration::from_secs(300)), runs: Some(9),
+            log_state: jobs::LogState::Written(SystemTime::now() - Duration::from_secs(300)),
+            runs: Some(9),
             installed: Some(SystemTime::now() - Duration::from_secs(90_000)), fault: None,
         }
     }
@@ -553,9 +564,9 @@ mod tests {
 
     #[test]
     fn a_job_never_run_is_not_called_fresh() {
-        let mut j = job(jobs::Schedule::At { hour: 6, minute: 10, weekday: Some(1) });
+        let mut j = job(jobs::Schedule::Calendar(jobs::Cal { hour: Some(6), minute: Some(10), day: None, weekday: Some(1), month: None }));
         j.runs = Some(0);
-        j.last_output = None;
+        j.log_state = jobs::LogState::Missing;
         assert!(job_line(&j).contains("never run yet"), "{}", job_line(&j));
     }
 }

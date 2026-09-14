@@ -67,7 +67,7 @@ fn main() {
                 _ => fail("give a time, for example: at consolidate 05:30"),
             };
             let Some((hour, minute)) = parse_hhmm(time) else { fail("a time is written as HH:MM") };
-            apply(find(&all, name), &jobs::Schedule::At { hour, minute, weekday: day });
+            apply(find(&all, name), &jobs::Schedule::at(hour, minute, day));
         }
         Some("-h") | Some("--help") => print!("{HELP}"),
         Some(other) => fail(&format!("unknown command: {other}")),
@@ -160,7 +160,8 @@ fn parse_weekday(s: &str) -> Option<u32> {
 fn find<'a>(all: &'a [Job], name: &str) -> &'a Job {
     match all.iter().find(|j| j.short() == name || j.label == name) {
         Some(j) if j.broken() => fail(&format!(
-            "{name}: this plist cannot be read ({}), so launchd has not loaded it either. \
+            "{name}: this plist cannot be read ({}). launchd may still be running the copy it \
+             loaded before the file broke -- what it will do at the next login is the question. \
              Fix the file first.", j.fault.clone().unwrap_or_default())),
         Some(j) => j,
         None => fail(&format!("no such job: {name}. There is: {}",
@@ -196,6 +197,14 @@ fn list(all: &[Job]) {
                 Some(d) => format!("never ran (installed {})", ago(d)),
                 None => "never ran".to_string(),
             }
+        } else if j.last_exit.is_none() {
+            "not loaded into launchd".to_string()
+        } else if j.runs == Some(0) {
+            // Loaded, and launchd has not started it since this login. Its exit column says 0,
+            // which it prints both for "finished successfully" and for "never finished at all" --
+            // the substitution this whole console exists to refuse. Without a schedule there is
+            // nothing to complain about, but there is also nothing to call a successful run.
+            "loaded; no run since this login".to_string()
         } else {
             match j.last_exit {
                 // launchd remembers only the code of the LAST run, so this is not a history but a
@@ -208,6 +217,11 @@ fn list(all: &[Job]) {
             }
         };
         println!("{:<13} {:<22} {:<14} {}", j.short(), j.schedule.human(), when, state);
+        if let Some(why) = j.freshness_unknown() {
+            // Neither healthy nor failing: the evidence is gone. Drawing that as health is how a
+            // job that stopped writing anything stays invisible.
+            println!("{:<13} ? {why}", "");
+        }
         if j.overdue() {
             // We only shout when a period and a half has passed with nothing to show for it. A
             // job installed later than its own last slot honestly shows a zero and is not a

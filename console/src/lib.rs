@@ -98,6 +98,12 @@ pub fn config_fault(path: &std::path::Path) -> Result<(), String> {
     // reason a console built from it compiles in seconds.
     extern "C" { fn getuid() -> u32; }
     let Ok(md) = std::fs::metadata(path) else { return Ok(()) };
+    if !md.is_file() {
+        // A directory or a device here is a misconfigured HM_CONSOLE_CONFIG. Reading it fails,
+        // and falling back to the default without a word is how the console ends up talking to
+        // a different store than the person configured.
+        return Err(format!("{} is not a file, so nothing can be read from it", path.display()));
+    }
     let mode = md.mode() & 0o777;
     if mode & 0o022 != 0 {
         return Err(format!("{}: mode {mode:o} -- another account can write it, and what it \
@@ -243,10 +249,26 @@ fn run_with_timeout(cmd: &str, stdin_text: &str, timeout: Duration) -> Result<St
     // and pipelines (`ssh host kubectl exec … -- psql …`). Parsing it ourselves would mean
     // writing an incomplete shell. Its source is the config file of whoever owns the machine,
     // not the network.
-    let mut child = Command::new("sh")
-        .arg("-c").arg(cmd)
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().map_err(|e| format!("could not start sh: {e}"))?;
+    let mut child = Command::new("sh");
+    child.arg("-c").arg(cmd)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Its own process group, so the timeout can kill the WHOLE tree. Measured before this:
+    // killing only `sh` left the ssh and kubectl it had started running after the deadline --
+    // a console that reports "no answer within 30s" while its query keeps working on the other
+    // end, once a minute, forever.
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        child.pre_exec(|| {
+            // setpgid(0, 0): the child leads a new group, so killpg reaches its descendants too.
+            extern "C" { fn setpgid(pid: i32, pgid: i32) -> i32; }
+            if setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = child.spawn().map_err(|e| format!("could not start sh: {e}"))?;
     {
         let mut si = child.stdin.take().ok_or("no stdin on the child")?;
         si.write_all(stdin_text.as_bytes()).map_err(|e| format!("writing the query: {e}"))?;
@@ -283,8 +305,7 @@ fn run_with_timeout(cmd: &str, stdin_text: &str, timeout: Duration) -> Result<St
         }
     };
     let Some(st) = status else {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_tree(&mut child);
         return Err(format!("no answer within {}s", timeout.as_secs()));
     };
     let grace = Duration::from_secs(5);
@@ -306,6 +327,22 @@ fn run_with_timeout(cmd: &str, stdin_text: &str, timeout: Duration) -> Result<St
         return Err(format!("the query failed (exit {code}): {tail}"));
     }
     Ok(out)
+}
+
+/// End the child AND everything it started. `child.kill()` reaches only `sh`; a preset like
+/// `ssh host kubectl exec ...` leaves both of those behind, still talking to the store.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        extern "C" { fn killpg(pgrp: i32, sig: i32) -> i32; }
+        // The group id is the child's pid: it was made a group leader before exec.
+        let pgid = child.id() as i32;
+        unsafe { killpg(pgid, 15); }                 // SIGTERM to the group
+        std::thread::sleep(Duration::from_millis(200));
+        unsafe { killpg(pgid, 9); }                  // and then SIGKILL to whatever ignored it
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // -- parsing -------------------------------------------------------------------------------
