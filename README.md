@@ -230,16 +230,62 @@ cannot be told from an empty store.
 
 | Command | What |
 |---------|------|
-| `hypermnesia` | the menu-bar tray: volumes, a Run-now button per job, schedules, refresh |
+| `hypermnesia` | the menu-bar tray (macOS) |
 | `hypermnesia-stats` | the same numbers on stdout |
 | `hypermnesia-jobs` | scheduled passes: what is configured, when each last worked, run one now, change a schedule |
 | `hypermnesia-settings` | the tunables, each with the value in force and where that value came from |
 | `hypermnesia-setup` | the first-run walkthrough, and `--connect` / `--show` / `--test` on their own |
 
-The rule it is written to is the one this project is about: **stale must not look fresh, and
-missing must not look empty.** A reading that failed keeps the old numbers and labels them with
-their age; a job that never ran says so rather than showing launchd's zero as success; a settings
-file the hooks refuse is reported as refused, not displayed knob by knob as if it applied.
+### The tray
+
+A menu, not a window. Everything the console has to show is a dozen lines and a dozen buttons; a
+window would mean a GUI framework for the same result. Two dependencies, both macOS-only, and the
+data layer under them has none at all — a console that takes a minute to build is a console nobody
+rebuilds.
+
+What is in the menu:
+
+- **the first line is the age of what you are reading.** Not a status light: "updated 4m ago, in
+  1.2s", and after a failure "! not updated: <reason>, showing state from 12m ago". It is computed
+  when the menu is drawn, from the wall clock, so a Mac that slept for two hours says two hours.
+- **the volumes** — memories active of total, knowledge pages, documents and chunks, how many
+  chunks have no embedding, how many embedding models are in the store, the review queue, the
+  stale count, the database size.
+- **Run now** — every scheduled pass, with its schedule, when it last wrote to its log, and its
+  last exit code. Pressing one runs it through launchd and reports what launchd then did, not that
+  the request was accepted.
+- **Schedule** — the common intervals and times, per job. It edits the plist, validates it, and
+  reloads the job, because launchd keeps its own copy from the moment it loaded it: writing the
+  file without the reload would show a new schedule while the old one is in force.
+- **Refresh now** and **Quit**.
+
+The menu-bar title carries one mark, `HM !`, and it is derived from the lines below rather than
+computed beside them: anything the menu would show with a `!` puts the mark in the title. That is
+the whole design in one detail — the icon is where a problem is noticed, so the icon must not be
+able to disagree with the menu.
+
+`hypermnesia --install` puts it in launchd to start at login, restarted if it crashes and not if
+you quit it. `--uninstall` takes it back out.
+
+**Try it without a database.** The console's only connection setting is a command that prints the
+query's answer, so a file works:
+
+```bash
+HM_PSQL_CMD="cat demo/store.json" ./target/release/hypermnesia-stats   # or hypermnesia, for the tray
+```
+
+That is the store in `console/demo/store.json` — a small fictional one, not anybody's real
+numbers.
+
+### The rule it is written to
+
+**Stale must not look fresh, and missing must not look empty.** A reading that failed keeps the
+old numbers and labels them with their age. A job that never ran says so rather than showing
+launchd's zero as success — launchd prints exit 0 both for "finished well" and for "never
+finished". A settings file the hooks refuse is reported as refused, not displayed knob by knob as
+if it applied. An answer that is not this query's JSON is an error, not a store full of zeroes.
+Every complaint the console can print, and the two readings that are deliberately not complaints,
+are listed in [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md).
 
 ## Design docs
 
