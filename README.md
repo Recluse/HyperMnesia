@@ -61,17 +61,28 @@ missing index, half its embeddings, or a scope that matches nothing.
 
 ### What it changed for one user
 
-A user put the document side in on 3 September 2026 and pointed it at a folder of markdown notes
-that until then lived in his `CLAUDE.md` — so the whole folder reached the model on every request,
-and was re-read from cache at every step of every session. His own usage panel shows cache reads
-falling roughly fiftyfold within days and staying down; his output tokens barely moved. He had not
-been hitting the five-hour limits before the change, and has not since, so a smaller quota does
-not account for it.
+[Boris Khodok](https://github.com/boris-virto) put the document side in on 3 September 2026 and
+pointed it at a folder of markdown notes that until then lived in his `CLAUDE.md` — so the whole
+folder reached the model on every request, and was re-read from cache at every step of every
+session. His usage panel, below, shows cache reads falling roughly fiftyfold within days and
+staying down; his output tokens barely moved. He had not been hitting the five-hour limits before
+the change, and has not since, so a smaller quota does not account for it.
+
+<p align="center">
+  <img src="docs/assets/usage-drop.jpg" width="700"
+       alt="daily token usage: hundreds of millions through early September, near zero afterwards">
+</p>
 
 Read that number as narrowly as it was measured: it is retrieval replacing a folder pinned into
 the context. He had no Tier 0/1 map — his `get_project_map` came back empty — and no
 personal-memory pipeline running, so it is not evidence about either of those. Those deserve their
 own measurement, and this repository does not have one yet.
+
+He is also this repository's first outside contributor, and both contributions are of a piece with
+the rest of it: [issue #1](https://github.com/Recluse/HyperMnesia/issues/1), a git-ignored
+directory that ingested zero documents and said nothing about it, and
+[pull request #2](https://github.com/Recluse/HyperMnesia/pull/2), `--known-hashes`, which stopped a
+re-ingest from burning every embedding it already had.
 
 If you want to see it rather than read about it: **[docs/DEMO.md](docs/DEMO.md)** — two minutes,
 real output, no install beyond a Postgres.
