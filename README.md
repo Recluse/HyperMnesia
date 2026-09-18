@@ -69,7 +69,7 @@ staying down; his output tokens barely moved. He had not been hitting the five-h
 the change, and has not since, so a smaller quota does not account for it.
 
 <p align="center">
-  <img src="docs/assets/usage-drop.jpg" width="700"
+  <img src="docs/assets/usage-drop.jpg" width="666"
        alt="daily token usage: hundreds of millions through early September, near zero afterwards">
 </p>
 
