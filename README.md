@@ -199,8 +199,12 @@ That is the fastest thing here and it needs neither the map nor the hooks: the n
 along with every request and start arriving a few chunks at a time, when they are relevant.
 
 ```bash
-./hm ingest /path/to/your/notes mynotes
+./hm ingest /path/to/your/notes mynotes          # --walk if the folder is git-ignored
 ```
+
+Re-run that same line whenever the notes change: it is incremental by content hash, so unchanged
+files keep their chunks and their embeddings. Put it in a git hook or a scheduled job and the
+index keeps itself current; `ci/freshness.py` reports when it has fallen behind.
 
 `hm` is the recommended path because the *order* of those steps is load-bearing and getting it
 wrong is silent: the ANN index must be built after the first bulk embed, and a re-ingest without

@@ -200,6 +200,38 @@ To auto-capture/inject personal memory, register the hooks in Claude Code settin
 `mem_extract` / `mem_consolidate` schedule. Configure the distiller via `HM_LLM_BACKEND` + `HM_LLM_URL`/`HM_LLM_MODEL` (OpenAI-compatible),
 `HM_LLM_MODEL` (Ollama), or `HM_LLM_CMD` (a CLI) — see `hooks/_llm.py`. Everything is fail-open: if the store is unreachable, the agent keeps working.
 
+## Keeping the index current
+
+`./hm ingest <dir> <scope>` is the update command as well as the first one. It is incremental when
+the scope already holds documents: it takes a content-hash snapshot from the database it is about
+to write to, re-emits only what changed, and leaves every other document's embeddings alone. So
+"refresh" is the same line you ran the first time.
+
+```bash
+./hm ingest ~/code/myrepo myrepo            # tracked files, via git ls-files
+./hm ingest ~/notes mynotes --walk          # a folder git does not track, or is told to ignore
+```
+
+`--walk` matters more than it looks: without it a git-ignored directory enumerates to nothing, and
+the ingester refuses to write an empty corpus rather than deleting the scope it was asked to
+refresh.
+
+Three ways to run it without remembering to:
+
+| When | How |
+|------|-----|
+| on every commit / pull | a `post-commit` and `post-merge` hook in the repo, calling the line above |
+| on a timer | cron, a systemd timer, or a launchd agent; on macOS `hypermnesia-jobs` lists and reschedules those |
+| in CI | a step on push, if the runner can reach the database |
+
+A timer is the simplest and a git hook is the better one: it runs when something actually changed,
+and costs nothing when nothing did.
+
+**How you learn it has drifted** rather than assuming: `ci/freshness.py <repo> <scope>` reports
+documents whose ingested commit is behind HEAD, and component globs that match no file. `hm
+doctor` covers the other half -- a missing index, unembedded chunks, two embedding models in one
+store. Neither needs a schedule to be useful, but both are worth one.
+
 ## The console (optional, macOS menu bar + CLI)
 
 `console/` is the operator's side: what the store holds, whether the scheduled passes are running,

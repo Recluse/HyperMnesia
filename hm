@@ -9,7 +9,11 @@
 # with them. Neither raises an error.
 #
 #   ./hm init                  bring up the docker stack, load both schemas, print what to export
-#   ./hm ingest <dir> <scope>  ingest -> embed -> index, incrementally if the scope already exists
+#   ./hm ingest <dir> <scope> [--walk]
+#                              ingest -> embed -> index, incrementally if the scope already exists.
+#                              --walk enumerates the tree instead of asking git, for a directory
+#                              that is git-ignored or not a repository at all -- without it such a
+#                              directory ingests ZERO documents and says why.
 #   ./hm doctor                is this install actually working, or only appearing to
 #   ./hm latency               where the time goes: hook, embedder, database, reranker
 #
@@ -87,8 +91,24 @@ EOF
 }
 
 cmd_ingest() {
-    [ $# -eq 2 ] || usage
-    dir=$1; scope=$2
+    # --walk anywhere among the arguments: a notes folder that is git-ignored is the common case
+    # for it, and that is exactly the case which otherwise ingests nothing at all.
+    #
+    # Read with `case` rather than a `[ ]` test, and the positionals rebuilt by assignment rather
+    # than by `set -- $(...)`: under `set -e` a failing test as the last statement of a loop ends
+    # the script, and an unquoted expansion loses a directory whose name contains a space.
+    walk=""; dir=""; scope=""; n=0
+    for a in "$@"; do
+        case "$a" in
+            --walk) walk="--walk" ;;
+            *) n=$((n + 1))
+               case "$n" in
+                   1) dir="$a" ;;
+                   2) scope="$a" ;;
+               esac ;;
+        esac
+    done
+    [ "$n" -eq 2 ] || usage
     [ -d "$dir" ] || die "no such directory: $dir"
     # Before the first psql call, not inside the python step that runs after it: the scope is
     # interpolated into a single-quoted SQL literal below, so a quote in it produces a syntax
@@ -119,10 +139,10 @@ cmd_ingest() {
         psql "$DATABASE_URL" -tAX -v ON_ERROR_STOP=1 -F'	' \
             -c "SELECT path, content_hash FROM documents WHERE repo='$scope'" > "$tmp/known.tsv"
         "$PY" "$ROOT/ingest/ingest_repo.py" "$dir" "$scope" "$tmp/out.sql" \
-            --known-hashes "$tmp/known.tsv"
+            --known-hashes "$tmp/known.tsv" $walk
     else
         step "First ingest of scope '$scope'"
-        "$PY" "$ROOT/ingest/ingest_repo.py" "$dir" "$scope" "$tmp/out.sql"
+        "$PY" "$ROOT/ingest/ingest_repo.py" "$dir" "$scope" "$tmp/out.sql" $walk
     fi
 
     step "Loading the documents"

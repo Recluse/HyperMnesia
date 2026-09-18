@@ -69,13 +69,13 @@ def write_stub(path, body):
     os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def run_ingest(doccount):
+def run_ingest(doccount, extra=(), dirname="src"):
     """Run `hm ingest` against stubs; returns the recorded argv lines."""
     with tempfile.TemporaryDirectory() as tmp:
         write_stub(os.path.join(tmp, "psql"), PSQL_STUB)
         write_stub(os.path.join(tmp, "pystub"), PY_STUB)
         log = os.path.join(tmp, "log.jsonl")
-        src = os.path.join(tmp, "src")
+        src = os.path.join(tmp, dirname)
         os.makedirs(src)
         env = dict(os.environ,
                    PATH=tmp + os.pathsep + os.environ.get("PATH", ""),
@@ -83,7 +83,7 @@ def run_ingest(doccount):
                    STUB_LOG=log,
                    STUB_DOCCOUNT=str(doccount),
                    DATABASE_URL="postgresql://stub/stub")
-        p = subprocess.run(["sh", HM, "ingest", src, "myrepo"],
+        p = subprocess.run(["sh", HM, "ingest", src, "myrepo", *extra],
                            capture_output=True, timeout=120, env=env)
         lines = [json.loads(l) for l in open(log, encoding="utf-8")] if os.path.exists(log) else []
     return lines, p
@@ -109,6 +109,31 @@ def main():
     check("calls the ingester", ingest is not None)
     check("no --known-hashes on a first ingest", "--known-hashes" not in (ingest or []),
           "an empty scope has no snapshot to take")
+
+    print("== --walk is passed through, and only when asked for ==")
+    # A git-ignored notes folder enumerates to nothing without it, and the ingester then refuses
+    # to write an empty corpus -- so for that folder, `hm ingest` without --walk does nothing at
+    # all. It has to reach the ingester.
+    lines, p = run_ingest(0, extra=["--walk"])
+    ingest = next((l for l in lines if any("ingest_repo.py" in a for a in l)), None)
+    check("--walk reaches the ingester", "--walk" in (ingest or []), str(ingest))
+    check("and the scope is still read correctly", "myrepo" in (ingest or []), str(ingest))
+    lines, _ = run_ingest(12, extra=["--walk"])
+    ingest = next((l for l in lines if any("ingest_repo.py" in a for a in l)), None)
+    check("--walk survives the incremental path too",
+          "--walk" in (ingest or []) and "--known-hashes" in (ingest or []), str(ingest))
+    lines, _ = run_ingest(0)
+    ingest = next((l for l in lines if any("ingest_repo.py" in a for a in l)), None)
+    check("and is absent when it was not asked for", "--walk" not in (ingest or []), str(ingest))
+
+    print("== a directory whose name contains a space still works ==")
+    # The flag parsing rebuilds the positionals; doing that with an unquoted expansion would eat
+    # this case.
+    lines, p = run_ingest(0, dirname="my notes")
+    ingest = next((l for l in lines if any("ingest_repo.py" in a for a in l)), None)
+    check("the path arrives in one piece",
+          any(a.endswith("my notes") for a in (ingest or [])), str(ingest))
+    check("exits 0", p.returncode == 0, p.stderr.decode()[-200:])
 
     print("== re-ingest of a scope that already holds documents ==")
     lines, p = run_ingest(12)
