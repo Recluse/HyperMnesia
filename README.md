@@ -59,6 +59,20 @@ no file are reported, a store that will not answer says so instead of resembling
 no rules, and `./hm doctor` names the faults that leave an install answering normally with a
 missing index, half its embeddings, or a scope that matches nothing.
 
+### What it changed for one user
+
+A user put the document side in on 3 September 2026 and pointed it at a folder of markdown notes
+that until then lived in his `CLAUDE.md` — so the whole folder reached the model on every request,
+and was re-read from cache at every step of every session. His own usage panel shows cache reads
+falling roughly fiftyfold within days and staying down; his output tokens barely moved. He had not
+been hitting the five-hour limits before the change, and has not since, so a smaller quota does
+not account for it.
+
+Read that number as narrowly as it was measured: it is retrieval replacing a folder pinned into
+the context. He had no Tier 0/1 map — his `get_project_map` came back empty — and no
+personal-memory pipeline running, so it is not evidence about either of those. Those deserve their
+own measurement, and this repository does not have one yet.
+
 If you want to see it rather than read about it: **[docs/DEMO.md](docs/DEMO.md)** — two minutes,
 real output, no install beyond a Postgres.
 
@@ -178,6 +192,14 @@ cp deploy/docker/.env.example deploy/docker/.env   # POSTGRES_PASSWORD: openssl 
 ./hm init                          # compose up, wait for Postgres, load both schemas
 export DATABASE_URL=...            # init prints the exact line
 ./hm ingest /path/to/your/repo myrepo    # ingest -> embed -> ANN index -> doctor
+```
+
+**Have a folder of notes wired into `CLAUDE.md`?** Ingest it and then take it out of `CLAUDE.md`.
+That is the fastest thing here and it needs neither the map nor the hooks: the notes stop riding
+along with every request and start arriving a few chunks at a time, when they are relevant.
+
+```bash
+./hm ingest /path/to/your/notes mynotes
 ```
 
 `hm` is the recommended path because the *order* of those steps is load-bearing and getting it
