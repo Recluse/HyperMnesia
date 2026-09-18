@@ -54,6 +54,21 @@ component globs, and that component's `must` rules — plus those reached throug
 dependency graph — are injected before the edit by a hook, rather than waited for. Documentation
 and past decisions stay reachable behind that, by search.
 
+### Where it came from, and why it would rather say nothing
+
+This began somewhere else: retrieval over a large reference catalogue, where the task is to pick
+the right entry out of tens of thousands. That problem sets the standard the rest of this inherits.
+A confidently wrong pick is worse than no pick at all — it travels downstream into a document and
+is found much later, while a refusal is noticed in the same minute. Applying the same machinery to
+a pile of internal documentation came second, as a transfer, once it was clear the documents had
+become the bigger problem.
+
+So when this system is unsure, it is built to say so rather than to return the nearest thing it
+has: memory search abstains past a distance threshold instead of offering a loose match, the
+ingester refuses to write an empty corpus rather than emptying the scope it was asked to refresh,
+and the console reports a reading it could not take instead of drawing zeroes. That is the same
+rule each time, and it is older than the code.
+
 A hand-authored map rots, so the rot is made visible rather than assumed away: globs that match
 no file are reported, a store that will not answer says so instead of resembling a project with
 no rules, and `./hm doctor` names the faults that leave an install answering normally with a
