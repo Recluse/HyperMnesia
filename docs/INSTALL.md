@@ -44,13 +44,22 @@ Read on for the manual steps, for the non-Docker paths, and for Kubernetes.
 |---|---|---|---|---|
 | **Use case** | dev, personal, 1 user | homelab / small team | existing cluster, HA-ish | cheapest, no GPU |
 | **CPU** | 4+ cores | 4-8 cores | per-node | 2-4 cores |
-| **RAM** | 8 GB (16 w/ reranker) | 8-16 GB | 4-8 GB / node | 4 GB |
+| **RAM** | 8 GB (16 w/ reranker) | 8-16 GB | 8-10 GB for the embedder + 1 GB for the rest | 8 GB |
 | **Disk** | ~5 GB + your corpus | ~10 GB | PV ~20 GB | ~3 GB |
 | **GPU / accel** | Apple MPS or NVIDIA (nice, not required) | optional | optional | none |
 | **OS** | macOS 13+ / Linux | Linux (Docker) | any k8s 1.27+ | Linux |
 | **Embedder** | Ollama `bge-m3` | TEI or Ollama (compose) | TEI Deployment | TEI on CPU (~3-5 s/chunk) |
 | **Reranker** | local (`rerank/server.py`, ~4 GB RAM when active) | optional compose service | optional Deployment | **off** (RRF only) |
 | **Postgres** | docker (pgvector image) | docker-compose | in-cluster, local PV | docker |
+
+> **The RAM is the embedder's, not the system's.** Measured on a live install holding 1387
+> documents, 24975 chunks and 750 memories: Postgres sits at **172 MiB** resident and the pod
+> that runs the Python tools at **9 MiB**. The embedder next to it — text-embeddings-inference
+> serving `bge-m3` on CPU, with `--max-batch-tokens 4096 --max-client-batch-size 32` — sits at
+> **6.5 GiB**. That is the whole hardware story, and it is why the row above got it wrong until
+> someone measured: the store is cheap, the model is not. The model also does not have to live
+> next to the store. Embed on a Mac or a GPU box, or point `OLLAMA_URL`/`TEI_URL` at something
+> else; a query only ever embeds its own short text.
 
 > **Bulk embedding is the only heavy step.** On CPU, `bge-m3` is ~3-5 s/chunk; on a GPU or Apple
 > Silicon (Ollama) it's ~10-100x  faster. Embed once; queries only embed the (short) query text.

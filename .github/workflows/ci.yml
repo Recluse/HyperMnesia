@@ -42,6 +42,10 @@ jobs:
         run: python tests/test_settings_knobs.py
       - name: Shared settings file (prefix allowlist, mode check, env precedence)
         run: python tests/test_env_file.py
+      # The consolidator rewrites memory in place: one bad grouping can retire hundreds of
+      # records in a single verdict, which is exactly what it did before this guard existed.
+      - name: Consolidator grouping (a chain must not become one group)
+        run: python tests/test_consolidate_groups.py
       # Four modules ship an executable self-check and only one of them was run. For each of
       # the three below, that self-check is the ONLY automated coverage its behaviour has:
       # Tier-1 selection (longest-match order, 1-hop propagation, cross-repo isolation),
