@@ -74,6 +74,17 @@ Optional, and the only Claude-Code-specific part. Register in Claude Code settin
 - On a schedule (cron/systemd/launchd): `mem_extract.py` distills queued transcripts into
   memories via an LLM; `mem_consolidate.py` runs the consolidation pass.
 
+**What consolidation actually acts on.** A candidate group is a set of memories where *every*
+member is within `MEM_CONSOLIDATE_MAXDIST` of *every* other -- a maximal clique, not a chain.
+The distinction is the whole safety of the pass: linking any two close memories and letting that
+spread transitively collapsed a 528-memory store into one group of 369, and a single `merge`
+verdict on such a group replaces every member with one text. Three bounds hold independently of
+what the model says: no group above `MEM_CONSOLIDATE_MAX_GROUP` is ever acted on, at most
+`MEM_CONSOLIDATE_MAX_GROUPS` are examined per run (each is an LLM call), and a merge below
+`MEM_REVIEW_THRESHOLD` confidence is parked for you in the review queue instead of applied. The
+replacement inherits the project its sources shared, and each retired memory records which one
+displaced it.
+
 Injected memory is wrapped in a nonce-fenced block marked as *data, not instructions*, and the
 content is defanged, so a poisoned memory can't smuggle directives into the agent.
 

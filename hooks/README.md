@@ -12,7 +12,7 @@ to ask. All are **fail-open** — they never block a tool call — but none is f
 | `mem_recall.py`  | UserPromptSubmit | inject memories relevant to the prompt |
 | `mem_capture.py` | SessionEnd, PreCompact | enqueue the transcript path |
 | `mem_extract.py` | schedule (cron/systemd/launchd) | distill queued transcripts -> memories |
-| `mem_consolidate.py` | schedule (daily) | merge/supersede near-duplicates (gated) |
+| `mem_consolidate.py` | schedule (daily) | merge/supersede near-duplicates: cliques only, bounded group size, low-confidence proposals parked for you |
 | `mem_reflect.py` | schedule (daily) | synthesize per-project knowledge pages (regenerated, never stale) |
 | `mem_review.py`  | you, manually | `list \| approve <id> \| reject <id>` the review queue; `stale [days]` lists active facts nothing has recalled in that long, to confirm or retire |
 

@@ -104,6 +104,20 @@ Without it, psql prints the error, carries on to `COMMIT` (which becomes a rollb
 every guard inside the transaction, including the snapshot check above, is silenced along with it.
 Every invocation in this repo's code and documentation sets it. If you write your own, set it too.
 
+## What the consolidator refuses to do
+
+It rewrites memory in place, so it says what it declined and why rather than reporting a clean
+pass:
+
+| In the log | What happened |
+|------------|---------------|
+| `N candidate group(s) larger than 6 were NOT reviewed` | those memories are mutually close but too many to act on in one verdict; tighten `MEM_CONSOLIDATE_MAXDIST` or raise the cap deliberately |
+| `61 group(s) to review; taking the 10 tightest, 51 left for the next run` | the rest are not lost, they wait; each group costs one LLM call |
+| `group [...]: merge REFUSED -- 8 members exceeds the 6 this may act on` | the code's own bound, independent of the model's confidence |
+| `group [...]: NO VERDICT (...) -- left untouched` | the model failed or answered unparseably. NOT the same as "keep", and the last line repeats the count so a run whose verdicts all failed cannot read as "everything examined" |
+| `low-confidence (0.62) → queued for review` | the proposal is waiting in `mem_review.py list`, nothing was changed |
+| `merge write FAILED, keeping originals intact` | the replacement did not land, so the sources were never retired |
+
 ## What the console tells you about itself
 
 The console is a tool for noticing silence, so silence in the console is the worst bug it can

@@ -318,6 +318,10 @@ shared settings file below, or from the default — in that order.
 | `MEM_LEX_MAXDIST` | = `MEM_SEM_MAXDIST` | `ingest/mem_ops.py` | lexical floor; unset it follows the gate above |
 | `EMBED_BATCH` | `16` | `ingest/embed_chunks.py` | chunks per request during a bulk embed |
 | `EMBED_MODEL` | `bge-m3` | `ingest/_common.py` | model name for Ollama, and the string stamped into `embedding_model` |
+| `MEM_CONSOLIDATE_MAXDIST` | `0.20` | `hooks/mem_consolidate.py` | how close two memories must be to be candidates for merging. Above ~0.25 the candidate graph starts collapsing into one blob; 0.35 meant "same topic" rather than "same fact" |
+| `MEM_CONSOLIDATE_MAX_GROUP` | `6` | `hooks/mem_consolidate.py` | the most memories one verdict may act on. A merge replaces every member, so this bounds the damage a wrong verdict can do, independently of the model's confidence |
+| `MEM_CONSOLIDATE_MAX_GROUPS` | `10` | `hooks/mem_consolidate.py` | groups examined per run; each one is an LLM call, and the rest wait for the next pass |
+| `MEM_CONSOLIDATE_MODEL` | `haiku` | `hooks/mem_consolidate.py` | the model the consolidation verdict is asked of |
 
 ### The shared settings file
 
