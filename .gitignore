@@ -1,5 +1,8 @@
 # Rust build artifacts
 mcp-server/target/
+# CARGO_TARGET_DIR for the console crate, when set to the repo root's build/ (keeps target output
+# out of an immutable-OS host's toolbox checkout and in one place regardless of which crate built).
+/build/
 
 # Python
 __pycache__/

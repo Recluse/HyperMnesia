@@ -11,15 +11,15 @@ use hypermnesia_console::jobs::{self, Job};
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Through jobs::job_prefix rather than the variable: only that path also consults the
-    // config file, and the tray -- started by launchd with a minimal environment -- has
-    // nothing else to read.
+    // config file, and the tray -- started by the service manager with a minimal environment --
+    // has nothing else to read.
     let prefix = jobs::job_prefix();
     let all = match jobs::list(&prefix) {
         Ok(j) => j,
         Err(e) => fail(&e),
     };
     if all.is_empty() {
-        fail(&format!("no job with the prefix {prefix} found in ~/Library/LaunchAgents"));
+        fail(&format!("no job with the prefix {prefix} found in {}", jobs::UNITS_LOCATION));
     }
 
     match args.first().map(String::as_str) {
@@ -160,9 +160,10 @@ fn parse_weekday(s: &str) -> Option<u32> {
 fn find<'a>(all: &'a [Job], name: &str) -> &'a Job {
     match all.iter().find(|j| j.short() == name || j.label == name) {
         Some(j) if j.broken() => fail(&format!(
-            "{name}: this plist cannot be read ({}). launchd may still be running the copy it \
-             loaded before the file broke -- what it will do at the next login is the question. \
-             Fix the file first.", j.fault.clone().unwrap_or_default())),
+            "{name}: this {} cannot be read ({}). {} may still be running the copy it loaded \
+             before the file broke -- what it will do at the next login is the question. Fix \
+             the file first.", jobs::UNIT_NOUN, j.fault.clone().unwrap_or_default(),
+            jobs::BACKEND_NAME)),
         Some(j) => j,
         None => fail(&format!("no such job: {name}. There is: {}",
                               all.iter().map(Job::short).collect::<Vec<_>>().join(", "))),
@@ -178,10 +179,11 @@ fn list(all: &[Job]) {
     println!("{:<13} {:<22} {:<14} {}", "JOB", "SCHEDULE", "LAST OUTPUT", "STATE");
     for j in all {
         if let Some(why) = &j.fault {
-            // An unreadable plist is one launchd also refused at login: the job is not running.
-            // It used to be dropped from the list entirely, which is the one case the console had
-            // nothing at all to say about.
-            println!("{:<13} {:<22} {:<14} ! unreadable plist: {why}", j.short(), "—", "—");
+            // An unreadable unit is one the service manager also refused: the job is not
+            // running. It used to be dropped from the list entirely, which is the one case the
+            // console had nothing at all to say about.
+            println!("{:<13} {:<22} {:<14} ! unreadable {}: {why}", j.short(), "—", "—",
+                     jobs::UNIT_NOUN);
             continue;
         }
         let when = match j.since_last_output() {
@@ -198,7 +200,7 @@ fn list(all: &[Job]) {
                 None => "never ran".to_string(),
             }
         } else if j.last_exit.is_none() {
-            "not loaded into launchd".to_string()
+            format!("not loaded into {}", jobs::BACKEND_NAME)
         } else if j.runs == Some(0) {
             // Loaded, and launchd has not started it since this login. Its exit column says 0,
             // which it prints both for "finished successfully" and for "never finished at all" --
@@ -213,7 +215,7 @@ fn list(all: &[Job]) {
                 // has nothing to tell them apart by.
                 Some(0) => format!("last run ok{}", runs_note(j)),
                 Some(c) => format!("last run: code {c}{}", runs_note(j)),
-                None => "not loaded into launchd".to_string(),
+                None => format!("not loaded into {}", jobs::BACKEND_NAME),
             }
         };
         println!("{:<13} {:<22} {:<14} {}", j.short(), j.schedule.human(), when, state);
@@ -227,7 +229,7 @@ fn list(all: &[Job]) {
             // job installed later than its own last slot honestly shows a zero and is not a
             // complaint: a false alarm here would teach one to scroll past this line.
             let what = if j.never_ran() {
-                "the period has already passed and launchd still never ran it"
+                "the period has already passed and it still never ran"
             } else {
                 "it ran at some point, but the log has not moved for more than a period"
             };
@@ -254,6 +256,12 @@ fn ago(d: std::time::Duration) -> String {
     else { format!("{} d ago", s / 86400) }
 }
 
+// The schedule-editing mechanism described below is real on macOS -- a plist is written, linted
+// and reloaded into launchd, with a `.bak` for safety -- and is simply not implemented yet on
+// Linux (`jobs::set_schedule` returns "not implemented" there). Two texts, not one interpolated
+// with `jobs::BACKEND_NAME`, because the difference is not a noun, it is a paragraph that is
+// false on one of the two platforms.
+#[cfg(target_os = "macos")]
 const HELP: &str = "\
 hypermnesia-jobs — the memory pipeline's scheduled jobs (launchd).
 
@@ -272,4 +280,21 @@ file is restored.
 The name is the tail of the label: extract, consolidate, reflect, freshness, rerank.
 The label prefix comes from HM_JOB_PREFIX, then the console config file, then the
 default com.hypermnesia.
+";
+
+#[cfg(not(target_os = "macos"))]
+const HELP: &str = "\
+hypermnesia-jobs — the memory pipeline's scheduled jobs (systemd user units).
+
+    hypermnesia-jobs                  what is configured, when it worked, the last exit code
+    hypermnesia-jobs log <name> [N]   the last N lines of the log (40 by default), where one is \
+configured
+
+`run`, `every` and `at` are read on this platform, but not yet implemented: this build can list
+systemd user timers and services, not edit or trigger them. Use `systemctl --user start
+<name>.service` and `systemctl --user edit <name>.timer` directly for now.
+
+The name is the tail of the unit's file stem: extract, consolidate, reflect, freshness, rerank.
+The unit prefix comes from HM_JOB_PREFIX, then the console config file, then the
+default hypermnesia-.
 ";

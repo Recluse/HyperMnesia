@@ -270,9 +270,13 @@ holds, whether the scheduled passes are running, and what the tunables are set t
 writing a query.
 
 ```bash
-cd console && cargo build --release       # two dependencies, both only for the tray
+cd console && cargo build --release       # the CLI tools; zero dependencies
 ./target/release/hypermnesia-setup        # the walkthrough: from nothing to a menu-bar icon
 ```
+
+The tray itself needs a GUI toolkit, so it is not part of that plain build: unconditional on
+macOS, and on Linux behind `cargo build --release --features tray` (GTK3 +
+libayatana-appindicator, see [docs/INSTALL.md](docs/INSTALL.md)).
 
 It reaches the database exactly one way: a command that receives SQL on stdin. Direct psql,
 `docker exec`, `kubectl exec`, ssh to a machine that has kubectl — all of them are one string with
@@ -282,7 +286,7 @@ cannot be told from an empty store.
 
 | Command | What |
 |---------|------|
-| `hypermnesia` | the menu-bar tray (macOS) |
+| `hypermnesia` | the menu-bar tray (macOS) / system tray (Linux, `--features tray`; jobs are read-only there so far) |
 | `hypermnesia-stats` | the same numbers on stdout |
 | `hypermnesia-jobs` | scheduled passes: what is configured, when each last worked, run one now, change a schedule |
 | `hypermnesia-settings` | the tunables, each with the value in force and where that value came from |
@@ -295,9 +299,9 @@ cannot be told from an empty store.
 </p>
 
 A menu, not a window. Everything the console has to show is a dozen lines and a dozen buttons; a
-window would mean a GUI framework for the same result. Two dependencies, both macOS-only, and the
-data layer under them has none at all — a console that takes a minute to build is a console nobody
-rebuilds.
+window would mean a GUI framework for the same result. The tray's GUI dependencies are declared
+per platform and behind a feature on Linux, and the data layer under them has none at all — a
+console that takes a minute to build is a console nobody rebuilds.
 
 What is in the menu:
 
@@ -308,20 +312,23 @@ What is in the menu:
   chunks have no embedding, how many embedding models are in the store, the review queue, the
   stale count, the database size.
 - **Run now** — every scheduled pass, with its schedule, when it last wrote to its log, and its
-  last exit code. Pressing one runs it through launchd and reports what launchd then did, not that
-  the request was accepted.
-- **Schedule** — the common intervals and times, per job. It edits the plist, validates it, and
-  reloads the job, because launchd keeps its own copy from the moment it loaded it: writing the
-  file without the reload would show a new schedule while the old one is in force.
+  last exit code. On macOS, pressing one runs it through launchd and reports what launchd then
+  did, not that the request was accepted. On Linux this is read-only so far: the row shows the
+  same information, read from `systemctl --user show`, but pressing it reports "not implemented".
+- **Schedule** — the common intervals and times, per job. On macOS it edits the plist, validates
+  it, and reloads the job, because launchd keeps its own copy from the moment it loaded it: writing
+  the file without the reload would show a new schedule while the old one is in force. Not
+  implemented on Linux yet.
 - **Refresh now** and **Quit**.
 
-The menu-bar title carries one mark, `HM !`, and it is derived from the lines below rather than
-computed beside them: anything the menu would show with a `!` puts the mark in the title. That is
-the whole design in one detail — the icon is where a problem is noticed, so the icon must not be
-able to disagree with the menu.
+The tray carries one mark for "something here needs a look", derived from the lines below rather
+than computed beside them: anything the menu would show with a `!` raises it. That is the whole
+design in one detail — the mark is where a problem is noticed, so it must not be able to disagree
+with the menu. On macOS the mark is in the menu-bar title, `HM !`; a system tray icon has no text
+of its own, so on Linux it is the icon itself, calm green or warned red.
 
 `hypermnesia --install` puts it in launchd to start at login, restarted if it crashes and not if
-you quit it. `--uninstall` takes it back out.
+you quit it, on macOS. `--uninstall` takes it back out. Not implemented on Linux yet.
 
 **Try it without a database.** The console's only connection setting is a command that prints the
 query's answer, so a file works:

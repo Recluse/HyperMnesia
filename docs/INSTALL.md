@@ -221,7 +221,7 @@ Three ways to run it without remembering to:
 | When | How |
 |------|-----|
 | on every commit / pull | a `post-commit` and `post-merge` hook in the repo, calling the line above |
-| on a timer | cron, a systemd timer, or a launchd agent; on macOS `hypermnesia-jobs` lists and reschedules those |
+| on a timer | cron, a systemd timer, or a launchd agent; `hypermnesia-jobs` lists them on both macOS and Linux, and reschedules them on macOS |
 | in CI | a step on push, if the runner can reach the database |
 
 A timer is the simplest and a git hook is the better one: it runs when something actually changed,
@@ -232,7 +232,7 @@ documents whose ingested commit is behind HEAD, and component globs that match n
 doctor` covers the other half -- a missing index, unembedded chunks, two embedding models in one
 store. Neither needs a schedule to be useful, but both are worth one.
 
-## The console (optional, macOS menu bar + CLI)
+## The console (optional, menu bar / system tray + CLI)
 
 `console/` is the operator's side: what the store holds, whether the scheduled passes are running,
 and what the tunables are set to.
@@ -243,6 +243,30 @@ cd console && cargo build --release
 ./target/release/hypermnesia-stats          # the numbers, once
 ./target/release/hypermnesia --install      # the menu-bar tray, at login (macOS)
 ```
+
+The four command-line tools build the same way everywhere; the data layer has no dependencies at
+all. The tray itself needs a GUI toolkit, declared per platform so a machine with none of it
+installed still builds everything else:
+
+```bash
+# macOS: the tray is part of the default build.
+cargo build --release
+
+# Linux: behind a feature, since it needs GTK3 and libayatana-appindicator development headers
+# that a plain `cargo build` should not have to assume are present.
+sudo apt install libgtk-3-dev libayatana-appindicator3-dev libxdo-dev   # Debian/Ubuntu
+sudo dnf install gtk3-devel libayatana-appindicator-gtk3-devel libxdo-devel  # Fedora
+cargo build --release --features tray
+```
+
+**Linux, what works today:** the tray icon, the store's numbers, and reading systemd user units
+(`~/.config/systemd/user/*.timer`) -- schedule, last exit code, whether it is running, and when it
+last fired, read straight from `systemctl --user show` with no date-parsing crate. Editing a
+schedule, running a job on demand, and installing the tray into autostart are not implemented on
+Linux yet; `hypermnesia-jobs` and the tray say so rather than doing nothing silently. See
+[the console message table](DIAGNOSTICS.md#what-the-console-tells-you-about-itself) for the exact
+Linux-side lines, and `HM_JOB_PREFIX` below for how job names differ (`hypermnesia-extract.timer`,
+not `com.hypermnesia.extract.plist`).
 
 It reaches the database through ONE setting: a command that receives SQL on stdin and prints
 unaligned rows. The wizard offers the four usual shapes — direct psql, `docker exec`,
@@ -256,7 +280,8 @@ unaligned rows. The wizard offers the four usual shapes — direct psql, `docker
 Both are **refused entirely** — loudly, falling back to defaults — unless the file is yours, is
 unwritable by any other account, and sits in a directory with the same property. The first holds a
 command run through `sh -c` at every refresh and at login with nobody present; the second sets the
-environment of the jobs launchd starts. `HM_PSQL_CMD` in the environment beats the config file.
+environment of the jobs the service manager starts. `HM_PSQL_CMD` in the environment beats the
+config file.
 
 A password inside the psql command ends up in psql's argv, where any process running as you can
 read it. `~/.pgpass` or `PGPASSWORD` in the command's own environment avoids that.
@@ -265,7 +290,8 @@ read it. `~/.pgpass` or `PGPASSWORD` in the command's own environment avoids tha
 variables; names that decide what gets EXECUTED (`HM_PYTHON`, `HM_MEM_OPS`, `HM_SEARCH`,
 `HM_RERANK`, `HM_LLM_CMD`, `PATH`, `PYTHONPATH`) are refused by name. A variable already set in the
 environment beats the file — but "the environment" means the shell that started the process, and
-launchd gives its jobs none of yours, so for the scheduled passes the file is what is in force.
+neither launchd nor a systemd user unit gives its jobs any of yours, so for the scheduled passes
+the file is what is in force.
 
 ## Configuration reference
 
@@ -315,7 +341,7 @@ shared settings file below, or from the default — in that order.
 `~/.claude/hypermnesia.env` — one `KEY=value` file for the tunables above, written by
 `hypermnesia-settings set <KEY> <value>`, loaded on import by `hooks/_mem_common.py` and
 `ingest/_common.py`. `HYPERMNESIA_ENV_FILE` moves it. The rules it is read under are in
-[The console](#the-console-optional-macos-menu-bar--cli) above: refused whole unless it is
+[The console](#the-console-optional-menu-bar--system-tray--cli) above: refused whole unless it is
 your own private file, and only the exact names listed here are accepted.
 
 ### The console
@@ -323,6 +349,6 @@ your own private file, and only the exact names listed here are accepted.
 | Env | Default | Meaning |
 |-----|---------|---------|
 | `HM_PSQL_CMD` | `psql "$DATABASE_URL" -tAX -v ON_ERROR_STOP=1` | the command the console sends SQL to on stdin. The one setting that differs between deployments |
-| `HM_JOB_PREFIX` | `com.hypermnesia` | the launchd label prefix the job tools manage |
+| `HM_JOB_PREFIX` | `com.hypermnesia` (macOS) / `hypermnesia-` (Linux) | the label/unit-name prefix the job tools manage |
 | `HM_CONSOLE_CONFIG` | `~/.config/hypermnesia/console.conf` | where the two settings above are stored. Refused whole if another account can write it: it holds a command the tray runs at login |
 | `HM_TIMEOUT_SECS` | `30` | ceiling on one reading of the store |

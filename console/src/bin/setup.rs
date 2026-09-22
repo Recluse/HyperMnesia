@@ -113,12 +113,14 @@ fn walkthrough() {
 
     step(6, "The menu bar");
     if yes("Add the tray to autostart?", true) {
-        // launchd starts the tray with a minimal environment: no login shell, none of your
-        // exports. A command that reads $DATABASE_URL was verified HERE, where you have it.
+        // The service manager starts the tray with a minimal environment: no login shell, none
+        // of your exports. A command that reads $DATABASE_URL was verified HERE, where you have
+        // it.
         let cmd = config().get("HM_PSQL_CMD").cloned().unwrap_or_default();
         if let Some(var) = shell_variable_in(&cmd) {
             println!("! The command you configured uses ${var}, which this shell supplies and");
-            println!("  launchd does not: it starts jobs with a minimal environment. In the tray");
+            println!("  {} does not: it starts jobs with a minimal environment. In the tray",
+                     jobs::BACKEND_NAME);
             println!("  that command will fail where it works here. Either write the value into");
             println!("  the command (hypermnesia-setup --connect) or keep using the CLI tools.");
             if !yes("Install it anyway?", false) {

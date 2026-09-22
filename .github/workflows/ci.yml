@@ -69,15 +69,31 @@ jobs:
       # because it shares the toolchain, and a console that does not compile is a console nobody
       # notices is broken until they try to open it.
       #
-      # On this runner that means the data layer and the four command-line tools -- the tray and
-      # its two dependencies are declared for macOS only, since the schedules it reads are
-      # launchd's. Everything the tests cover is in the part that builds here.
-      - name: Build the console (data layer + CLI tools; the tray is macOS-only)
+      # On this runner that means the data layer and the four command-line tools with the default
+      # feature set: the tray's GUI dependencies are declared for macOS unconditionally, and for
+      # Linux only behind the `tray` feature (off by default), specifically so this step needs no
+      # GUI library at all. Everything the tests cover here is in the part that builds without it.
+      - name: Build the console (data layer + CLI tools; no GUI libraries needed)
         working-directory: console
         run: cargo build --release --locked
       - name: Console unit tests
         working-directory: console
         run: cargo test --locked
+      # The Linux tray, behind its feature: exercises the `tray-icon` + GTK path this runner does
+      # not otherwise touch. Its own dependencies need real headers, hence the apt step -- and
+      # that step is confined to here so the two steps above stay proof that nothing else in this
+      # crate needs them.
+      - name: Build the Linux tray (GTK + appindicator)
+        working-directory: console
+        run: |
+          sudo apt-get update
+          # libxdo-dev is easy to miss: tray-icon's menu-accelerator handling links -lxdo, and the
+          # link fails without it even though nothing above mentions xdo by name.
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
+          cargo build --release --locked --features tray
+      - name: Linux tray unit tests
+        working-directory: console
+        run: cargo test --locked --features tray
 
   schema:
     runs-on: ubuntu-latest
