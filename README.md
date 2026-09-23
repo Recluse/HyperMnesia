@@ -270,9 +270,13 @@ holds, whether the scheduled passes are running, and what the tunables are set t
 writing a query.
 
 ```bash
-cd console && cargo build --release       # two dependencies, both only for the tray
+cd console && cargo build --release       # the CLI tools; zero dependencies
 ./target/release/hypermnesia-setup        # the walkthrough: from nothing to a menu-bar icon
 ```
+
+The tray itself needs a GUI toolkit, so it is not part of that plain build: unconditional on
+macOS, and on Linux behind `cargo build --release --features tray` (GTK3 +
+libayatana-appindicator, see [docs/INSTALL.md](docs/INSTALL.md)).
 
 It reaches the database exactly one way: a command that receives SQL on stdin. Direct psql,
 `docker exec`, `kubectl exec`, ssh to a machine that has kubectl — all of them are one string with
@@ -282,7 +286,7 @@ cannot be told from an empty store.
 
 | Command | What |
 |---------|------|
-| `hypermnesia` | the menu-bar tray (macOS) |
+| `hypermnesia` | the menu-bar tray (macOS) / system tray (Linux, `--features tray`) |
 | `hypermnesia-stats` | the same numbers on stdout |
 | `hypermnesia-jobs` | scheduled passes: what is configured, when each last worked, run one now, change a schedule |
 | `hypermnesia-settings` | the tunables, each with the value in force and where that value came from |
@@ -295,33 +299,46 @@ cannot be told from an empty store.
 </p>
 
 A menu, not a window. Everything the console has to show is a dozen lines and a dozen buttons; a
-window would mean a GUI framework for the same result. Two dependencies, both macOS-only, and the
-data layer under them has none at all — a console that takes a minute to build is a console nobody
-rebuilds.
+window would mean a GUI framework for the same result. The tray's GUI dependencies are declared
+per platform and behind a feature on Linux, and the data layer under them has none at all — a
+console that takes a minute to build is a console nobody rebuilds.
 
 What is in the menu:
 
 - **the first line is the age of what you are reading.** Not a status light: "updated 4m ago, in
   1.2s", and after a failure "! not updated: <reason>, showing state from 12m ago". It is computed
   when the menu is drawn, from the wall clock, so a Mac that slept for two hours says two hours.
+  The store's own numbers refresh every minute; the jobs — a local, cheap read on either platform
+  — refresh every few seconds, faster still for a little while after a button is pressed, so
+  pressing one does not mean waiting out the idle cadence to see whether it worked.
 - **the volumes** — memories active of total, knowledge pages, documents and chunks, how many
   chunks have no embedding, how many embedding models are in the store, the review queue, the
   stale count, the database size.
 - **Run now** — every scheduled pass, with its schedule, when it last wrote to its log, and its
-  last exit code. Pressing one runs it through launchd and reports what launchd then did, not that
-  the request was accepted.
-- **Schedule** — the common intervals and times, per job. It edits the plist, validates it, and
-  reloads the job, because launchd keeps its own copy from the moment it loaded it: writing the
-  file without the reload would show a new schedule while the old one is in force.
+  last exit code. Pressing one runs it — through launchd on macOS, through `systemctl --user start
+  --no-block` on Linux — and reports what the service manager then did, not that the request was
+  accepted: a program that is not there fails immediately, and that is read back rather than taken
+  on faith.
+- **Schedule** — the common intervals and times, per job. It writes the unit, validates it, and
+  reloads the job, because both launchd and systemd keep their own copy from the moment they
+  loaded it: writing the file without the reload would show a new schedule while the old one is
+  still in force. A backup goes down next to the file first, and on any slip along the way it is
+  restored — what actually landed is read back and compared to what was asked before the tray
+  calls it done.
+- **Timers** (Linux only) — arm or disarm a job's schedule without removing it. systemd tracks
+  "loaded but not armed" as a state of its own, which the read side of this tray could already
+  show as a fault; this is what fixes it. launchd has no such state — a job it has loaded runs on
+  its schedule, full stop — so there is nothing here to switch on macOS.
 - **Refresh now** and **Quit**.
 
-The menu-bar title carries one mark, `HM !`, and it is derived from the lines below rather than
-computed beside them: anything the menu would show with a `!` puts the mark in the title. That is
-the whole design in one detail — the icon is where a problem is noticed, so the icon must not be
-able to disagree with the menu.
+The tray carries one mark for "something here needs a look", derived from the lines below rather
+than computed beside them: anything the menu would show with a `!` raises it. That is the whole
+design in one detail — the mark is where a problem is noticed, so it must not be able to disagree
+with the menu. On macOS the mark is in the menu-bar title, `HM !`; a system tray icon has no text
+of its own, so on Linux it is the icon itself, calm green or warned red.
 
-`hypermnesia --install` puts it in launchd to start at login, restarted if it crashes and not if
-you quit it. `--uninstall` takes it back out.
+`hypermnesia --install` puts it in autostart to start at login, restarted if it crashes and not if
+you quit it — launchd on macOS, a systemd user unit on Linux. `--uninstall` takes it back out.
 
 **Try it without a database.** The console's only connection setting is a command that prints the
 query's answer, so a file works:

@@ -1,321 +1,15 @@
-//! The pipeline's scheduled jobs: what is configured, when it last worked, and how to run it now.
+//! The launchd backend: `*.plist` files under `~/Library/LaunchAgents`, read through
+//! `plutil -convert json` and `launchctl list`/`print`/`kickstart`/`bootout`/`bootstrap`.
 //!
-//! All of it lives in launchd, so this is the macOS-specific part of the console. We read the
-//! `*.plist` files through `plutil -convert json` and take their state from `launchctl list`. No
-//! plist parser of our own: the format is binary about as often as it is text, and a homegrown
+//! No plist parser of our own: the format is binary about as often as it is text, and a homegrown
 //! implementation would break silently on the very first binary file.
-//!
-//! The important part about "when it last worked": launchd does not keep that. It knows the exit
-//! code of the LAST run and nothing else. So the time comes from the mtime of the log file -- and
-//! a missing log means "it has not run once since the path was set", not "it is working quietly".
-//! This is not a nicety: our reflect job is set to run weekly, and there is no log file at all.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
-/// Reverse-DNS prefix of the launchd labels this console manages.
-pub const DEFAULT_JOB_PREFIX: &str = "com.hypermnesia";
-
-/// Label of the tray's own autostart job, passed to `install_self`.
-pub const DEFAULT_TRAY_LABEL: &str = "com.hypermnesia.tray";
-
-/// The label prefix to look for: environment, then the config file, then the default -- the same
-/// order as every other setting here.
-///
-/// The config file matters more than it looks. The tray is started by launchd, which gives it a
-/// minimal environment and none of a login shell's variables, so an installation whose jobs are
-/// named differently could set HM_JOB_PREFIX in its shell forever and the tray would still show
-/// an empty job list -- while every command run by hand showed the right one.
-pub fn job_prefix() -> String {
-    if let Some(v) = std::env::var("HM_JOB_PREFIX").ok().filter(|s| !s.is_empty()) {
-        return v;
-    }
-    // Filtered the same way as the environment: an empty HM_JOB_PREFIX in the config makes
-    // `starts_with` match every LaunchAgent the person owns, and this module edits and kickstarts
-    // what it lists.
-    if let Some(v) = crate::config().get("HM_JOB_PREFIX").filter(|s| !s.is_empty()) {
-        return v.clone();
-    }
-    DEFAULT_JOB_PREFIX.to_string()
-}
-
-/// One calendar slot, as launchd stores it.
-///
-/// Every field is optional AND an omitted field is a WILDCARD, which is the whole reason this is
-/// a struct rather than an hour and a minute. `{"Minute": 15}` means every hour at :15, not
-/// "daily 00:15"; `{"Day": 1, "Hour": 3}` means the first of each month, not "daily 03:00".
-/// Reading the omissions as zeroes printed a plausible wrong time -- and, worse, a wrong period:
-/// a healthy monthly job was measured against a day and a half and reported overdue for
-/// twenty-nine days out of thirty.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Cal {
-    pub minute: Option<u32>,
-    pub hour: Option<u32>,
-    /// Day of the month, 1-31.
-    pub day: Option<u32>,
-    /// 0 = Sunday.
-    pub weekday: Option<u32>,
-    pub month: Option<u32>,
-}
-
-impl Cal {
-    pub fn at(hour: u32, minute: u32, weekday: Option<u32>) -> Self {
-        Self { hour: Some(hour), minute: Some(minute), weekday, ..Self::default() }
-    }
-
-    /// How long between two firings, taken from the COARSEST field that is pinned: everything
-    /// finer than it repeats inside that cycle, everything coarser is a wildcard.
-    pub fn period(&self) -> Duration {
-        let day = 86_400;
-        Duration::from_secs(if self.month.is_some() {
-            365 * day
-        } else if self.day.is_some() {
-            31 * day
-        } else if self.weekday.is_some() {
-            7 * day
-        } else if self.hour.is_some() {
-            day
-        } else if self.minute.is_some() {
-            3_600
-        } else {
-            // Nothing pinned at all: launchd fires such a job every minute.
-            60
-        })
-    }
-
-    pub fn human(&self) -> String {
-        const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-        const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-        // "xx" where launchd would repeat: an hour with no minute fires every minute of it.
-        let time = match (self.hour, self.minute) {
-            (Some(h), Some(m)) => format!("{h:02}:{m:02}"),
-            (Some(h), None) => format!("{h:02}:xx"),
-            (None, Some(m)) => format!(":{m:02}"),
-            (None, None) => String::new(),
-        };
-        let month = self.month
-            .map(|m| format!("{} ", MONTHS[((m.max(1) - 1) as usize) % 12]))
-            .unwrap_or_default();
-        match (self.month, self.day, self.weekday, self.hour, self.minute) {
-            (_, Some(d), _, _, _) => format!("{} {month}day {d} {time}",
-                if self.month.is_some() { "yearly" } else { "monthly" }),
-            (_, None, Some(w), _, _) => format!("weekly {} {time}", DAYS[(w as usize) % 7]),
-            (_, None, None, Some(_), _) => format!("daily {time}"),
-            (_, None, None, None, Some(_)) => format!("hourly at {time}"),
-            _ => "every minute".into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Schedule {
-    /// Every N seconds.
-    Every(u64),
-    /// One calendar slot.
-    Calendar(Cal),
-    /// Several calendar slots: launchd accepts an array of dicts. All of them are kept -- the
-    /// period has to come from the widest of them, and the first slot is not the schedule.
-    Several(Vec<Cal>),
-    /// No schedule: a service that is simply kept running.
-    None,
-}
-
-impl Schedule {
-    /// A one-slot calendar schedule, which is what the console can set.
-    pub fn at(hour: u32, minute: u32, weekday: Option<u32>) -> Self {
-        Schedule::Calendar(Cal::at(hour, minute, weekday))
-    }
-
-    pub fn human(&self) -> String {
-        match self {
-            Schedule::Every(s) if *s % 3600 == 0 => format!("every {} h", s / 3600),
-            Schedule::Every(s) if *s % 60 == 0 => format!("every {} min", s / 60),
-            Schedule::Every(s) => format!("every {s} s"),
-            Schedule::Calendar(c) => c.human(),
-            Schedule::Several(c) if c.len() == 1 => c[0].human(),
-            Schedule::Several(c) => format!("{} slots ({})", c.len(), c[0].human()),
-            Schedule::None => "on demand".into(),
-        }
-    }
-}
-
-/// What is known about a job's log.
-#[derive(Debug, Clone, PartialEq)]
-pub enum LogState {
-    /// The plist names no log: nothing can be dated by it, in either direction.
-    NotConfigured,
-    /// A log is configured and it is not there -- the job has not written anything since the
-    /// path was set.
-    Missing,
-    /// The log was last written at this time.
-    Written(SystemTime),
-    /// A log is configured, exists, and cannot be dated: unreadable, or stamped in the future
-    /// (a clock that moved). Not evidence of health and not evidence of failure -- and saying so
-    /// beats both of the alternatives.
-    Unknown(String),
-}
-
-impl LogState {
-    pub fn at(&self) -> Option<SystemTime> {
-        match self {
-            LogState::Written(t) => Some(*t),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Job {
-    pub label: String,
-    pub plist: PathBuf,
-    pub schedule: Schedule,
-    pub program: Vec<String>,
-    pub log: Option<PathBuf>,
-    /// Exit code of the last run, as launchd remembers it. `None` -- the job is not loaded.
-    pub last_exit: Option<i32>,
-    /// When the plist last changed. Needed so as not to raise a false alarm: a job installed
-    /// later than its own last slot simply has not come due yet.
-    pub installed: Option<SystemTime>,
-    /// How many times launchd has started it. Zero -- not once.
-    ///
-    /// Without this number the status column lies: `launchctl list` prints `0` in the status
-    /// column both for "finished successfully" and for "never finished at all", so a job that has
-    /// never started looks like one that ran without errors. Seen on reflect: the list showed
-    /// "last run ok" with `runs = 0` and `last exit code = (never exited)`.
-    pub runs: Option<u64>,
-    /// PID, if the job is running right now.
-    pub pid: Option<u32>,
-    /// What the log says about when the job last worked. The only sign that survives a reboot,
-    /// and the reason it is three states rather than a timestamp: "no log configured", "a log is
-    /// configured and is not there" and "unreadable / dated in the future" are three different
-    /// pieces of knowledge, and collapsing them into None made a rotated-away log read as a
-    /// healthy job forever.
-    pub log_state: LogState,
-    /// Why this job could not be read. A plist in LaunchAgents that `plutil` refuses is a plist
-    /// launchd also refused at login -- the job is not running, and that is precisely the case
-    /// the console used to have nothing to say about, because the row was dropped from the list.
-    pub fault: Option<String>,
-}
-
-impl Job {
-    /// Short name without the reverse-DNS prefix: on the console's screen `extract`, not
-    /// `com.hypermnesia.extract`.
-    pub fn short(&self) -> &str {
-        self.label.rsplit(['.', '-']).next().unwrap_or(&self.label)
-    }
-
-    pub fn running(&self) -> bool {
-        self.pid.is_some()
-    }
-
-    /// How long until the job repeats. For calendar schedules -- a day or a week; the exact date
-    /// of the next run is not needed, only the order of magnitude.
-    pub fn period(&self) -> Option<Duration> {
-        match &self.schedule {
-            Schedule::Every(s) => Some(Duration::from_secs(*s)),
-            Schedule::Calendar(c) => Some(c.period()),
-            // The widest of the slots, not the narrowest: two weekly slots are still a week
-            // apart at worst, and measuring them against a day would cry wolf for six days of it.
-            Schedule::Several(cals) => cals.iter().map(Cal::period).max(),
-            Schedule::None => None,
-        }
-    }
-
-    /// Something is wrong with the job itself, before any question of when it last ran.
-    pub fn broken(&self) -> bool {
-        self.fault.is_some()
-    }
-
-    /// launchd has never started it.
-    ///
-    /// `runs` alone does not answer this. It is per-bootstrap state: launchd loads every
-    /// LaunchAgent again at each login and the counter starts at zero, while the plist's mtime
-    /// does not move. Trusting it turned every healthy job into "never ran / overdue" after a
-    /// reboot. So the log -- the only evidence that survives a restart -- has to agree, and it
-    /// only counts as evidence if it was written AFTER the job was installed: a log left behind
-    /// by a previous installation says nothing about this one.
-    pub fn never_ran(&self) -> bool {
-        if self.schedule == Schedule::None || self.broken() {
-            return false;                     // a service without a schedule -- not a complaint
-        }
-        if self.log_after_install() {
-            return false;                     // it has written something since: it ran
-        }
-        match self.runs {
-            Some(n) => n == 0,
-            // The counter is unavailable (the job is not loaded): fall back to the sign "a log is
-            // configured but not there" -- weaker, but better than silence.
-            None => self.log_state == LogState::Missing,
-        }
-    }
-
-    /// Was the log written after this version of the job was installed? A log from a previous
-    /// install is not evidence about this one -- in either direction.
-    fn log_after_install(&self) -> bool {
-        match (self.log_state.at(), self.installed) {
-            (Some(out), Some(inst)) => out >= inst,
-            (Some(_), None) => true,
-            _ => false,
-        }
-    }
-
-    /// Has never run AND would have had time to -- or ran once and then stopped. THAT is the
-    /// complaint; `never_ran` on its own is NOT.
-    ///
-    /// The difference is not cosmetic. A weekly job installed on Monday afternoon honestly shows
-    /// zero runs until the next Monday, and shouting at it would be a lie. The signal must fire
-    /// on "a whole period has passed and nothing happened", otherwise people learn to scroll
-    /// past it and it stops working on the day it is needed.
-    ///
-    /// A period and a half is the threshold, not one period: a job whose slot is due about now
-    /// has not failed yet.
-    pub fn overdue(&self) -> bool {
-        let Some(period) = self.period() else { return false };
-        let slack = period + period / 2;
-        if self.never_ran() {
-            // The only date available is the plist's own.
-            return self.since_installed().map(|age| age > slack).unwrap_or(true);
-        }
-        // It ran at some point. Then the complaint is staleness, dated by the log -- and never
-        // from before the job was installed, or a fresh install inheriting an old log would be
-        // called overdue the moment it was made.
-        match (self.since_last_output(), self.since_installed()) {
-            (Some(age), Some(since_install)) => age.min(since_install) > slack,
-            (Some(age), None) => age > slack,
-            (None, _) => false,
-        }
-    }
-
-    /// Can this job's freshness be judged at all? A configured log that is gone or undatable
-    /// leaves the question open -- and an open question must not be drawn as health.
-    pub fn freshness_unknown(&self) -> Option<String> {
-        if self.broken() || self.schedule == Schedule::None {
-            return None;
-        }
-        match &self.log_state {
-            LogState::Unknown(why) => Some(why.clone()),
-            // Ran at least once since this boot, yet the log it is supposed to write is not
-            // there: it was rotated away, or the job is writing nowhere.
-            LogState::Missing if self.runs.unwrap_or(0) > 0 =>
-                Some("the configured log is not there, so nothing can date its last run".into()),
-            LogState::NotConfigured if self.runs.unwrap_or(0) > 0 =>
-                Some("no log is configured, so nothing survives a reboot to date its runs".into()),
-            _ => None,
-        }
-    }
-
-    /// How long ago it was installed (by the plist's modification time).
-    pub fn since_installed(&self) -> Option<Duration> {
-        self.installed.and_then(|t| SystemTime::now().duration_since(t).ok())
-    }
-
-    pub fn since_last_output(&self) -> Option<Duration> {
-        self.log_state.at().and_then(|t| SystemTime::now().duration_since(t).ok())
-    }
-}
+use super::{log_state_of, Cal, Job, LogState, Schedule};
 
 /// Where the user's own LaunchAgents live.
 ///
@@ -373,7 +67,7 @@ fn broken_job(path: &PathBuf, name: &str, fault: String,
     let (pid, last_exit) = states.get(name).cloned().unwrap_or((None, None));
     Job {
         label: name.to_string(),
-        plist: path.clone(),
+        source: path.clone(),
         schedule: Schedule::None,
         program: Vec::new(),
         log: None,
@@ -382,7 +76,9 @@ fn broken_job(path: &PathBuf, name: &str, fault: String,
         runs: runs_of(name),
         pid,
         log_state: LogState::NotConfigured,
+        trigger: super::TriggerState::NotTracked,
         fault: Some(fault),
+        armed: None,
     }
 }
 
@@ -404,26 +100,11 @@ fn read_plist(path: &PathBuf, states: &BTreeMap<String, (Option<u32>, Option<i32
     let installed = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
     Ok(Job {
         program,
-        label, plist: path.clone(), schedule, log, last_exit, pid, log_state, runs, installed,
+        label, source: path.clone(), schedule, log, last_exit, pid, log_state, runs, installed,
+        trigger: super::TriggerState::NotTracked,
         fault: None,
+        armed: None,
     })
-}
-
-/// What the log can tell us, kept as the three different things it can be.
-fn log_state_of(log: Option<&PathBuf>) -> LogState {
-    let Some(p) = log else { return LogState::NotConfigured };
-    let md = match std::fs::metadata(p) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LogState::Missing,
-        Err(e) => return LogState::Unknown(format!("{}: {e}", p.display())),
-    };
-    match md.modified() {
-        Ok(t) if t > SystemTime::now() + Duration::from_secs(60) =>
-            LogState::Unknown(format!("{} is stamped in the future -- a clock moved",
-                                      p.display())),
-        Ok(t) => LogState::Written(t),
-        Err(e) => LogState::Unknown(format!("{}: {e}", p.display())),
-    }
 }
 
 /// What a plist says, before anything is asked of launchd or of the filesystem. Separate from
@@ -582,7 +263,7 @@ pub fn set_schedule(job: &Job, sched: &Schedule) -> Result<String, String> {
     if let Some(why) = job.fault.as_ref() {
         return Err(format!("this plist could not be read ({why}) -- I will not edit it"));
     }
-    let path = job.plist.to_string_lossy().to_string();
+    let path = job.source.to_string_lossy().to_string();
     let backup = format!("{path}.bak");
     // A .bak already there is the leftover of an edit that did not finish -- a crash between
     // removing the schedule keys and writing the new ones. Overwriting it with the CURRENT file
@@ -807,6 +488,15 @@ pub fn autostart_fault(label: &str) -> Option<String> {
     (installed != me).then(|| format!("autostart starts {installed}, not this binary ({me})"))
 }
 
+/// launchd has no separate "loaded but not armed" state: a job it has loaded runs on its
+/// schedule, full stop. There is nothing here for a menu toggle to switch.
+pub const SUPPORTS_ENABLE: bool = false;
+
+pub fn set_enabled(_job: &Job, _enabled: bool) -> Result<String, String> {
+    Err("launchd has no separate enable/disable step -- a loaded job is armed; unload it with \
+        launchctl bootout instead".into())
+}
+
 /// Take the console out of autostart.
 pub fn uninstall_self(label: &str) -> Result<String, String> {
     let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
@@ -821,18 +511,6 @@ pub fn uninstall_self(label: &str) -> Result<String, String> {
     }
 }
 
-/// The last `n` lines of a job's log.
-pub fn tail(job: &Job, n: usize) -> Result<String, String> {
-    let Some(path) = job.log.as_ref() else {
-        return Err("the job has no log file configured".into());
-    };
-    let data = std::fs::read(path)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    let text = String::from_utf8_lossy(&data);
-    let lines: Vec<&str> = text.lines().collect();
-    Ok(lines[lines.len().saturating_sub(n)..].join("\n"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -845,25 +523,10 @@ mod tests {
 
     fn job(schedule: Schedule) -> Job {
         Job {
-            label: "x".into(), plist: PathBuf::new(), schedule, program: vec![], log: None,
+            label: "x".into(), source: PathBuf::new(), schedule, program: vec![], log: None,
             last_exit: None, pid: None, log_state: LogState::NotConfigured, runs: None,
-            installed: None, fault: None,
+            installed: None, trigger: super::TriggerState::NotTracked, fault: None, armed: None,
         }
-    }
-
-    /// A job with a log that was written `ago` ago, installed `installed_ago` ago.
-    fn with_log(schedule: Schedule, runs: Option<u64>, written: Option<Duration>,
-                installed_ago: Duration) -> Job {
-        let mut j = job(schedule);
-        j.log = Some(PathBuf::from("/nope"));
-        j.runs = runs;
-        j.last_exit = Some(0);
-        j.installed = Some(SystemTime::now() - installed_ago);
-        j.log_state = match written {
-            Some(d) => LogState::Written(SystemTime::now() - d),
-            None => LogState::Missing,
-        };
-        j
     }
 
     #[test]
@@ -935,94 +598,6 @@ mod tests {
         assert!(parse_plist_json("not json at all").is_err());
     }
 
-    #[test]
-    fn schedules_render_in_words() {
-        assert_eq!(Schedule::Every(14400).human(), "every 4 h");
-        assert_eq!(Schedule::Every(900).human(), "every 15 min");
-        // Something not a whole number of minutes stays in seconds instead of being rounded into
-        // a lie.
-        assert_eq!(Schedule::Every(90).human(), "every 90 s");
-        assert_eq!(Schedule::at(5, 30, None).human(), "daily 05:30");
-        assert_eq!(Schedule::at(6, 10, Some(1)).human(), "weekly Mon 06:10");
-        assert_eq!(Schedule::None.human(), "on demand");
-    }
-
-    /// A job launchd has never started must be called exactly that, not "successful".
-    #[test]
-    fn a_scheduled_job_that_never_ran_is_flagged() {
-        let mut j = with_log(Schedule::at(6, 10, Some(1)), Some(0), None,
-                             Duration::from_secs(30 * 86_400));
-        assert!(j.never_ran());
-
-        j.runs = Some(44);                    // launchd started it since the last login
-        assert!(!j.never_ran());
-
-        j.runs = Some(0);
-        j.schedule = Schedule::None;          // a service without a schedule -- not a complaint
-        assert!(!j.never_ran());
-
-        // The counter is unavailable (the job is not loaded): fall back to "a log is configured
-        // but not there".
-        j.schedule = Schedule::Every(3600);
-        j.runs = None;
-        assert!(j.never_ran());
-        j.log_state = LogState::Written(SystemTime::now());
-        assert!(!j.never_ran());
-    }
-
-    /// The run counter is per-bootstrap: launchd resets it at every login while the plist's
-    /// mtime stays where it was. Keying "never ran" on it alone turned every healthy job into a
-    /// false alarm after a reboot -- which is how a warning stops being read.
-    #[test]
-    fn a_reboot_does_not_turn_a_working_job_into_a_false_alarm() {
-        let j = with_log(Schedule::Every(14_400), Some(0), Some(Duration::from_secs(600)),
-                         Duration::from_secs(30 * 86_400));
-        assert!(!j.never_ran(), "the log says it ran ten minutes ago");
-        assert!(!j.overdue());
-    }
-
-    /// The other direction of the same mistake: a job that ran once and then stopped used to be
-    /// exempt forever, because a positive counter ended the question.
-    #[test]
-    fn a_job_that_ran_once_and_then_stalled_is_still_overdue() {
-        let mut j = with_log(Schedule::Every(3600), Some(12), Some(Duration::from_secs(600)),
-                             Duration::from_secs(30 * 86_400));
-        assert!(!j.overdue(), "ten minutes into an hourly job is fine");
-
-        j.log_state = LogState::Written(SystemTime::now() - Duration::from_secs(6 * 3600));
-        assert!(j.overdue(), "six hours into an hourly job is not");
-    }
-
-    /// A log left behind by a PREVIOUS installation is not evidence about this one. Without
-    /// that rule a job installed a minute ago, pointing at a month-old log, was called overdue
-    /// on the spot.
-    #[test]
-    fn an_inherited_log_does_not_condemn_a_fresh_install() {
-        let j = with_log(Schedule::at(6, 10, Some(1)), Some(0),
-                         Some(Duration::from_secs(30 * 86_400)),  // log: a month old
-                         Duration::from_secs(60));                // installed a minute ago
-        assert!(!j.overdue(), "it has not had a chance to run yet");
-        assert!(j.never_ran(), "and the old log is not evidence that it did");
-    }
-
-    /// Freshness that cannot be judged must say so. A rotated-away log used to leave a stalled
-    /// job reading "last run ok" with an empty timestamp, for ever.
-    #[test]
-    fn a_log_that_cannot_date_a_run_is_an_open_question_not_health() {
-        let j = with_log(Schedule::Every(3600), Some(9), None, Duration::from_secs(86_400));
-        assert!(j.freshness_unknown().is_some(), "the log is configured and gone");
-        assert!(!j.overdue(), "and that is not the same as proof it stopped");
-
-        let mut future = with_log(Schedule::Every(3600), Some(9), Some(Duration::from_secs(60)),
-                                  Duration::from_secs(86_400));
-        future.log_state = LogState::Unknown("stamped in the future".into());
-        assert!(future.freshness_unknown().is_some());
-
-        let healthy = with_log(Schedule::Every(3600), Some(9), Some(Duration::from_secs(60)),
-                               Duration::from_secs(86_400));
-        assert!(healthy.freshness_unknown().is_none());
-    }
-
     /// A plist that cannot be read is kept as a row with a fault, never dropped.
     #[test]
     fn an_unreadable_plist_becomes_a_row_not_a_gap() {
@@ -1033,22 +608,6 @@ mod tests {
         assert_eq!(j.short(), "bad");
         assert!(!j.never_ran(), "a fault is its own complaint, not a run-count one");
         assert!(!j.overdue());
-    }
-
-    #[test]
-    fn period_matches_the_schedule() {
-        assert_eq!(job(Schedule::Every(14400)).period(), Some(Duration::from_secs(14400)));
-        assert_eq!(job(Schedule::at(5, 30, None)).period(), Some(Duration::from_secs(86_400)));
-        assert_eq!(job(Schedule::at(6, 10, Some(1))).period(),
-                   Some(Duration::from_secs(7 * 86_400)));
-        assert_eq!(job(Schedule::None).period(), None);
-    }
-
-    #[test]
-    fn short_name_drops_the_reverse_dns_prefix() {
-        let mut j = job(Schedule::None);
-        j.label = "com.hypermnesia.consolidate".into();
-        assert_eq!(j.short(), "consolidate");
     }
 
     /// Quit has to stick. `KeepAlive` set unconditionally relaunches the tray about ten seconds

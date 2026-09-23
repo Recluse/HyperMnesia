@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 pub mod jobs;
 pub mod settings;
+pub mod view;
 
 pub const STATS_SQL: &str = include_str!("stats.sql");
 

@@ -1,8 +1,12 @@
-//! The pipeline's scheduled jobs: show them and run them.
+//! The pipeline's scheduled jobs: show them, run them, and change when they run.
 //!
 //!     hypermnesia-jobs                  what is configured and when it last worked
 //!     hypermnesia-jobs run <short>      run now, without touching the schedule
 //!     hypermnesia-jobs log <short>      the last lines of the log
+//!     hypermnesia-jobs every <short> 4h an interval schedule
+//!     hypermnesia-jobs at <short> 05:30 a calendar schedule
+//!     hypermnesia-jobs enable <short>   arm the schedule (systemd only)
+//!     hypermnesia-jobs disable <short>  disarm it without removing it (systemd only)
 //!
 //! The short name is the tail of the label: extract, consolidate, reflect, freshness, rerank.
 
@@ -11,15 +15,15 @@ use hypermnesia_console::jobs::{self, Job};
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Through jobs::job_prefix rather than the variable: only that path also consults the
-    // config file, and the tray -- started by launchd with a minimal environment -- has
-    // nothing else to read.
+    // config file, and the tray -- started by the service manager with a minimal environment --
+    // has nothing else to read.
     let prefix = jobs::job_prefix();
     let all = match jobs::list(&prefix) {
         Ok(j) => j,
         Err(e) => fail(&e),
     };
     if all.is_empty() {
-        fail(&format!("no job with the prefix {prefix} found in ~/Library/LaunchAgents"));
+        fail(&format!("no job with the prefix {prefix} found in {}", jobs::UNITS_LOCATION));
     }
 
     match args.first().map(String::as_str) {
@@ -69,7 +73,21 @@ fn main() {
             let Some((hour, minute)) = parse_hhmm(time) else { fail("a time is written as HH:MM") };
             apply(find(&all, name), &jobs::Schedule::at(hour, minute, day));
         }
-        Some("-h") | Some("--help") => print!("{HELP}"),
+        Some("enable") => {
+            let Some(name) = args.get(1) else { fail("give the job's short name") };
+            match jobs::set_enabled(find(&all, name), true) {
+                Ok(msg) => println!("{msg}"),
+                Err(e) => fail(&e),
+            }
+        }
+        Some("disable") => {
+            let Some(name) = args.get(1) else { fail("give the job's short name") };
+            match jobs::set_enabled(find(&all, name), false) {
+                Ok(msg) => println!("{msg}"),
+                Err(e) => fail(&e),
+            }
+        }
+        Some("-h") | Some("--help") => print!("{}", help_text()),
         Some(other) => fail(&format!("unknown command: {other}")),
     }
 }
@@ -116,9 +134,12 @@ fn apply(j: &Job, sched: &jobs::Schedule) {
         Ok(msg) => {
             println!("{msg}");
             println!("was: {was}");
-            // launchd keeps its own copy of the schedule from the moment it loaded the job, so the
-            // job is reloaded. That resets the run counter -- which has to be said out loud, or
-            // the next look at the list will be alarming: a zero where everything is fine.
+            // The service manager keeps its own copy of the schedule from the moment it loaded
+            // the job, so the job is reloaded. That resets whatever run counter it keeps -- which
+            // has to be said out loud on the platform that has one, or the next look at the list
+            // will be alarming: a zero where everything is fine. systemd keeps no such counter
+            // (`Job::runs` is always `None` there), so there is nothing to warn about on Linux.
+            #[cfg(target_os = "macos")]
             println!("the job was reloaded into launchd; the run counter started over");
         }
         Err(e) => fail(&e),
@@ -159,10 +180,11 @@ fn parse_weekday(s: &str) -> Option<u32> {
 
 fn find<'a>(all: &'a [Job], name: &str) -> &'a Job {
     match all.iter().find(|j| j.short() == name || j.label == name) {
-        Some(j) if j.broken() => fail(&format!(
-            "{name}: this plist cannot be read ({}). launchd may still be running the copy it \
-             loaded before the file broke -- what it will do at the next login is the question. \
-             Fix the file first.", j.fault.clone().unwrap_or_default())),
+        Some(j) if j.unwritable() => fail(&format!(
+            "{name}: this {} cannot be read ({}). {} may still be running the copy it loaded \
+             before the file broke -- what it will do at the next login is the question. Fix \
+             the file first.", jobs::UNIT_NOUN, j.fault.clone().unwrap_or_default(),
+            jobs::BACKEND_NAME)),
         Some(j) => j,
         None => fail(&format!("no such job: {name}. There is: {}",
                               all.iter().map(Job::short).collect::<Vec<_>>().join(", "))),
@@ -178,10 +200,11 @@ fn list(all: &[Job]) {
     println!("{:<13} {:<22} {:<14} {}", "JOB", "SCHEDULE", "LAST OUTPUT", "STATE");
     for j in all {
         if let Some(why) = &j.fault {
-            // An unreadable plist is one launchd also refused at login: the job is not running.
-            // It used to be dropped from the list entirely, which is the one case the console had
-            // nothing at all to say about.
-            println!("{:<13} {:<22} {:<14} ! unreadable plist: {why}", j.short(), "—", "—");
+            // An unreadable unit is one the service manager also refused: the job is not
+            // running. It used to be dropped from the list entirely, which is the one case the
+            // console had nothing at all to say about.
+            println!("{:<13} {:<22} {:<14} ! unreadable {}: {why}", j.short(), "—", "—",
+                     jobs::UNIT_NOUN);
             continue;
         }
         let when = match j.since_last_output() {
@@ -198,7 +221,7 @@ fn list(all: &[Job]) {
                 None => "never ran".to_string(),
             }
         } else if j.last_exit.is_none() {
-            "not loaded into launchd".to_string()
+            format!("not loaded into {}", jobs::BACKEND_NAME)
         } else if j.runs == Some(0) {
             // Loaded, and launchd has not started it since this login. Its exit column says 0,
             // which it prints both for "finished successfully" and for "never finished at all" --
@@ -213,7 +236,7 @@ fn list(all: &[Job]) {
                 // has nothing to tell them apart by.
                 Some(0) => format!("last run ok{}", runs_note(j)),
                 Some(c) => format!("last run: code {c}{}", runs_note(j)),
-                None => "not loaded into launchd".to_string(),
+                None => format!("not loaded into {}", jobs::BACKEND_NAME),
             }
         };
         println!("{:<13} {:<22} {:<14} {}", j.short(), j.schedule.human(), when, state);
@@ -227,7 +250,7 @@ fn list(all: &[Job]) {
             // job installed later than its own last slot honestly shows a zero and is not a
             // complaint: a false alarm here would teach one to scroll past this line.
             let what = if j.never_ran() {
-                "the period has already passed and launchd still never ran it"
+                "the period has already passed and it still never ran"
             } else {
                 "it ran at some point, but the log has not moved for more than a period"
             };
@@ -237,6 +260,9 @@ fn list(all: &[Job]) {
     println!();
     println!("run <name> — run now; log <name> [N] — the tail of the log; \
               every/at <name> … — change the schedule (--help)");
+    if jobs::SUPPORTS_ENABLE {
+        println!("enable/disable <name> — arm or disarm the schedule without removing it");
+    }
 }
 
 fn runs_note(j: &Job) -> String {
@@ -254,22 +280,46 @@ fn ago(d: std::time::Duration) -> String {
     else { format!("{} d ago", s / 86400) }
 }
 
-const HELP: &str = "\
-hypermnesia-jobs — the memory pipeline's scheduled jobs (launchd).
+// One text, not two: both backends now write, validate, reload and read back a schedule, and
+// differ only in the nouns `jobs::UNIT_NOUN`/`BACKEND_NAME`/`UNITS_LOCATION` already carry.
+// `enable`/`disable` is the one command that is not portable -- launchd has no separate "loaded
+// but not armed" state, so it is documented as systemd-only rather than interpolated away.
+#[cfg(target_os = "macos")]
+const RUN_NOW: &str = "run immediately (launchctl kickstart -k)";
+#[cfg(target_os = "linux")]
+const RUN_NOW: &str = "run immediately (systemctl --user start --no-block)";
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const RUN_NOW: &str = "run immediately";
+
+fn help_text() -> String {
+    // launchd has no separate "loaded but not armed" state -- a job it has loaded is armed, full
+    // stop -- so `enable`/`disable` is documented only where `jobs::SUPPORTS_ENABLE` says it does
+    // something, rather than interpolating a noun into a paragraph that would be false on macOS.
+    let enable = if jobs::SUPPORTS_ENABLE {
+        format!("    hypermnesia-jobs enable <name>    arm the schedule\n\
+                 \x20   hypermnesia-jobs disable <name>   disarm it without removing it\n")
+    } else {
+        String::new()
+    };
+    format!("\
+hypermnesia-jobs — the memory pipeline's scheduled jobs ({backend}).
 
     hypermnesia-jobs                  what is configured, when it worked, the last exit code
-    hypermnesia-jobs run <name>       run immediately (launchctl kickstart -k)
-    hypermnesia-jobs log <name> [N]   the last N lines of the log (40 by default)
+    hypermnesia-jobs run <name>       {run_now}
+    hypermnesia-jobs log <name> [N]   the last N lines of the log (40 by default), where one \
+is configured
     hypermnesia-jobs every <name> 4h  an interval schedule (30s, 15m, 4h, 2d)
     hypermnesia-jobs at <name> 05:30      daily at that time
     hypermnesia-jobs at <name> mon 06:10  weekly on that day
-
-Editing a schedule writes the plist, validates it and reloads the job into launchd: without the
-reload launchd keeps working from its own copy, and the new schedule would be displayed where the
-old one is in force. Before the edit a .bak is put down next to the file, and on any slip the
+{enable}
+Editing a schedule writes the {noun}, validates it and reloads the job into {backend}: without
+the reload {backend} keeps working from its own copy, and the new schedule would be shown where
+the old one is in force. Before the edit a .bak is put down next to the file, and on any slip the
 file is restored.
 
 The name is the tail of the label: extract, consolidate, reflect, freshness, rerank.
 The label prefix comes from HM_JOB_PREFIX, then the console config file, then the
-default com.hypermnesia.
-";
+default {prefix}.
+", backend = jobs::BACKEND_NAME, run_now = RUN_NOW, noun = jobs::UNIT_NOUN,
+       prefix = jobs::DEFAULT_JOB_PREFIX)
+}

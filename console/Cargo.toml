@@ -19,6 +19,19 @@ license = "MIT"
 tray-icon = "0.25"
 winit = "0.30"
 
+# The Linux tray, behind a feature and off by default -- for the same reason the macOS deps are
+# per-target: the data layer and the four command-line tools must keep building on a machine with
+# no GUI libraries at all, which is what CI's bare runner is. `tray-icon` drives the same crate as
+# macOS, through `libayatana-appindicator`; on Linux it needs a GTK main loop rather than winit's,
+# so `gtk` is a dependency here and `winit` is not.
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-icon = { version = "0.25", optional = true }
+gtk = { version = "0.18", optional = true }
+glib = { version = "0.18", optional = true }
+
+[features]
+tray = ["dep:tray-icon", "dep:gtk", "dep:glib"]
+
 [[bin]]
 name = "hypermnesia-stats"
 path = "src/bin/stats.rs"

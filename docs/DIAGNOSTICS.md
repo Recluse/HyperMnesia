@@ -128,24 +128,37 @@ have. What it says, and what each line means:
 | `! not updated: <reason>, showing state from 4m ago` | the reading failed; these numbers are old and this is how old |
 | `! no answer about a reading for 2m -- the reader is stuck` | the worker thread is alive and has stopped answering |
 | `! the reader thread has died` | nothing will update again; restart the tray |
-| `never ran (installed 3 d ago)` | launchd has started this job zero times and it has written no log |
-| `! the period has already passed and launchd still never ran it` | a whole period and a half with no run — the complaint, as opposed to the observation above |
+| `never ran (installed 3 d ago)` | the service manager has started this job zero times and it has written no log |
+| `! the period has already passed and it still never ran` | a whole period and a half with no run — the complaint, as opposed to the observation above |
 | `! it ran at some point, but the log has not moved for more than a period` | it worked once and stopped |
-| `! unreadable plist: <plutil said>` | launchd refused this job too; it is not running |
+| `! unreadable plist: <plutil said>` (macOS) | launchd refused this job too; it is not running |
+| `! unreadable unit: <systemctl said>` (Linux) | the same fault, from `systemctl --user show` or the parser instead of `plutil` |
+| `! the timer is disabled, so it is not scheduled by anything` (Linux) | the `.timer` unit exists and parses, but is not enabled — no launchd analogue: a plist in LaunchAgents is loaded by definition, but a systemd timer can exist and simply not be armed |
+| `! the timer is loaded but not armed (ActiveState=..., SubState=...)` (Linux) | loaded and enabled, but not actually active right now |
 | `! exit 2, 5m ago` | the last run failed. `freshness` exits 1 by design, meaning discrepancies were found |
-| `loaded; no run since this login` | launchd has the job and has not started it since the last login. Its exit column says 0, which it prints for "never finished" as well as for "finished well" |
+| `loaded; no run since this login` (macOS) | launchd has the job and has not started it since the last login. Its exit column says 0, which it prints for "never finished" as well as for "finished well" |
 | `? the configured log is not there` | the job ran, but the file that would date its last run is gone. Neither health nor failure: the evidence is missing, and that is its own answer |
 | `! the hooks IGNORE this file entirely: <why>` | the settings file is out of force; the defaults are running |
 | `file (IGNORED)` / `5 (file: 9)` | the file says 9, the default 5 is what is actually in effect |
-| `this shell` as a source | set here, but launchd's jobs do not inherit it — the line below says what they use |
+| `this shell` as a source | set here, but the jobs the service manager starts do not inherit it — the line below says what they use |
 | `the answer parsed but has no "memories"` | something answered, but it was not this query's result. Not a store full of zeros |
+| `systemctl --user is not reachable: <why>` (Linux) | no session bus, not "no jobs configured" — the two must never look alike |
+| `<path>.bak already exists: an earlier edit did not finish` | a previous `set_schedule` was interrupted before it could clean up; compare the `.bak` with the live file and remove it before editing again |
+| `the unit does not pass the check after the edit (...); the file was restored` (Linux) | `systemd-analyze --user verify` (or, failing that, a `daemon-reload` + `LoadState` check) refused the edit before anything was reloaded; nothing changed |
+| `systemd reloaded the unit but reports a different schedule than was set (...) -- the file was restored` (Linux) | the read-back after a reload did not match what was asked; the console does not call an edit done on the strength of an exit code alone |
+| `<name> ran and exited <code>` | `run` succeeded in the sense of starting; the program itself failed. The exit code is read back from `ExecMainStatus`/`InvocationID` after the request, not assumed from `systemctl start`'s own success |
+| `<timer> is masked -- unmask it first: systemctl --user unmask <timer>` (Linux) | `enable`/`disable` refuses a masked unit rather than fighting the mask |
+| `autostart starts <path>, not this binary (<path>)` | the installed autostart unit points at a binary that has moved, been rebuilt elsewhere, or been deleted — it will fail at every login with nothing on screen to say so until this line does |
 
-Schedules are read the way launchd means them: an omitted `StartCalendarInterval` field is a
-wildcard, so `{Minute: 15}` is "hourly at :15" and `{Day: 1, Hour: 3}` is "monthly day 1 03:00".
-The period follows the coarsest pinned field, which is what keeps a monthly job from being called
-overdue every day of the month.
+Schedules are read the way each backend means them. On macOS an omitted `StartCalendarInterval`
+field is a wildcard, so `{Minute: 15}` is "hourly at :15" and `{Day: 1, Hour: 3}` is "monthly day 1
+03:00". On Linux the same rule applies to `OnCalendar=`: `*:15:00` is the same "hourly at :15", not
+"00:15". Either way the period follows the coarsest pinned field, which is what keeps a monthly job
+from being called overdue every day of the month.
 
 Two readings that are NOT complaints, and are deliberately not marked: a job with no schedule
-(`on demand`) never being "overdue", and a positive run counter with no log to date it by. The
-run counter is per-bootstrap — launchd resets it at every login — so it can only ever prove that
-something ran, never that nothing did.
+(`on demand`) never being "overdue", and — on macOS — a positive run counter with no log to date it
+by. The run counter is per-bootstrap — launchd resets it at every login — so it can only ever prove
+that something ran, never that nothing did. systemd keeps no such counter at all; where it answers
+"when did this last fire" directly (`LastTriggerUSec`), that answer is trusted over the log, and it
+settles the question in either direction — "never" is as final an answer there as a timestamp is.
