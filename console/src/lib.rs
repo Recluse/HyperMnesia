@@ -315,8 +315,40 @@ pub fn probe(t: &Target) -> Result<String, String> {
     Ok(line.to_string())
 }
 
+/// The most output an answer may be. This query returns a few kilobytes; a command that has
+/// produced sixteen megabytes is not psql answering it, and reading on until memory runs out is
+/// a worse failure than saying so.
+const MAX_OUTPUT: usize = 16 << 20;
+
+/// The smallest amount of time the readers get after the child exits, when the deadline itself
+/// has already run out. Without it a child that finishes one millisecond before the deadline
+/// would have its perfectly good output declared missing.
+const COLLECT_FLOOR: Duration = Duration::from_millis(200);
+
+/// Read one pipe to the end, bounded. Read errors are carried out rather than dropped: a
+/// truncated answer that arrives as `Ok` is the silent kind of wrong this file is about.
+fn drain(h: &mut Option<std::process::ChildStdout>, which: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let Some(h) = h.as_mut() else { return Ok(Vec::new()) };
+    let mut b = Vec::new();
+    // One byte past the limit, so "exactly at the limit" and "more than the limit" are
+    // distinguishable rather than both looking like a complete answer.
+    h.take(MAX_OUTPUT as u64 + 1).read_to_end(&mut b)
+        .map_err(|e| format!("reading the command's {which}: {e}"))?;
+    if b.len() > MAX_OUTPUT {
+        return Err(format!("the command produced more than {} MiB on {which}",
+                           MAX_OUTPUT >> 20));
+    }
+    Ok(b)
+}
+
 fn run_with_timeout(cmd: &str, stdin_text: &str, timeout: Duration) -> Result<String, String> {
     use std::sync::mpsc;
+    // ONE deadline, taken before anything starts. It used to begin after the query had already
+    // been written to the child, so the write itself was outside the timeout: a query larger
+    // than the pipe's capacity blocked for ever if the child never read it, and a child that
+    // filled its own output pipe while we were still writing deadlocked both ends.
+    let deadline = Instant::now() + timeout;
     // `sh -c` deliberately: the command is written by a person and contains quotes, expansions
     // and pipelines (`ssh host kubectl exec … -- psql …`). Parsing it ourselves would mean
     // writing an incomplete shell. Its source is the config file of whoever owns the machine,
@@ -341,36 +373,43 @@ fn run_with_timeout(cmd: &str, stdin_text: &str, timeout: Duration) -> Result<St
         });
     }
     let mut child = child.spawn().map_err(|e| format!("could not start sh: {e}"))?;
-    {
-        let mut si = child.stdin.take().ok_or("no stdin on the child")?;
-        si.write_all(stdin_text.as_bytes()).map_err(|e| format!("writing the query: {e}"))?;
-    }
 
     // Readers on their own threads, and channels rather than join: killing a process does not
     // close the pipe if something it spawned inherited stdout, and a join would then wait for
     // the grandchild -- far past the deadline. Measured in this project's MCP server: a 3s
     // timeout returned after 30.
+    //
+    // They start BEFORE the query is written, and the write gets a thread of its own, so that
+    // no phase of this can block another. All three are only ever waited for against the one
+    // deadline above.
     let (tx_o, rx_o) = mpsc::channel();
     let (tx_e, rx_e) = mpsc::channel();
+    let (tx_w, rx_w) = mpsc::channel();
     let mut so = child.stdout.take();
     let mut se = child.stderr.take();
-    // stdout arrives as BYTES and is turned into text once, strictly. `from_utf8_lossy` here
-    // was the earliest point at which two different names became the same `?`: by the time the
-    // parser saw them they were genuinely identical, so no amount of care further in could tell
-    // them apart. A psql that returns something which is not text is a failure, not a name.
+    std::thread::spawn(move || { let _ = tx_o.send(drain(&mut so, "stdout")); });
     std::thread::spawn(move || {
-        let mut b = Vec::new();
-        if let Some(h) = so.as_mut() { use std::io::Read; let _ = h.read_to_end(&mut b); }
-        let _ = tx_o.send(String::from_utf8(b)
-            .map_err(|_| "the command's output is not valid UTF-8".to_string()));
+        // stderr is read through the same bounded path; the handle types differ, so it gets its
+        // own two lines rather than a generic.
+        use std::io::Read;
+        let r = (|| -> Result<Vec<u8>, String> {
+            let Some(h) = se.as_mut() else { return Ok(Vec::new()) };
+            let mut b = Vec::new();
+            h.take(MAX_OUTPUT as u64 + 1).read_to_end(&mut b)
+                .map_err(|e| format!("reading the command's stderr: {e}"))?;
+            b.truncate(MAX_OUTPUT);
+            Ok(b)
+        })();
+        let _ = tx_e.send(r);
     });
+    let mut si = child.stdin.take().ok_or("no stdin on the child")?;
+    let query = stdin_text.to_string();
     std::thread::spawn(move || {
-        let mut b = Vec::new();
-        if let Some(h) = se.as_mut() { use std::io::Read; let _ = h.read_to_end(&mut b); }
-        let _ = tx_e.send(String::from_utf8_lossy(&b).into_owned());
+        let r = si.write_all(query.as_bytes()).map_err(|e| e.to_string());
+        drop(si);                      // the child needs to see the end of its input
+        let _ = tx_w.send(r);
     });
 
-    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break Some(st),
@@ -378,17 +417,51 @@ fn run_with_timeout(cmd: &str, stdin_text: &str, timeout: Duration) -> Result<St
                 if Instant::now() >= deadline { break None; }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Err(e) => return Err(format!("waiting on the child: {e}")),
+            Err(e) => { kill_tree(&mut child); return Err(format!("waiting on the child: {e}")); }
         }
     };
     let Some(st) = status else {
         kill_tree(&mut child);
         return Err(format!("no answer within {}s", timeout.as_secs()));
     };
-    let grace = Duration::from_secs(5);
-    let out = rx_o.recv_timeout(grace)
-        .map_err(|_| "the command exited but its output never arrived".to_string())??;
-    let err = rx_e.recv_timeout(grace).unwrap_or_default();
+
+    // What is LEFT of the deadline, not a fresh five seconds. A descendant holding stdout open
+    // used to add five seconds to every such run and then be reported as "output never
+    // arrived"; one holding only stderr was worse -- it added the same five seconds and then
+    // succeeded, with stderr silently empty. Either way the group was left alive.
+    let collect = deadline.saturating_duration_since(Instant::now()).max(COLLECT_FLOOR);
+    let out = match rx_o.recv_timeout(collect) {
+        Ok(r) => match r {
+            Ok(bytes) => String::from_utf8(bytes)
+                // The earliest point at which two different names became the same `?`: by the
+                // time the parser saw them they were genuinely identical, so no amount of care
+                // further in could have told them apart. A psql that returns something which is
+                // not text is a failure, not a name.
+                .map_err(|_| "the command's output is not valid UTF-8".to_string()),
+            Err(e) => Err(e),
+        },
+        Err(_) => {
+            kill_tree(&mut child);
+            Err("the command exited but something it started is still holding its output open"
+                .to_string())
+        }
+    };
+    let err = match rx_e.recv_timeout(COLLECT_FLOOR) {
+        Ok(Ok(b)) => String::from_utf8_lossy(&b).into_owned(),   // for a person to read
+        Ok(Err(e)) => e,
+        Err(_) => "(its error output is still held open by something it started)".to_string(),
+    };
+    // Checked after the exit status, never before it: psql that fails on the first line exits
+    // while the rest of the query is still being written, and the EPIPE that causes is the
+    // symptom. Reporting it instead of the real error is how "syntax error at or near" became
+    // "writing the query: Broken pipe".
+    let write_failed = matches!(rx_w.recv_timeout(COLLECT_FLOOR), Ok(Err(_)));
+
+    // Our own reason for refusing the output comes before the exit status. When the size limit
+    // is what stopped the read, the child dies of SIGPIPE BECAUSE of that -- and "the command
+    // exited a signal and said nothing at all" would name a symptom this console caused rather
+    // than the cause it knows.
+    let out = out?;
     if !st.success() {
         // Some of these fail with everything on stdout and nothing on stderr (a preset whose
         // placeholders were never filled in, `kubectl` printing usage). "the query failed: "
@@ -402,6 +475,12 @@ fn run_with_timeout(cmd: &str, stdin_text: &str, timeout: Duration) -> Result<St
             return Err(format!("the command exited {code} and said nothing at all"));
         }
         return Err(format!("the query failed (exit {code}): {tail}"));
+    }
+    if write_failed {
+        // A clean exit that never took the whole query answered a DIFFERENT question from the
+        // one asked. Whatever it printed is not this query's reading.
+        return Err("the command exited successfully without reading the whole query, so what \
+                    it answered is not what was asked".to_string());
     }
     Ok(out)
 }
@@ -1024,6 +1103,72 @@ mod tests {
                      r#"[{"model":"\ud83dA","n":1}]"#] {
             assert!(parse(&answer("[]", "[]", half)).is_err(), "accepted a lone surrogate: {half}");
         }
+    }
+
+    /// The deadline covers the WHOLE operation, descendants included. Each of these was measured
+    /// against the previous version, which established its deadline only after the query had
+    /// been written and then gave the readers a fresh five seconds on top:
+    ///
+    /// - a descendant holding stdout: error after 5.03 s, and the group left running;
+    /// - a descendant holding only stderr: SUCCESS after 5.03 s, stderr silently empty;
+    /// - a query larger than the pipe, to a command that never reads: blocked for ever.
+    #[cfg(unix)]
+    #[test]
+    fn the_deadline_covers_the_whole_operation() {
+        let one = Duration::from_secs(1);
+
+        // A child that exits at once but leaves a descendant holding stdout open. The answer
+        // must come back inside the deadline, not five seconds after it.
+        let began = Instant::now();
+        let r = run_with_timeout("sleep 30 & exit 0", "", one);
+        assert!(began.elapsed() < one * 3, "waited {:?} on a held pipe", began.elapsed());
+        assert!(r.is_err(), "a held-open pipe is not a complete answer: {r:?}");
+
+        // The same, holding only stderr. This one used to SUCCEED -- with stderr empty, which
+        // is how a failing command came back as "said nothing at all".
+        let began = Instant::now();
+        let _ = run_with_timeout("sleep 30 2>/dev/null & echo hi", "", one);
+        assert!(began.elapsed() < one * 3, "waited {:?} on a held stderr", began.elapsed());
+
+        // A query far larger than a pipe's capacity, handed to a command that never reads it.
+        // The write used to happen before the deadline existed, on the calling thread.
+        let began = Instant::now();
+        let huge = "x".repeat(4 << 20);
+        let r = run_with_timeout("sleep 30", &huge, one);
+        assert!(began.elapsed() < one * 3, "waited {:?} on a full pipe", began.elapsed());
+        assert!(r.is_err(), "{r:?}");
+    }
+
+    /// Output has a ceiling. Reading on until memory runs out is a worse failure than saying so,
+    /// and a command producing megabytes is not psql answering this query.
+    #[cfg(unix)]
+    #[test]
+    fn output_larger_than_the_limit_is_refused() {
+        let ok = run_with_timeout("printf 'small'", "", Duration::from_secs(20));
+        assert_eq!(ok.as_deref(), Ok("small"));
+        // `yes` fills the pipe far faster than the limit, so this settles quickly.
+        let r = run_with_timeout("yes 0123456789abcdef", "", Duration::from_secs(20))
+            .expect_err("an endless stream must be refused");
+        assert!(r.contains("MiB") || r.contains("no answer"), "unexpected refusal: {r}");
+    }
+
+    /// A command that exits 0 without reading the query answered a different question. It used
+    /// to come back as a successful reading of whatever it happened to print -- and the EPIPE
+    /// from the unread half used to be reported INSTEAD of a real error, turning psql's "syntax
+    /// error at or near" into "writing the query: Broken pipe".
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_ignores_the_query_is_not_an_answer() {
+        let big = "x".repeat(4 << 20);
+        let r = run_with_timeout("exit 0", &big, Duration::from_secs(20))
+            .expect_err("a command that never read the query has not answered it");
+        assert!(r.contains("whole query"), "{r}");
+
+        // ...but a command that FAILS reports its own error, not the broken pipe.
+        let r = run_with_timeout("echo 'syntax error at or near' >&2; exit 3", &big,
+                                 Duration::from_secs(20))
+            .expect_err("a failing command is an error");
+        assert!(r.contains("syntax error"), "the real error must survive the EPIPE: {r}");
     }
 
     /// Bad bytes from the command are a failure, not a name. They used to be replaced with
