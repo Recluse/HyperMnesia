@@ -19,6 +19,7 @@ Env: DATABASE_URL, EMBED_BACKEND (+ OLLAMA_URL/TEI_URL), HM_PYTHON, HM_MEM_OPS.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -29,13 +30,32 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://hm@localhost:5432/hy
 
 results = []
 
+# The probes exercise the live path, so they have to BE somebody: writes are refused without an
+# author and reads are scoped to one. Their own identity rather than a real person's, so a probe
+# row that failed to clean up cannot end up in anyone's profile.
+PROBE_AUTHOR = os.environ.get("MEM_PROBE_AUTHOR", "probe")
+if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", PROBE_AUTHOR):
+    sys.exit(f"MEM_PROBE_AUTHOR {PROBE_AUTHOR!r} is not a plain name ([A-Za-z0-9._-], up to 64)")
+# A second identity, so isolation can be probed rather than assumed.
+OTHER_AUTHOR = PROBE_AUTHOR + "-other"
 
-def mem(cmd, payload, timeout=60):
+
+def mem(cmd, payload, timeout=60, who=None):
+    payload = dict(payload)
+    payload.setdefault("_identity", who or PROBE_AUTHOR)
     p = subprocess.run([PY, MEM_OPS, cmd], input=json.dumps(payload, ensure_ascii=False).encode(),
                        capture_output=True, timeout=timeout)
     if p.returncode != 0:
         raise RuntimeError(f"mem_ops {cmd} failed: {p.stderr.decode()[-400:]}")
     return p.stdout.decode().strip()
+
+
+def mem_may_fail(cmd, payload, who=None):
+    """Like `mem`, but a refusal is an ANSWER here rather than a crash."""
+    try:
+        return mem(cmd, payload, who=who)
+    except RuntimeError as e:
+        return f"REFUSED: {e}"
 
 
 def psql(sql, timeout=30):
@@ -91,6 +111,31 @@ def main():
         ids.append(d)
         out = mem("search", {"query": "how should I address the experimental cluster", "k": 3})
         check("paraphrase finds fact top-3", f"[#{d}]" in out, out[:200])
+        # 5. isolation -- the probe that fails if the multi-user rule is taken off.
+        #
+        # Every probe above passes with the rule deleted entirely, because they write and read
+        # as ONE identity: they cannot tell a store that isolates from one that does not. This
+        # writes as one author and reads as a second, which is the only arrangement that can.
+        print("== probe: isolation (a second author) ==")
+        e = mem_id(mem("write", {"type": "preference", "importance": 0.4, "metadata": meta,
+                                 "content": "PROBE-PRIVATE: drinks tea only from the blue mug."}))
+        ids.append(e)
+        q = "which mug is the tea drunk from"
+        check("the author finds their own private fact", f"[#{e}]" in mem("search", {"query": q, "k": 5}))
+        check("a second author does not",
+              f"[#{e}]" not in mem("search", {"query": q, "k": 5}, who=OTHER_AUTHOR))
+        check("nor through history",
+              f"[#{e}]" not in mem("search", {"query": q, "k": 5, "include_inactive": True},
+                                   who=OTHER_AUTHOR))
+        check("nor by id", f"[#{e}]" not in mem_may_fail("get", {"id": e}, who=OTHER_AUTHOR))
+        # Checked by what did NOT happen, not by the wording: with row-level security on, the
+        # row is invisible to the other author, so `mark` honestly answers "not found" rather
+        # than refusing by name -- the same answer `get` gives, and for the same reason.
+        out = mem_may_fail("mark", {"id": e, "status": "retracted"}, who=OTHER_AUTHOR)
+        check("and cannot be retracted by them", "marked" not in out, out[:120])
+        out = mem_may_fail("supersede", {"old_id": e, "content": "replaced"}, who=OTHER_AUTHOR)
+        check("nor superseded by them", "saved" not in out, out[:120])
+        check("the fact survived both attempts", f"[#{e}]" in mem("search", {"query": q, "k": 5}))
     finally:
         if ids:
             psql(f"DELETE FROM mem.sources WHERE memory_id IN ({','.join(map(str, ids))});")

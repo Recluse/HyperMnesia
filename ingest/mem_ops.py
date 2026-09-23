@@ -99,6 +99,42 @@ def ensure_entity(cur, subj):
     return cur.fetchone()[0]
 
 
+# -- who is asking -----------------------------------------------------------
+# `author` says who learned a fact and `scope` says who may see it (sql/mem_multiuser.sql).
+# This is where the caller's identity reaches the connection, so mem.active_memories and the
+# row-level policies in mem_app_role.sql have something to filter by.
+#
+# It arrives in the payload as `_identity`, put there by the hooks from the environment. Never
+# from a tool argument and never from the searched text: an identity a caller can choose is an
+# identity a caller can borrow.
+def set_reader(cur, p):
+    """Scope this connection. Returns the identity, or None if the caller did not say."""
+    who = (p.get("_identity") or "").strip() or None
+    if who:
+        cur.execute("SELECT set_config('mem.reader', %s, false)", (who,))
+    return who
+
+
+def require_author(who):
+    """Writes need a name. A row whose author is a guess is worse than a row not written --
+    it is unattributable for ever, and consolidation would later merge it into somebody's."""
+    who = (who or "").strip() or None
+    if not who:
+        raise SystemExit("refusing to write: nobody said who is writing (MEM_AUTHOR is unset). "
+                         "A memory with no author cannot be scoped, shared or revoked.")
+    return who
+
+
+# `preference` is about ONE person and is actively wrong injected into somebody else's session.
+# Everything else, when it carries a project tag, is about the project -- and that is the whole
+# reason a second engineer having memory is worth anything. A row with no project has no
+# audience to define, so it stays private whatever its type.
+def default_scope(mtype, project):
+    if not project or mtype == "preference":
+        return "private"
+    return "project"
+
+
 def do_write(cur, p, supersedes_id=None):
     # Redact structured secrets BEFORE persist/embed. This is the single chokepoint for every
     # write path (hook extract, MCP memory_write, supersede, consolidation merge), so a leaked
@@ -111,24 +147,57 @@ def do_write(cur, p, supersedes_id=None):
     if supersedes_id:
         # Lock the target row FOR UPDATE so two concurrent supersedes of the same memory can't
         # both create an active replacement; refuse if it's no longer active.
-        cur.execute("SELECT memory_type, status FROM mem.memories WHERE id=%s FOR UPDATE",
-                    (supersedes_id,))
+        cur.execute("SELECT memory_type, status, author, scope::text, project FROM mem.memories "
+                    "WHERE id=%s FOR UPDATE", (supersedes_id,))
         row = cur.fetchone()
         if not row:
             raise SystemExit(f"supersedes_id {supersedes_id} not found")
         if row[1] != "active":
             raise SystemExit(f"supersedes_id {supersedes_id} is already {row[1]}")
+        # Superseding is "that fact is no longer what I know". Across authors it is somebody
+        # ELSE deciding what you know, and it happens silently -- the old row leaves every
+        # retrieval path at once.
+        me = (p.get("_identity") or "").strip() or None
+        if row[2] and row[2] != me:
+            # A row you may READ gets the explanation; one you may not gets the answer a
+            # missing id gets. Three distinguishable replies made this an oracle: walking the
+            # id space told you, for every row, whether it exists, whether it is private, and
+            # who wrote it.
+            cur.execute("SELECT mem.may_read(%s, %s::mem.memory_scope, %s)",
+                        (row[2], row[3], row[4]))
+            if not cur.fetchone()[0]:
+                raise SystemExit(f"supersedes_id {supersedes_id} not found")
+            raise SystemExit(f"#{supersedes_id} was written by {row[2]}, not by you. Write your "
+                             f"own memory, or ask them to supersede theirs -- replacing another "
+                             f"author's fact silently is not something this store does.")
         mtype = mtype or row[0]
+    author = require_author(p.get("_identity"))
+    project = canon_project(cur, p.get("project"))
+    # An explicit scope is honoured; otherwise the type and the project decide. A value that is
+    # neither known word is NOT coerced to the default -- a scope nobody understood must not
+    # quietly become an audience.
+    scope = p.get("scope") or default_scope(mtype, project)
+    if scope not in ("private", "project"):
+        raise SystemExit(f"unknown scope {scope!r}: expected 'private' or 'project'")
+    # Publishing into a project you do not belong to puts a row where its members can read it
+    # and you cannot -- a way into other people's sessions from outside their project. The
+    # policies in mem_app_role.sql refuse it too; this is the readable error.
+    if scope == "project":
+        cur.execute("SELECT mem.may_publish(%s)", (project,))
+        if not cur.fetchone()[0]:
+            raise SystemExit(
+                f"refusing to write: {author} is not a member of {project!r}, so this memory "
+                f"cannot be shared with it. Write it private, or ask for membership.")
     cur.execute("""INSERT INTO mem.memories
         (memory_type, content, title, lang, importance, confidence, subject_entity_id,
          project, valid_from, valid_to, event_time, supersedes_id, metadata, embedding,
-         embedding_model)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector,%s) RETURNING id""",
+         embedding_model, author, scope)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector,%s,%s,%s) RETURNING id""",
         (mtype, content, title, p.get("lang", "ru"),
          p.get("importance", 0.5), p.get("confidence", 0.8), subj_id,
-         canon_project(cur, p.get("project")), p.get("valid_from"), p.get("valid_to"), p.get("event_time"),
+         project, p.get("valid_from"), p.get("valid_to"), p.get("event_time"),
          supersedes_id, json.dumps(_scrub_deep(p.get("metadata", {}))), embed(content),
-         EMBED_MODEL))
+         EMBED_MODEL, author, scope))
     mid = cur.fetchone()[0]
     if supersedes_id:
         # Close the old fact's validity window at the moment the new one takes over. LEAST (not
@@ -245,7 +314,10 @@ def _simple_query(q):
 
 
 def do_search(cur, p):
-    src = "mem.memories" if p.get("include_inactive") else "mem.active_memories"
+    # `mem.all_memories`, NOT the base table. Swapping in `mem.memories` takes the rule out of
+    # the query entirely, and `include_inactive` is a documented tool parameter -- any model
+    # turn can set it. History is a narrower question than "everything".
+    src = "mem.all_memories" if p.get("include_inactive") else "mem.active_memories"
     emb = embed(p["query"])
     q = p["query"]
     types = p.get("types") or None
@@ -305,12 +377,20 @@ def do_reflect_targets(cur, p):
 
 
 def do_reflect_group(cur, p):
-    """Active non-page memories for one project -> JSON [{id, type, imp, content}]."""
+    """Active non-page PROJECT-SCOPED memories for one project -> [{id, type, imp, content}].
+
+    `scope='project'` is the whole point of the filter. A knowledge page is written back as a
+    project-scoped memory and, where the document side is in use, mirrored into the document
+    corpus -- which has no scope at all. A page summarising the author's private rows therefore
+    publishes them, in paraphrase, to everyone the page reaches. The page is shared by
+    construction, so only shared material may go into it.
+    """
     cur.execute("""SELECT coalesce(json_agg(json_build_object(
                      'id',id,'type',memory_type,'imp',importance,'content',content)
                      ORDER BY importance DESC),'[]')
                    FROM mem.active_memories
-                   WHERE (metadata->>'kind') IS DISTINCT FROM 'page' AND project = %s""",
+                   WHERE (metadata->>'kind') IS DISTINCT FROM 'page'
+                     AND scope = 'project' AND project = %s""",
                 (canon_project(cur, p["project"]),))
     return cur.fetchone()[0]
 
@@ -319,11 +399,17 @@ def do_page_upsert(cur, p):
     """Write the project's knowledge page, superseding its prior page so it never goes stale
     (each reflect run rebuilds it from the current active memories)."""
     proj = canon_project(cur, p.get("project"))
+    # The author's OWN prior page. Superseding by id alone would walk around the cross-author
+    # refusal do_write makes one line later, and retire a second author's page for the project.
     cur.execute("""SELECT id FROM mem.active_memories
                    WHERE (metadata->>'kind')='page' AND project IS NOT DISTINCT FROM %s
-                   ORDER BY id DESC LIMIT 1""", (proj,))
+                     AND author = %s
+                   ORDER BY id DESC LIMIT 1""",
+                (proj, (p.get("_identity") or "").strip() or None))
     row = cur.fetchone()
-    payload = {**p, "project": proj, "type": "semantic",
+    # Explicitly project-scoped, never inherited from a default: a page exists to be read by
+    # the project, so "private page" is not a state this should reach by accident either way.
+    payload = {**p, "project": proj, "type": "semantic", "scope": "project",
                "metadata": {**(p.get("metadata") or {}), "kind": "page"},
                "importance": p.get("importance", 0.6), "confidence": p.get("confidence", 0.7)}
     return do_write(cur, payload, supersedes_id=row[0] if row else None)
@@ -369,7 +455,24 @@ def fmt_row(r):
     return f"[#{mid}] ({flags}, {created}{window}) {content}"
 
 
-def apply_proposal(cur, action, member_ids, proposal):
+def _group_scope(cur, member_ids):
+    """The audience a merged row inherits: `private` if ANY member is private. A merge restates
+    what was already there; it must not widen who may read it."""
+    cur.execute("SELECT bool_or(scope = 'private') FROM mem.memories WHERE id = ANY(%s)",
+                (member_ids,))
+    r = cur.fetchone()
+    return "private" if (r and r[0]) else "project"
+
+
+def _group_project(cur, member_ids):
+    """The project a merged row inherits -- NULL if the members disagree, and then the scope
+    above has already kept it private."""
+    cur.execute("SELECT DISTINCT project FROM mem.memories WHERE id = ANY(%s)", (member_ids,))
+    projects = [x for (x,) in cur.fetchall() if x]
+    return projects[0] if len(projects) == 1 else None
+
+
+def apply_proposal(cur, action, member_ids, proposal, who=None):
     """Apply an approved consolidation proposal -- the same effect the consolidator would
     have had at write time (merge -> one canonical memory + supersede members; supersede ->
     mark losers). Returns a human summary."""
@@ -378,12 +481,36 @@ def apply_proposal(cur, action, member_ids, proposal):
     cur.execute("SELECT count(*) FROM mem.active_memories WHERE id = ANY(%s)", (member_ids,))
     if cur.fetchone()[0] == 0:
         return f"stale (members {member_ids} no longer active) -- not applied"
+    # Consolidation ends with every member row superseded -- gone from every retrieval path --
+    # and, for a merge, one new row carrying what they all said. Across authors that is one
+    # person quietly rewriting what another knows, which is what a cross-author supersede is
+    # refused for. The group has to be of one mind before it can be of one memory.
+    cur.execute("SELECT DISTINCT author FROM mem.memories WHERE id = ANY(%s)", (member_ids,))
+    authors = sorted(a for (a,) in cur.fetchall() if a)
+    if len(authors) > 1:
+        return (f"not applied: {member_ids} were written by {', '.join(authors)}. Merging "
+                f"across authors would supersede one person's memory in another's name.")
+    if authors and who and authors[0] != who:
+        return f"not applied: {member_ids} belong to {authors[0]}, not to {who}."
+    # A group spanning two projects has no single audience to inherit, and a project-scoped row
+    # with no project fails the CHECK -- which would abort the whole review transaction rather
+    # than decline the one proposal.
+    if action == "merge" and _group_scope(cur, member_ids) == "project" \
+            and _group_project(cur, member_ids) is None:
+        return (f"not applied: {member_ids} are shared with different projects, so the merged "
+                f"memory would have no audience of its own. Merge within one project.")
     if action == "merge" and proposal.get("content"):
         mid = do_write(cur, {
             "type": proposal.get("type", "semantic"),
             "content": proposal["content"],
             "importance": min(0.7, max(0.0, float(proposal.get("importance", 0.6)))),
             "metadata": {"merged_from": list(member_ids)},
+            # The GROUP decides, not the proposal. `proposal` is the consolidating model's
+            # output -- untrusted text -- and reading scope/project from it lets a merge of
+            # private rows come back shared, or land under a different project's tag.
+            "_identity": authors[0] if authors else who,
+            "scope": _group_scope(cur, member_ids),
+            "project": _group_project(cur, member_ids),
             "source": {"source_type": "consolidation", "channel": "review",
                        "excerpt": f"merged from {member_ids}"}})
         for m in member_ids:
@@ -409,6 +536,10 @@ def main():
     p = json.loads(sys.stdin.read() or "{}")
     conn = connect()
     cur = conn.cursor()
+    # Before ANY statement: every read surface filters on this, and a connection that never set
+    # it sees only what is shared with projects it belongs to -- which for an unidentified
+    # caller is nothing.
+    set_reader(cur, p)
     if cmd == "write":
         mid = do_write(cur, p)
         conn.commit()
@@ -447,26 +578,53 @@ def main():
         # case for nearly every superseded row before this (the consolidator marks losers separately from
         # writing the replacement, so supersedes_id stays NULL on that path).
         by = p.get("by")
-        cur.execute("UPDATE mem.memories SET status=%s::mem.memory_status, "
-                    "valid_to=COALESCE(valid_to, CASE WHEN %s<>'active' THEN now() END), "
-                    "metadata = metadata || CASE WHEN %s::bigint IS NULL THEN '{}'::jsonb "
-                    "ELSE jsonb_build_object('superseded_by', %s::bigint) END "
-                    "WHERE id=%s RETURNING id", (status, status, by, by, p["id"]))
-        row = cur.fetchone()
-        conn.commit()
-        print(f"marked [#{p['id']}] {status}" if row else "(not found)")
+        # Yours only. `mark` retracts a memory -- it leaves every retrieval path at once -- and
+        # it took an id and nothing else, so any caller could retire any row in the store by
+        # number, including one they could not read.
+        cur.execute("SELECT author FROM mem.memories WHERE id=%s FOR UPDATE", (p["id"],))
+        owner = cur.fetchone()
+        me = (p.get("_identity") or "").strip() or None
+        if not owner:
+            # Also the answer when row-level security makes it invisible, which is the same
+            # answer `get` gives: "you may not touch #123" tells the caller #123 exists.
+            print("(not found)")
+        elif owner[0] != me:
+            raise SystemExit(f"#{p['id']} was written by {owner[0]}, not by you -- "
+                             f"retracting another author's memory is not something this does.")
+        else:
+            cur.execute("UPDATE mem.memories SET status=%s::mem.memory_status, "
+                        "valid_to=COALESCE(valid_to, CASE WHEN %s<>'active' THEN now() END), "
+                        "metadata = metadata || CASE WHEN %s::bigint IS NULL THEN '{}'::jsonb "
+                        "ELSE jsonb_build_object('superseded_by', %s::bigint) END "
+                        "WHERE id=%s RETURNING id", (status, status, by, by, p["id"]))
+            row = cur.fetchone()
+            conn.commit()
+            print(f"marked [#{p['id']}] {status}" if row else "(not found)")
     elif cmd == "get":
+        # Reads the base table deliberately -- `get` must still show a superseded or
+        # out-of-window row, which mem.active_memories excludes by design -- but through
+        # mem.may_read, the same rule the views use. Writing the rule out by hand here instead
+        # of calling it is how a first version came to check the scope and forget membership,
+        # leaving every project-scoped row in every project fetchable by number.
         cur.execute("""SELECT m.id, m.memory_type::text, m.status::text, m.importance,
                        m.confidence, m.created_at::date::text, m.valid_from::date::text,
                        m.valid_to::date::text, m.project, m.content, 0.0,
                        m.title, m.supersedes_id,
-                       (SELECT id FROM mem.memories s WHERE s.supersedes_id = m.id LIMIT 1)
-                       FROM mem.memories m WHERE m.id=%s""", (p["id"],))
+                       (SELECT id FROM mem.memories s WHERE s.supersedes_id = m.id
+                          AND mem.may_read(s.author, s.scope, s.project) LIMIT 1),
+                       m.author, m.scope::text
+                       FROM mem.memories m
+                       WHERE m.id=%s
+                         AND mem.may_read(m.author, m.scope, m.project)""", (p["id"],))
         r = cur.fetchone()
         if not r:
+            # Deliberately the same answer as a missing id. "You may not see #123" tells a
+            # caller that #123 exists and whose it is -- most of what they wanted.
             print("(not found)")
         else:
             print(fmt_row(r[:11]))
+            if r[14]:
+                print(f"  author: {r[14]} ({r[15]})")
             if r[12]:
                 print(f"  supersedes: #{r[12]}")
             if r[13]:
@@ -483,16 +641,23 @@ def main():
                 print(f"  source: {st}{(' via ' + ch) if ch else ''}"
                       f"{(' -- ' + exc[:120]) if exc else ''}")
     elif cmd == "review_add":
-        cur.execute("""INSERT INTO mem.review_queue (action, member_ids, proposal, confidence)
-                       VALUES (%s,%s,%s,%s) RETURNING id""",
+        cur.execute("""INSERT INTO mem.review_queue
+                         (action, member_ids, proposal, confidence, author)
+                       VALUES (%s,%s,%s,%s,%s) RETURNING id""",
                     (p["action"], p["member_ids"], json.dumps(p["proposal"]),
-                     float(p.get("confidence", 0.0))))
+                     float(p.get("confidence", 0.0)),
+                     require_author(p.get("_identity"))))
         rid = cur.fetchone()[0]
         conn.commit()
         print(f"review [#{rid}] queued ({p['action']}, conf={p.get('confidence')})")
     elif cmd == "review_list":
+        # Yours. The proposal text is a paraphrase of the memories in the group, so an
+        # unfiltered list hands every reader a summary of rows they may not see.
         cur.execute("""SELECT id, action, member_ids, confidence, proposal, created_at::date
-                       FROM mem.review_queue WHERE status='pending' ORDER BY created_at""")
+                       FROM mem.review_queue
+                       WHERE status='pending'
+                         AND author IS NOT DISTINCT FROM current_setting('mem.reader', true)
+                       ORDER BY created_at""")
         rows = cur.fetchall()
         if not rows:
             print("(no pending reviews)")
@@ -505,8 +670,12 @@ def main():
         # Atomic claim: only one concurrent resolve can flip a pending row, so a merge can't be
         # applied twice. The row is claimed to the final status here and RETURNING gives us the
         # proposal to apply.
+        # ...and only your own may be claimed. Resolving is destructive: it consumes the row
+        # and, on approval, rewrites the memories it names.
         cur.execute("UPDATE mem.review_queue SET status=%s, resolved_at=now() "
-                    "WHERE id=%s AND status='pending' RETURNING action, member_ids, proposal",
+                    "WHERE id=%s AND status='pending' "
+                    "  AND author IS NOT DISTINCT FROM current_setting('mem.reader', true) "
+                    "RETURNING action, member_ids, proposal",
                     (decision, p["id"]))
         row = cur.fetchone()
         if not row:
@@ -514,7 +683,9 @@ def main():
             print(f"(review #{p['id']} not found or already resolved)")
         else:
             action, members, proposal = row
-            msg = apply_proposal(cur, action, members, proposal) if decision == "approved" else "rejected"
+            msg = (apply_proposal(cur, action, members, proposal,
+                                  (p.get("_identity") or "").strip() or None)
+                   if decision == "approved" else "rejected")
             cur.execute("UPDATE mem.review_queue SET note=%s WHERE id=%s", (msg, p["id"]))
             conn.commit()
             print(f"review [#{p['id']}] {decision}: {msg}")

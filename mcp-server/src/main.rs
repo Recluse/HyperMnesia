@@ -546,10 +546,61 @@ fn tool_search_docs(query: &str, k: u32) -> Result<String, String> {
     Ok(if s.is_empty() { "(search returned nothing at all -- check the search process's stderr)".to_string() } else { s })
 }
 
+/// Who this server acts as. The same name and the same file the Python hooks read, so one
+/// machine has one identity however memory is reached. Absent, reads fall back to what is
+/// shared with the reader's projects and writes are refused by mem_ops.py -- a memory nobody
+/// can be named for is unattributable for ever.
+fn mem_author() -> Option<String> {
+    let ok = |v: &str| !v.is_empty() && v.len() <= 64
+        && v.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c));
+    if let Some(v) = std::env::var("MEM_AUTHOR").ok().map(|v| v.trim().to_string()) {
+        if ok(&v) { return Some(v); }
+    }
+    let path = std::env::var("HYPERMNESIA_ENV_FILE").unwrap_or_else(|_| {
+        format!("{}/.claude/hypermnesia.env", std::env::var("HOME").unwrap_or_default())
+    });
+    // The same ownership and permission gate the Python loader applies. Two readers of one
+    // file must not disagree about whether to trust it: that file decides who you are.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        extern "C" { fn getuid() -> u32; }
+        let md = std::fs::metadata(&path).ok()?;
+        if !md.is_file() || md.mode() & 0o022 != 0 || md.uid() != unsafe { getuid() } {
+            eprintln!("hypermnesia-mcp: {path} is not a file only you can write -- ignoring it, \
+                       so this server has no identity and will not write memories.");
+            return None;
+        }
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') { continue; }
+        // Split on the FIRST '=', then trim. `strip_prefix("MEM_AUTHOR=")` misses
+        // `MEM_AUTHOR = name`, which the Python loader accepts -- one file, two answers.
+        let Some((k, v)) = line.split_once('=') else { continue };
+        if k.trim() != "MEM_AUTHOR" { continue; }
+        let v = v.trim().trim_matches('"').trim_matches('\'').trim().to_string();
+        if ok(&v) { return Some(v); }
+    }
+    None
+}
+
 fn tool_memory(cmd: &str, payload: &Value) -> Result<String, String> {
     // Personal memory: the bundled mem_ops.py (connects to the DB directly).
     // Payload goes via stdin as JSON -- no shell-quoting of arbitrary text.
     use std::process::{Command, Stdio};
+    // The caller's `_identity` is REMOVED first and set from the environment second, never
+    // merged: leaving a caller-supplied one standing when the environment has none lets a TOOL
+    // ARGUMENT decide who the writer is -- the one thing this value must never come from.
+    let mut payload = payload.clone();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.remove("_identity");
+        if let Some(who) = mem_author() {
+            obj.insert("_identity".into(), Value::String(who));
+        }
+    }
+    let payload = &payload;
     let script = script_path("HM_MEM_OPS", "ingest/mem_ops.py");
     let mut child = Command::new(py()).arg(script).arg(cmd)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())

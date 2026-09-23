@@ -85,6 +85,10 @@ echo "$DATABASE_URL"   # put this in your shell profile and your MCP client's en
 # the error, keeps going and exits 0, so a failed statement is indistinguishable from success.
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/schema.sql -f sql/schema_mem.sql
 
+# 2b. More than one person? See "Two people, one store" below and apply
+#     sql/mem_multiuser.sql + sql/mem_app_role.sql BEFORE anyone writes anything.
+#     One person: skip it, and add it later -- the migration backfills.
+
 # 3. Embedder: Ollama
 ollama pull bge-m3            # 1.2 GB
 export EMBED_BACKEND=ollama   # http://localhost:11434
@@ -374,3 +378,86 @@ your own private file, and only the exact names listed here are accepted.
 | `HM_JOB_PREFIX` | `com.hypermnesia` (macOS) / `hypermnesia-` (Linux) | the label/unit-name prefix the job tools manage |
 | `HM_CONSOLE_CONFIG` | `~/.config/hypermnesia/console.conf` | where the two settings above are stored. Refused whole if another account can write it, if it is not owned by you, or if it is not a plain file: it holds a command the tray runs at login. A refusal STOPS the tool — it does not fall back to the default command, because that reaches a different database and its numbers look exactly like the ones you asked for. A file that is simply absent is fine; the default applies then |
 | `HM_TIMEOUT_SECS` | `30` | ceiling on one reading of the store, covering the whole exchange — writing the query, waiting, and collecting the answer. Capped at 3600; a value outside 1..3600 is ignored and the default applies |
+
+## Two people, one store
+
+A personal memory store stops being one person's the moment a second author can write to it.
+`sql/mem_multiuser.sql` + `sql/mem_app_role.sql` make that safe. Apply them after
+`schema_mem.sql` and before anyone else connects.
+
+### Why not a namespace per person
+
+The rows in this store are not all of one kind with respect to sharing. A `preference` is about
+ONE person and is actively harmful injected into somebody else's session — they take another
+person's habits for project rules. A `semantic` or `procedural` fact is about the PROJECT, and
+a second engineer having memory is worth something precisely because what they learn reaches
+everyone. A namespace each gives the worst of both: their findings reach nobody, and personal
+preferences still need hiding by other means.
+
+So every row records **`author`** (who learned it) and **`scope`** (`private` | `project`), and
+**`mem.project_members`** says which projects an author may read the shared memory of.
+
+*(Every agent-memory product we compared against does namespace isolation and none has a
+visibility model: mem0 scopes by `user_id`/`agent_id`/`run_id`, Zep/Graphiti by `group_id`.
+Zep's own documentation makes the point this design rests on — a namespace filter is not
+authorization, and the identifier must never come from an untrusted request.)*
+
+### Identity
+
+`MEM_AUTHOR`, from `~/.claude/hypermnesia.env` (read by both the Python hooks and the Rust MCP
+server, so one machine has one identity) or from the environment. It reaches Postgres as the
+connection option `mem.reader`.
+
+Without it, **reads** return only what is shared with projects you belong to and **writes** are
+refused. Both fail closed, and the read failure is loud — your own preferences stop appearing in
+your profile, which you notice immediately.
+
+### Defaults, and what is refused
+
+| | |
+|---|---|
+| `preference` | private |
+| anything else with a project tag | shared with that project |
+| anything with no project | private, whatever its type |
+| supersede, `mark`, consolidation across authors | refused |
+| publishing into a project you are not in | refused |
+| a merge | inherits the group's author, project and *narrowest* scope |
+
+Grant membership explicitly — there is no "all projects" row, so a new project is unshared
+until someone says otherwise:
+
+```sql
+INSERT INTO mem.project_members (author, project) VALUES ('someone', 'the-tag');
+```
+
+The tag is matched exactly, so a case variant grants nothing and reports success. Copy it from
+`SELECT DISTINCT project FROM mem.memories`.
+
+### The rule is not only in a view
+
+`mem_multiuser.sql` puts it in the function `mem.may_read`, called by the views **and** by the
+callers that cannot use a view. That is necessary and not sufficient, which we established the
+expensive way: an adversarial audit of the first version found four callers that reached the
+base tables instead — a history flag swapping the view out, a fetch-by-id that checked the scope
+but forgot membership, a write that accepted any project, and a retract that checked nothing.
+
+`mem_app_role.sql` is what makes it hold anyway. `hm_app` is an ordinary role, so the row-level
+policies bind it: a query that forgets the rule comes back with **no rows** instead of every
+row. Point the application's `DATABASE_URL` at `hm_app`; keep the owning role for migrations,
+restores, and the one view with no rule on it (`mem.all_active_memories`, which a post-restore
+row count must use — `mem.active_memories` returns 0 for a connection with no identity, which
+is correct and looks exactly like an empty restore).
+
+If the application connects as the role that OWNS the tables, RLS is inert — owners bypass
+their own policies and a superuser bypasses everything.
+
+### Check that the boundary is up
+
+```bash
+# must print 0: no identity, no rows
+psql "$DATABASE_URL" -tAXc "SELECT count(*) FROM mem.memories;"
+
+# and the probe that fails if the rule is removed — it writes as one identity and reads as a
+# second, which is the only arrangement that can tell an isolating store from one that is not
+python3 eval/mem_probes.py
+```

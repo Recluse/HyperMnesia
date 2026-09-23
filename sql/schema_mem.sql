@@ -101,11 +101,22 @@ CREATE INDEX IF NOT EXISTS mem_review_pending_idx
     ON mem.review_queue(created_at) WHERE status = 'pending';
 
 -- The default read surface -- retrieval must not see superseded/out-of-window facts.
-CREATE OR REPLACE VIEW mem.active_memories AS
-  SELECT * FROM mem.memories
-  WHERE status = 'active'
-    AND (valid_from IS NULL OR valid_from <= now())
-    AND (valid_to   IS NULL OR valid_to   >  now());
+--
+-- WARNING: mem_multiuser.sql REDEFINES this view to filter by author and project membership.
+-- This file is the base schema and is documented as safe to re-apply, so a plain
+-- CREATE OR REPLACE here would silently take that rule off a live store the next time anyone
+-- ran the documented command -- every private memory shared with everyone, nothing failing and
+-- nothing said. Measured, by doing exactly that on a real store. Created only when absent.
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_views WHERE schemaname='mem' AND viewname='active_memories')
+  THEN
+    EXECUTE $v$CREATE VIEW mem.active_memories AS
+      SELECT * FROM mem.memories
+      WHERE status = 'active'
+        AND (valid_from IS NULL OR valid_from <= now())
+        AND (valid_to   IS NULL OR valid_to   >  now())$v$;
+  END IF;
+END $$;
 
 -- NOTE: if you set HM_FTS_LANG (used by the mem search query) to something other than
 -- 'english', change the stemmer below to match, or the two legs disagree on word forms.

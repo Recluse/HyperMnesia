@@ -8,7 +8,7 @@ cluster is unreachable. Fail-open.
 """
 import os, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _mem_common import psql, read_stdin_json, fence
+from _mem_common import psql, read_stdin_json, fence, identity, profile_cache_path
 
 # Under ~/.claude, like every other piece of hook state here (the queue, the locks, the
 # fault markers) -- and NOT in /tmp. This file holds the owner's pinned preferences, key facts
@@ -16,7 +16,11 @@ from _mem_common import psql, read_stdin_json, fence
 # world-writable directory with a predictable name that is two problems: anyone on the box
 # reads it, and anyone can pre-create it so the TTL branch below serves THEIR text as the
 # owner's pinned memory without the store ever being consulted.
-CACHE = os.path.expanduser("~/.claude/hypermnesia-profile-cache.txt")
+# Keyed by WHO the profile is for. One file for everyone means a second author on a machine is
+# served the first one's cached profile -- their private preferences, past a scope filter that
+# worked correctly one call earlier. See profile_cache_path: the key is a hash, because a
+# case-insensitive filesystem makes `Alice` and `alice` one file.
+CACHE = profile_cache_path()
 TTL = 300
 REVIEW_LINE = ("[Waiting for your review] {n} consolidation proposal(s) queued (oldest {d}) -- run: python3 hooks/mem_review.py list")
 DOWN_NOTE = ("Long-term memory is CURRENTLY UNAVAILABLE (the store did not answer). Proceed "
@@ -125,8 +129,12 @@ def main():
         age = f"{stale_age} min" if stale_age < 120 else f"{stale_age // 60} h"
         profile = STALE_NOTE.format(age=age) + "\n" + profile
     if profile:
+        # Named, not "the owner's". With a second author the phrase is a claim about whose
+        # facts these are, made to whoever happens to be reading -- and a second author sees
+        # project knowledge, not the first one's preferences.
         print(fence("profile",
-                    "Owner's long-term memory (pinned; full search: the memory_search tool):",
+                    f"Long-term memory ({identity() or 'unidentified'}; pinned; full search: "
+                    f"the memory_search tool):",
                     profile))
 
 

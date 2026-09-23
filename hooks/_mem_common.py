@@ -29,6 +29,13 @@ ENV_FILE = os.path.expanduser(os.environ.get("HYPERMNESIA_ENV_FILE", "~/.claude/
 # The knobs the console offers (console/src/settings.rs, KNOBS) plus the endpoints a deployment
 # has to name somewhere. tests/test_settings_knobs.py keeps this list and that one in step.
 _SETTABLE = frozenset((
+    # Who this machine's sessions read and write as. It belongs here rather than among the
+    # names a file may not choose: the file is already required to be yours and unwritable by
+    # anyone else, and whatever can edit it can edit your shell profile too -- locally the real
+    # boundary is the OS account. Keeping it out would buy no security and cost a deployment
+    # step in every workspace. Remotely it is different, and must not be caller-supplied: an
+    # authenticated gateway decides the identity, and the request never gets to name one.
+    "MEM_AUTHOR",
     "HM_LLM_MODEL", "HM_LLM_BACKEND", "HM_LLM_URL", "HM_LLM_KEY",
     "MEM_NOVELTY_MAXDIST", "MEM_REVIEW_THRESHOLD",
     "MEM_REFLECT_MIN", "MEM_REFLECT_MAX", "MEM_STALE_DAYS",
@@ -140,10 +147,70 @@ def fence(kind, header, body, max_body=None):
             f"</personal-memory-{kind} nonce={n}>")
 
 
-def _run(argv, stdin_text, timeout):
+# -- who is reading and writing ----------------------------------------------
+# The store stops being one person's the moment a second author can write to it. Every row
+# records WHO learned it and WHO may see it (sql/mem_multiuser.sql), and the reader's identity
+# has to reach the database on every connection or the rule has nothing to filter by.
+#
+# Letters, digits, dot, dash, underscore: this value ends up in a connection option and on a
+# row, and it names a person. Boring is the requirement.
+_IDENT_OK = re.compile(r"\A[A-Za-z0-9._-]{1,64}\Z")
+
+
+def identity():
+    """Who this process acts as, or None if nobody said -- or said something unusable.
+
+    Validated HERE rather than only where it reaches the connection option: checking it in one
+    place and not the other means a malformed name is refused for reads and accepted for
+    writes, and the rows go in under a name that can never read them back.
+    """
+    v = os.environ.get("MEM_AUTHOR", "").strip()
+    if not v:
+        return None
+    if not _IDENT_OK.match(v):
+        sys.stderr.write(f"_mem_common: MEM_AUTHOR {v!r} is not a plain name "
+                         f"([A-Za-z0-9._-], up to 64) -- ignoring it. This session reads only "
+                         f"what is shared with its projects, and cannot write memories.\n")
+        return None
+    return v
+
+
+def profile_cache_path():
+    """Where this identity's cached profile lives -- keyed by a HASH of the name.
+
+    Not the name itself: on a case-insensitive filesystem (macOS by default) `Alice` and
+    `alice` are one file, so a misspelled identity is served the other one's cached profile --
+    straight past a scope filter that worked correctly one call earlier. A hex digest has no
+    case, and no path separators to smuggle.
+    """
+    import hashlib
+    tag = hashlib.sha256((identity() or "anon").encode("utf-8")).hexdigest()[:16]
+    return os.path.expanduser(f"~/.claude/hypermnesia-profile-cache.{tag}.txt")
+
+
+def _reader_env():
+    """Environment carrying the reader identity into psql as a connection option.
+
+    Through PGOPTIONS and not a leading `SET`: psql prints the command tag `SET` on its own
+    line even under -tA, which would land in front of every answer these hooks parse.
+
+    No identity is not an error for reads -- the reader then sees only what is shared with
+    projects it belongs to, which is strictly LESS than before, and the owner notices at once
+    because their own preferences stop appearing. Writes are the other way round: mem_ops.py
+    refuses them, because a row whose author is a guess is unattributable for ever.
+    """
+    who = identity()
+    if not who:
+        return None
+    env = dict(os.environ)
+    env["PGOPTIONS"] = f"-c mem.reader={who}"
+    return env
+
+
+def _run(argv, stdin_text, timeout, env=None):
     try:
         p = subprocess.run(argv, input=(stdin_text or "").encode(),
-                           capture_output=True, timeout=timeout)
+                           capture_output=True, timeout=timeout, env=env)
         if p.returncode != 0:
             return None
         return p.stdout.decode("utf-8", "replace")
@@ -152,11 +219,16 @@ def _run(argv, stdin_text, timeout):
 
 
 def mem_ops(cmd, payload, timeout=10):
+    # Carried in the payload: mem_ops.py may run somewhere this process's environment does not
+    # reach, and it sets the connection's `mem.reader` from it.
+    payload = dict(payload)
+    payload.setdefault("_identity", identity())
     return _run([PY, MEM_OPS, cmd], json.dumps(payload, ensure_ascii=False), timeout)
 
 
 def psql(sql, timeout=10):
-    return _run(["psql", DATABASE_URL, "-tAX", "-v", "ON_ERROR_STOP=1"], sql, timeout)
+    return _run(["psql", DATABASE_URL, "-tAX", "-v", "ON_ERROR_STOP=1"], sql, timeout,
+                env=_reader_env())
 
 
 STORE_DOWN = os.path.expanduser("~/.claude/hypermnesia-store-down")
