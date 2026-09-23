@@ -372,5 +372,5 @@ your own private file, and only the exact names listed here are accepted.
 |-----|---------|---------|
 | `HM_PSQL_CMD` | `psql "$DATABASE_URL" -tAX -v ON_ERROR_STOP=1` | the command the console sends SQL to on stdin. The one setting that differs between deployments |
 | `HM_JOB_PREFIX` | `com.hypermnesia` (macOS) / `hypermnesia-` (Linux) | the label/unit-name prefix the job tools manage |
-| `HM_CONSOLE_CONFIG` | `~/.config/hypermnesia/console.conf` | where the two settings above are stored. Refused whole if another account can write it: it holds a command the tray runs at login |
-| `HM_TIMEOUT_SECS` | `30` | ceiling on one reading of the store |
+| `HM_CONSOLE_CONFIG` | `~/.config/hypermnesia/console.conf` | where the two settings above are stored. Refused whole if another account can write it, if it is not owned by you, or if it is not a plain file: it holds a command the tray runs at login. A refusal STOPS the tool — it does not fall back to the default command, because that reaches a different database and its numbers look exactly like the ones you asked for. A file that is simply absent is fine; the default applies then |
+| `HM_TIMEOUT_SECS` | `30` | ceiling on one reading of the store, covering the whole exchange — writing the query, waiting, and collecting the answer. Capped at 3600; a value outside 1..3600 is ignored and the default applies |

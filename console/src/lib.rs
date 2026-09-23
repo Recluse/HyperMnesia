@@ -982,6 +982,18 @@ mod tests {
         }
     }
 
+    /// The fixture the README tells a newcomer to try -- the console's one claim that works with
+    /// no database at all. A parser change that leaves it behind is discovered by whoever
+    /// followed the quickstart, which is the worst possible place to discover it. Written
+    /// because that just happened: the answer shape changed, every other test passed, and
+    /// `HM_PSQL_CMD="cat demo/store.json"` printed `"embedding_models" is not a list`.
+    #[test]
+    fn the_demo_store_the_readme_offers_still_parses() {
+        let s = parse(include_str!("../demo/store.json")).expect("demo/store.json must parse");
+        assert!(s.memories_total > 0, "a demo of an empty store demonstrates nothing");
+        assert!(!s.corpus.is_empty() && !s.embedding_models.is_empty());
+    }
+
     /// The config file is a command this console runs unattended at login. A file another
     /// account can write is refused whole, and the refusal is the value of this test: verified by
     /// hand before it was written, a mode-0666 config containing `touch FILE; echo "{}"` created

@@ -1,13 +1,64 @@
-{"memories": {"total": 214, "active": 168,
-  "by_type": {"semantic": 61, "preference": 44, "procedural": 33, "episodic": 21, "prospective": 9},
-  "by_project": [{"project": "myrepo", "n": 88}, {"project": "(none)", "n": 47},
-                 {"project": "infra", "n": 33}],
-  "pages": 6},
- "review_queue": {"pending": 0, "oldest_days": 0},
+{
+ "memories": {
+  "total": 214,
+  "active": 168,
+  "by_type": {
+   "semantic": 61,
+   "preference": 44,
+   "procedural": 33,
+   "episodic": 21,
+   "prospective": 9
+  },
+  "by_project": [
+   {
+    "project": "myrepo",
+    "n": 88
+   },
+   {
+    "project": "(none)",
+    "n": 47
+   },
+   {
+    "project": "infra",
+    "n": 33
+   }
+  ],
+  "pages": 6
+ },
+ "review_queue": {
+  "pending": 0,
+  "oldest_days": 0
+ },
  "stale": 0,
- "corpus": [{"repo": "myrepo", "docs": 312, "chunks": 5140, "embedded": 5140},
-            {"repo": "myrepo~mem", "docs": 6, "chunks": 6, "embedded": 6},
-            {"repo": "infra", "docs": 74, "chunks": 1233, "embedded": 1233}],
- "embedding_models": {"bge-m3": 6379},
- "components": {"myrepo": 18, "infra": 11},
- "db_size": "96 MB"}
+ "corpus": [
+  {
+   "repo": "myrepo",
+   "docs": 312,
+   "chunks": 5140,
+   "embedded": 5140
+  },
+  {
+   "repo": "myrepo~mem",
+   "docs": 6,
+   "chunks": 6,
+   "embedded": 6
+  },
+  {
+   "repo": "infra",
+   "docs": 74,
+   "chunks": 1233,
+   "embedded": 1233
+  }
+ ],
+ "embedding_models": [
+  {
+   "model": "bge-m3",
+   "n": 6379
+  }
+ ],
+ "components": {
+  "myrepo": 18,
+  "infra": 11
+ },
+ "db_size": "96 MB"
+}

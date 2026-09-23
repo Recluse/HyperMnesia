@@ -131,8 +131,8 @@ have. What it says, and what each line means:
 | `never ran (installed 3 d ago)` | the service manager has started this job zero times and it has written no log |
 | `! the period has already passed and it still never ran` | a whole period and a half with no run — the complaint, as opposed to the observation above |
 | `! it ran at some point, but the log has not moved for more than a period` | it worked once and stopped |
-| `! unreadable plist: <plutil said>` (macOS) | launchd refused this job too; it is not running |
-| `! unreadable unit: <systemctl said>` (Linux) | the same fault, from `systemctl --user show` or the parser instead of `plutil` |
+| `! <plutil said>` (macOS) | launchd refused this job too; it is not running. The reason is printed as given, with no fixed prefix: these faults are not all of one kind, and calling them all "unreadable" contradicted the half that read perfectly well |
+| `! <systemctl said>` (Linux) | the same, from `systemctl --user show` or the parser instead of `plutil` |
 | `! the timer is disabled, so it is not scheduled by anything` (Linux) | the `.timer` unit exists and parses, but is not enabled — no launchd analogue: a plist in LaunchAgents is loaded by definition, but a systemd timer can exist and simply not be armed |
 | `! the timer is loaded but not armed (ActiveState=..., SubState=...)` (Linux) | loaded and enabled, but not actually active right now |
 | `! exit 2, 5m ago` | the last run failed. `freshness` exits 1 by design, meaning discrepancies were found |
@@ -141,7 +141,10 @@ have. What it says, and what each line means:
 | `! the hooks IGNORE this file entirely: <why>` | the settings file is out of force; the defaults are running |
 | `file (IGNORED)` / `5 (file: 9)` | the file says 9, the default 5 is what is actually in effect |
 | `this shell` as a source | set here, but the jobs the service manager starts do not inherit it — the line below says what they use |
-| `the answer parsed but has no "memories"` | something answered, but it was not this query's result. Not a store full of zeros |
+| `memories."pages" is missing -- this is not the stats query` | something answered, but it was not this query's result. EVERY field this query returns is required, including for an empty store, so a partial answer cannot pose as one. Not a store full of zeros |
+| `the command exited successfully without reading the whole query` | it answered a different question from the one asked; whatever it printed is not this query's reading |
+| `the command exited but something it started is still holding its output open` | the child is gone but a grandchild (`ssh`, `kubectl`) kept the pipe. The group is killed and the reading fails, rather than being reported as an empty answer |
+| `<path>: mode 666 -- another account can write it` | the console's own config is refused whole, and the tool STOPS. It does not fall back to the default command: that reaches a different database, whose numbers look exactly like the ones you asked for |
 | `systemctl --user is not reachable: <why>` (Linux) | no session bus, not "no jobs configured" — the two must never look alike |
 | `<path>.bak already exists: an earlier edit did not finish` | a previous `set_schedule` was interrupted before it could clean up; compare the `.bak` with the live file and remove it before editing again |
 | `the unit does not pass the check after the edit (...); the file was restored` (Linux) | `systemd-analyze --user verify` (or, failing that, a `daemon-reload` + `LoadState` check) refused the edit before anything was reloaded; nothing changed |
