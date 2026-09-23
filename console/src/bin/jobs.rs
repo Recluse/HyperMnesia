@@ -17,7 +17,7 @@ fn main() {
     // Through jobs::job_prefix rather than the variable: only that path also consults the
     // config file, and the tray -- started by the service manager with a minimal environment --
     // has nothing else to read.
-    let prefix = jobs::job_prefix();
+    let prefix = jobs::job_prefix().unwrap_or_else(|e| fail(&e));
     let all = match jobs::list(&prefix) {
         Ok(j) => j,
         Err(e) => fail(&e),

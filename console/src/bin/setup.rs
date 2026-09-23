@@ -116,7 +116,13 @@ fn walkthrough() {
         // The service manager starts the tray with a minimal environment: no login shell, none
         // of your exports. A command that reads $DATABASE_URL was verified HERE, where you have
         // it.
-        let cmd = config().get("HM_PSQL_CMD").cloned().unwrap_or_default();
+        // A config this console refuses is not a config that says "use the default": say
+        // so here rather than checking the default command for a shell variable it does
+        // not have and reporting nothing wrong.
+        let cmd = match config() {
+            Ok(c) => c.get("HM_PSQL_CMD").cloned().unwrap_or_default(),
+            Err(e) => { println!("! {e}"); String::new() }
+        };
         if let Some(var) = shell_variable_in(&cmd) {
             println!("! The command you configured uses ${var}, which this shell supplies and");
             println!("  {} does not: it starts jobs with a minimal environment. In the tray",
@@ -279,7 +285,7 @@ fn connect() -> bool {
     // Tried BEFORE it is written. Writing an untried setting hands someone a console that shows
     // an empty screen on first open -- and an empty screen is indistinguishable from an empty
     // store.
-    let t = Target { psql_cmd: cmd.clone(), ..Target::default() };
+    let t = Target::with_cmd(cmd.clone());
     let ok = match probe(&t) {
         Ok(info) => {
             println!("The database answered: {}", info.lines().next().unwrap_or(&info));
@@ -295,7 +301,12 @@ fn connect() -> bool {
         }
     };
 
-    let mut cfg: BTreeMap<String, String> = config();
+    // Merged into what is already there, so a config that cannot be read must stop the
+    // save: writing over it would silently drop every other setting in it.
+    let mut cfg: BTreeMap<String, String> = match config() {
+        Ok(c) => c,
+        Err(e) => { println!("! {e}\nNothing was written."); return false; }
+    };
     cfg.insert("HM_PSQL_CMD".into(), cmd);
     match save_config(&cfg) {
         Ok(()) => {
@@ -431,7 +442,19 @@ fn offer_hooks_block() {
 // -- the smaller commands ---------------------------------------------------------------------
 
 fn show() {
-    let cfg = config();
+    // The reason comes first and nothing else is printed: this command exists to answer
+    // "which database am I talking to", and the honest answer to a refused config is the
+    // refusal. It used to print the DEFAULT command here, which is a different store.
+    let cfg = match config() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Config file: {}", config_path().display());
+            println!("! {e}");
+            println!("Refusing to guess which database that leaves. Fix or remove the \
+file, or set HM_PSQL_CMD in the environment.");
+            return;
+        }
+    };
     println!("Config file: {}{}", config_path().display(),
              if config_path().exists() { "" } else { "  (not created yet)" });
     let from_env = std::env::var("HM_PSQL_CMD").ok().filter(|s| !s.is_empty());
@@ -453,7 +476,10 @@ fn show() {
 }
 
 fn test_current() {
-    let t = Target::default();
+    let t = match Target::from_env() {
+        Ok(t) => t,
+        Err(e) => { println!("! {e}"); return; }
+    };
     println!("Trying: {}", t.psql_cmd);
     match probe(&t) {
         Ok(info) => println!("Answers: {}", info.lines().next().unwrap_or(&info)),

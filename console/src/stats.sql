@@ -31,7 +31,10 @@ SELECT json_build_object(
      FROM (SELECT d.repo, count(DISTINCT d.id) AS docs, count(c.id) AS chunks,
                   count(c.embedding) AS embedded
              FROM documents d LEFT JOIN chunks c ON c.document_id=d.id GROUP BY d.repo) z),
- 'embedding_models', (SELECT coalesce(json_object_agg(coalesce(embedding_model,'(null)'), n),'{}')
+ -- A list with a possibly-null 'model', not a {model: count} map. The map keyed NULL as the
+ -- string '(null)', so a model literally named that would have had its chunks counted together
+ -- with the ones that have no model recorded -- two different things under one healthy number.
+ 'embedding_models', (SELECT coalesce(json_agg(json_build_object('model', embedding_model, 'n', n) ORDER BY n DESC),'[]')
      FROM (SELECT embedding_model, count(*) AS n FROM chunks WHERE embedding IS NOT NULL GROUP BY 1) w),
  'components', (SELECT coalesce(json_object_agg(repo, n),'{}')
      FROM (SELECT repo, count(*) AS n FROM components GROUP BY 1) v),

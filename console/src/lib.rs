@@ -50,28 +50,50 @@ pub const PRESETS: &[(&str, &str)] = &[
 
 pub const DEFAULT_PSQL_CMD: &str = "psql \"$DATABASE_URL\" -tAX -v ON_ERROR_STOP=1";
 
-impl Default for Target {
-    fn default() -> Self {
-        Self {
-            psql_cmd: resolve_psql_cmd(),
-            timeout: Duration::from_secs(
-                std::env::var("HM_TIMEOUT_SECS").ok()
-                    .and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or(30),
-            ),
-        }
+/// The longest timeout that can be asked for. Not a preference: `Instant::now() + timeout`
+/// panics on a duration near `u64::MAX`, and `HM_TIMEOUT_SECS=18446744073709551615` did exactly
+/// that. An hour is far past any query this console runs.
+const MAX_TIMEOUT_SECS: u64 = 3600;
+
+impl Target {
+    /// Read the environment and the config, or say why neither can be trusted.
+    ///
+    /// There is no `Default` any more, and that is the point: it could only return a `Target`,
+    /// so a refused config had to become the DEFAULT psql command -- a different database,
+    /// reported as a healthy reading. A fallible constructor lets the refusal reach the screen.
+    pub fn from_env() -> Result<Self, String> {
+        Ok(Self { psql_cmd: resolve_psql_cmd()?, timeout: timeout_from_env() })
+    }
+
+    /// A target for a command the caller already has in hand -- the setup wizard trying one
+    /// before it is written anywhere. It reads no config, so a config that is being repaired
+    /// cannot stop the repair.
+    pub fn with_cmd(psql_cmd: String) -> Self {
+        Self { psql_cmd, timeout: timeout_from_env() }
     }
 }
 
+fn timeout_from_env() -> Duration {
+    Duration::from_secs(
+        std::env::var("HM_TIMEOUT_SECS").ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0 && *n <= MAX_TIMEOUT_SECS)
+            .unwrap_or(30),
+    )
+}
+
 /// Environment, then config file, then the default -- explicit beats recorded, as everywhere
-/// else here.
-pub fn resolve_psql_cmd() -> String {
+/// else here. A config that cannot be trusted is an error, NOT a fall-through to the default:
+/// the default reaches whatever `$DATABASE_URL` points at, and its numbers are indistinguishable
+/// on screen from the ones the person was asking for.
+pub fn resolve_psql_cmd() -> Result<String, String> {
     if let Some(v) = std::env::var("HM_PSQL_CMD").ok().filter(|s| !s.is_empty()) {
-        return v;
+        return Ok(v);
     }
-    if let Some(v) = config().get("HM_PSQL_CMD").filter(|s| !s.is_empty()) {
-        return v.clone();
+    if let Some(v) = config()?.get("HM_PSQL_CMD").filter(|s| !s.is_empty()) {
+        return Ok(v.clone());
     }
-    DEFAULT_PSQL_CMD.to_string()
+    Ok(DEFAULT_PSQL_CMD.to_string())
 }
 
 /// The console's own config. Separate from the pipeline's settings file: this one holds what the
@@ -84,25 +106,27 @@ pub fn config_path() -> std::path::PathBuf {
     std::path::PathBuf::from(home).join(".config/hypermnesia/console.conf")
 }
 
-/// Why the config file must be refused, if it must be.
+/// Why the config file must be refused, if it must be -- judged on an ALREADY OPEN descriptor.
 ///
 /// The file holds the command this console hands to `sh -c` -- at every refresh, and at login
 /// with nobody watching, because the tray installs itself with RunAtLoad. So it gets the guard
 /// the pipeline's settings file already has in hooks/_mem_common.py, and a stricter one: that
 /// file can only set allowlisted variables, this one is arbitrary code.
 ///
-/// A file that is not there is not a fault: there is a working default. `Ok(())` means "use it".
+/// Taking the metadata from the descriptor rather than from the path is the whole point. The
+/// previous version called `metadata(path)` and then `read_to_string(path)` -- two separate
+/// lookups, so anyone able to create entries in that directory could let the checked file be the
+/// person's own and the READ file be theirs.
 #[cfg(unix)]
-pub fn config_fault(path: &std::path::Path) -> Result<(), String> {
+pub fn fd_fault(path: &std::path::Path, md: &std::fs::Metadata) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
     // Not libc: one extern declaration keeps the data layer dependency-free, which is the
     // reason a console built from it compiles in seconds.
     extern "C" { fn getuid() -> u32; }
-    let Ok(md) = std::fs::metadata(path) else { return Ok(()) };
     if !md.is_file() {
-        // A directory or a device here is a misconfigured HM_CONSOLE_CONFIG. Reading it fails,
-        // and falling back to the default without a word is how the console ends up talking to
-        // a different store than the person configured.
+        // A directory, a device or a fifo here is a misconfigured HM_CONSOLE_CONFIG. Reading it
+        // fails, and falling back to the default without a word is how the console ends up
+        // talking to a different store than the person configured.
         return Err(format!("{} is not a file, so nothing can be read from it", path.display()));
     }
     let mode = md.mode() & 0o777;
@@ -119,23 +143,55 @@ pub fn config_fault(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-pub fn config_fault(_path: &std::path::Path) -> Result<(), String> { Ok(()) }
+/// Open the config, check the descriptor, read the same descriptor.
+///
+/// `Ok(None)` means the file is not there, which is a working state: there is a default. Every
+/// other failure is an `Err`, and the difference matters more here than anywhere else in this
+/// file -- see `config`.
+#[cfg(unix)]
+fn read_config_file(path: &std::path::Path) -> Result<Option<String>, String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NONBLOCK so that a fifo left at this path cannot hang the console at login instead of
+    // being refused. The two values this project builds for; the constant is not in std.
+    #[cfg(target_os = "linux")]
+    const O_NONBLOCK: i32 = 0o4000;
+    #[cfg(not(target_os = "linux"))]
+    const O_NONBLOCK: i32 = 0x0004;
 
-pub fn config() -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    let path = config_path();
-    if let Err(why) = config_fault(&path) {
-        // Said once per process: this is read on every refresh, and a warning printed sixty
-        // times a minute is a warning nobody reads.
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static SAID: AtomicBool = AtomicBool::new(false);
-        if !SAID.swap(true, Ordering::Relaxed) {
-            eprintln!("hypermnesia: {why}");
-        }
-        return out;
+    let f = match std::fs::OpenOptions::new().read(true).custom_flags(O_NONBLOCK).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let md = f.metadata().map_err(|e| format!("{}: {e}", path.display()))?;
+    fd_fault(path, &md)?;
+    let mut text = String::new();
+    (&f).read_to_string(&mut text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Some(text))
+}
+
+#[cfg(not(unix))]
+fn read_config_file(path: &std::path::Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
     }
-    let Ok(text) = std::fs::read_to_string(&path) else { return out };
+}
+
+/// The console's settings -- or the reason they cannot be used.
+///
+/// `Ok` with an empty map means there is no config file. That is the ONLY absence this returns
+/// quietly. A refused file, an unreadable one, a directory where a file should be: each used to
+/// become an empty map too, and an empty map means the DEFAULT psql command -- another
+/// database. Its figures then arrived in the tray as a fresh, successful reading of a store
+/// nobody configured, which is this project's own defect class at its worst: not a stale number
+/// but somebody else's number.
+pub fn config() -> Result<BTreeMap<String, String>, String> {
+    let path = config_path();
+    let mut out = BTreeMap::new();
+    let Some(text) = read_config_file(&path)? else { return Ok(out) };
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') { continue; }
@@ -143,7 +199,7 @@ pub fn config() -> BTreeMap<String, String> {
             out.insert(k.trim().to_string(), v.trim().to_string());
         }
     }
-    out
+    Ok(out)
 }
 
 pub fn save_config(map: &BTreeMap<String, String>) -> Result<(), String> {
@@ -158,23 +214,34 @@ pub fn save_config(map: &BTreeMap<String, String>) -> Result<(), String> {
     for (k, v) in map {
         text.push_str(&format!("{k}={v}\n"));
     }
-    // Created 0600, not written and then chmodded: the connection string can carry a password,
-    // and between the write and the chmod the file exists at 0644 on a default Mac. And the
-    // result is checked -- a password left readable because a chmod quietly failed is exactly
-    // the kind of "it looked fine" this project is against.
+    // Written to a NEW neighbouring file and renamed over the destination. Writing in place had
+    // three failure modes, all of them quiet: an existing 0644 file kept that mode while the new
+    // contents -- which can carry a password -- were already on disk; the truncate happened
+    // before the write, so a failure left an empty live config while setup printed "Not
+    // written"; and a chmod by pathname lands on whatever is at the pathname by then.
     #[cfg(unix)]
     {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true).create(true).truncate(true).mode(0o600)
-            .open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        f.write_all(text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
-        // create() leaves an existing file's mode alone, so set it too.
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("{}: could not make it private ({e}) -- it may hold a \
-                                  password", path.display()))?;
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "console.conf".into());
+        let tmp = path.with_file_name(format!("{name}.new"));
+        // A leftover from an interrupted save would otherwise block every future one. Removing
+        // it first is safe in a directory only this account can write -- which is the same
+        // assumption the guard above already makes about the config itself.
+        let _ = std::fs::remove_file(&tmp);
+        let written = (|| -> std::io::Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true).create_new(true).mode(0o600).open(&tmp)?;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()?;                    // renaming over a config that is still in the
+            drop(f);                          // page cache is how an empty one survives a crash
+            std::fs::rename(&tmp, &path)
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("{}: {e} -- the previous settings are untouched", path.display()));
+        }
     }
     #[cfg(not(unix))]
     std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -195,6 +262,10 @@ pub struct Stats {
     pub stale: i64,
     pub corpus: Vec<RepoStats>,
     pub embedding_models: BTreeMap<String, i64>,
+    /// Chunks whose `embedding_model` is NULL. Its own field rather than an entry in the map:
+    /// the query used to name that bucket "(null)", which a model actually called that would
+    /// have merged with -- and a merged count of two different things reads as one healthy one.
+    pub embedding_unset: i64,
     pub components: BTreeMap<String, i64>,
     pub db_size: String,
     /// How long the reading took. Shown on screen: a console that has itself become slow should
@@ -283,10 +354,15 @@ fn run_with_timeout(cmd: &str, stdin_text: &str, timeout: Duration) -> Result<St
     let (tx_e, rx_e) = mpsc::channel();
     let mut so = child.stdout.take();
     let mut se = child.stderr.take();
+    // stdout arrives as BYTES and is turned into text once, strictly. `from_utf8_lossy` here
+    // was the earliest point at which two different names became the same `?`: by the time the
+    // parser saw them they were genuinely identical, so no amount of care further in could tell
+    // them apart. A psql that returns something which is not text is a failure, not a name.
     std::thread::spawn(move || {
         let mut b = Vec::new();
         if let Some(h) = so.as_mut() { use std::io::Read; let _ = h.read_to_end(&mut b); }
-        let _ = tx_o.send(String::from_utf8_lossy(&b).into_owned());
+        let _ = tx_o.send(String::from_utf8(b)
+            .map_err(|_| "the command's output is not valid UTF-8".to_string()));
     });
     std::thread::spawn(move || {
         let mut b = Vec::new();
@@ -311,7 +387,7 @@ fn run_with_timeout(cmd: &str, stdin_text: &str, timeout: Duration) -> Result<St
     };
     let grace = Duration::from_secs(5);
     let out = rx_o.recv_timeout(grace)
-        .map_err(|_| "the command exited but its output never arrived".to_string())?;
+        .map_err(|_| "the command exited but its output never arrived".to_string())??;
     let err = rx_e.recv_timeout(grace).unwrap_or_default();
     if !st.success() {
         // Some of these fail with everything on stdout and nothing on stderr (a preset whose
@@ -359,7 +435,12 @@ fn kill_tree(child: &mut std::process::Child) {
 pub(crate) enum Json {
     Null,
     Bool(bool),
-    Num(f64),
+    /// The number's TOKEN, exactly as it arrived. Not an `f64`: every figure in this answer is a
+    /// SQL `count(*)`, and the round trip through a float changed them without a word --
+    /// `9007199254740993` came out `…992`, `7.9` came out `7`, `1e999` came out `i64::MAX`, all
+    /// with a successful exit. Keeping the token means an unrepresentable count is an absent
+    /// number, and an absent required number is an error.
+    Num(String),
     Str(String),
     Arr(Vec<Json>),
     Obj(Vec<(String, Json)>),
@@ -374,7 +455,9 @@ impl Json {
     }
     pub(crate) fn as_i64(&self) -> Option<i64> {
         match self {
-            Json::Num(n) => Some(*n as i64),
+            // A fraction, an exponent or anything past i64 fails here rather than being
+            // rounded, truncated or saturated into a plausible count.
+            Json::Num(tok) => tok.parse().ok(),
             _ => None,
         }
     }
@@ -390,7 +473,13 @@ impl Json {
             _ => None,
         }
     }
+    pub(crate) fn is_null(&self) -> bool { matches!(self, Json::Null) }
 }
+
+/// How deep a value may nest. This query returns three levels; a hundred thousand nested arrays
+/// in a field nobody reads used to abort the whole console with a stack overflow, which is a
+/// worse answer than any error message.
+const MAX_DEPTH: usize = 32;
 
 struct Scanner<'a> {
     b: &'a [u8],
@@ -406,12 +495,15 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    fn value(&mut self) -> Result<Json, String> {
+    fn value(&mut self, depth: usize) -> Result<Json, String> {
+        if depth > MAX_DEPTH {
+            return Err(format!("nested more than {MAX_DEPTH} deep at byte {}", self.i));
+        }
         self.ws();
         match self.b.get(self.i) {
             None => Err("unexpected end of JSON".into()),
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
+            Some(b'{') => self.object(depth),
+            Some(b'[') => self.array(depth),
             Some(b'"') => Ok(Json::Str(self.string()?)),
             Some(b't') => self.lit("true", Json::Bool(true)),
             Some(b'f') => self.lit("false", Json::Bool(false)),
@@ -429,98 +521,169 @@ impl<'a> Scanner<'a> {
         }
     }
 
+    fn digits(&mut self) -> usize {
+        let start = self.i;
+        while self.i < self.b.len() && self.b[self.i].is_ascii_digit() { self.i += 1; }
+        self.i - start
+    }
+
+    /// JSON's number grammar, enforced. The previous version swallowed any run of `-+.eE0-9`
+    /// and handed it to a float parser, which happily accepted `+01`, `.5` and `1e999`. A
+    /// console that reads a damaged answer as a number is the thing this file exists to prevent.
     fn number(&mut self) -> Result<Json, String> {
         let start = self.i;
-        while self.i < self.b.len()
-            && matches!(self.b[self.i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9') {
-            self.i += 1;
+        let bad = |i: usize| format!("not a number at byte {i}");
+        if self.b.get(self.i) == Some(&b'-') { self.i += 1; }
+        match self.b.get(self.i) {
+            Some(b'0') => {
+                self.i += 1;
+                if self.b.get(self.i).is_some_and(u8::is_ascii_digit) {
+                    return Err(format!("leading zero at byte {start}"));
+                }
+            }
+            Some(c) if c.is_ascii_digit() => { self.digits(); }
+            _ => return Err(bad(start)),
         }
-        std::str::from_utf8(&self.b[start..self.i]).ok()
-            .and_then(|s| s.parse().ok())
-            .map(Json::Num)
-            .ok_or_else(|| format!("not a number at byte {start}"))
+        if self.b.get(self.i) == Some(&b'.') {
+            self.i += 1;
+            if self.digits() == 0 { return Err(bad(start)); }
+        }
+        if matches!(self.b.get(self.i), Some(b'e') | Some(b'E')) {
+            self.i += 1;
+            if matches!(self.b.get(self.i), Some(b'+') | Some(b'-')) { self.i += 1; }
+            if self.digits() == 0 { return Err(bad(start)); }
+        }
+        std::str::from_utf8(&self.b[start..self.i]).map(|s| Json::Num(s.to_string()))
+            .map_err(|_| bad(start))
+    }
+
+    fn hex4(&mut self) -> Result<u32, String> {
+        let hex = self.b.get(self.i..self.i + 4)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .ok_or("short \\u escape")?;
+        let n = u32::from_str_radix(hex, 16).map_err(|_| format!("bad \\u escape {hex:?}"))?;
+        self.i += 4;
+        Ok(n)
     }
 
     /// Reads a string INCLUDING its escapes, which is the whole point: a `"` or `]` inside a
     /// value must not be mistaken for structure.
+    ///
+    /// Bytes are collected and validated as UTF-8 once at the end -- the same rule the reader
+    /// in `run_with_timeout` now applies to the whole answer, which is where raw bad bytes are
+    /// actually stopped. Replacing bad input with `U+FFFD` as it went was not leniency but data
+    /// loss: two different model names decoded to the same `?`, overwrote one another in the
+    /// count map, and took the "more than one embedding model" warning down with them.
     fn string(&mut self) -> Result<String, String> {
         if self.b.get(self.i) != Some(&b'"') {
             return Err(format!("expected a string at byte {}", self.i));
         }
         self.i += 1;
-        let mut out = String::new();
+        let mut out: Vec<u8> = Vec::new();
         while let Some(&c) = self.b.get(self.i) {
             self.i += 1;
             match c {
-                b'"' => return Ok(out),
+                b'"' => return String::from_utf8(out)
+                    .map_err(|_| "a string in the answer is not valid UTF-8".to_string()),
                 b'\\' => {
                     let e = *self.b.get(self.i).ok_or("unfinished escape")?;
                     self.i += 1;
-                    match e {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'n' => out.push('\n'),
-                        b't' => out.push('\t'),
-                        b'r' => out.push('\r'),
-                        b'b' => out.push('\u{8}'),
-                        b'f' => out.push('\u{c}'),
+                    let ch = match e {
+                        b'"' => '"',
+                        b'\\' => '\\',
+                        b'/' => '/',
+                        b'n' => '\n',
+                        b't' => '\t',
+                        b'r' => '\r',
+                        b'b' => '\u{8}',
+                        b'f' => '\u{c}',
                         b'u' => {
-                            let hex = self.b.get(self.i..self.i + 4)
-                                .and_then(|h| std::str::from_utf8(h).ok())
-                                .ok_or("short \\u escape")?;
-                            let n = u32::from_str_radix(hex, 16).map_err(|e| e.to_string())?;
-                            self.i += 4;
-                            out.push(char::from_u32(n).unwrap_or('\u{fffd}'));
+                            let n = self.hex4()?;
+                            match n {
+                                // A high surrogate must be followed by its low half: the pair is
+                                // ONE character. Decoded separately they both became U+FFFD.
+                                0xD800..=0xDBFF => {
+                                    if self.b.get(self.i..self.i + 2) != Some(b"\\u") {
+                                        return Err("a \\u escape is half of a surrogate pair \
+                                                    with nothing after it".into());
+                                    }
+                                    self.i += 2;
+                                    let lo = self.hex4()?;
+                                    if !(0xDC00..=0xDFFF).contains(&lo) {
+                                        return Err("a surrogate pair whose second half is not \
+                                                    a low surrogate".into());
+                                    }
+                                    let c = 0x10000 + ((n - 0xD800) << 10) + (lo - 0xDC00);
+                                    char::from_u32(c).ok_or("an impossible \\u escape")?
+                                }
+                                0xDC00..=0xDFFF => {
+                                    return Err("a low surrogate with no high half before it"
+                                               .into());
+                                }
+                                _ => char::from_u32(n).ok_or("an impossible \\u escape")?,
+                            }
                         }
-                        other => out.push(other as char),
-                    }
+                        other => {
+                            return Err(format!("unknown escape \\{} in a string",
+                                               other as char));
+                        }
+                    };
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                 }
-                _ => {
-                    // Multi-byte UTF-8 passes through byte by byte; collecting bytes and
-                    // converting at the end keeps names like `Документ` intact.
-                    let start = self.i - 1;
-                    let mut end = self.i;
-                    while end < self.b.len() && self.b[end] & 0xC0 == 0x80 { end += 1; }
-                    out.push_str(&String::from_utf8_lossy(&self.b[start..end]));
-                    self.i = end;
-                }
+                // A raw control character is not allowed in a JSON string, and a literal NUL
+                // inside a model name is a sign the answer is not what it claims to be.
+                0x00..=0x1F => return Err(format!("a raw control byte {c:#04x} in a string")),
+                _ => out.push(c),
             }
         }
         Err("unterminated string".into())
     }
 
-    fn object(&mut self) -> Result<Json, String> {
+    /// `,` separates, it does not decorate. The previous version treated a comma as "skip me",
+    /// which accepted `{,,,"memories":{"total":7 "active":5,},}` -- a missing comma between two
+    /// fields silently became one field too.
+    fn object(&mut self, depth: usize) -> Result<Json, String> {
         self.i += 1;                              // '{'
-        let mut kv = Vec::new();
+        let mut kv: Vec<(String, Json)> = Vec::new();
+        self.ws();
+        if self.b.get(self.i) == Some(&b'}') { self.i += 1; return Ok(Json::Obj(kv)); }
         loop {
             self.ws();
-            match self.b.get(self.i) {
-                Some(b'}') => { self.i += 1; return Ok(Json::Obj(kv)); }
-                Some(b',') => { self.i += 1; continue; }
-                None => return Err("unterminated object".into()),
-                _ => {}
-            }
             let k = self.string()?;
+            // Duplicates used to resolve two different ways in the same answer -- first wins in
+            // `get`, last wins in `counts`. Neither is a reading of anything.
+            if kv.iter().any(|(seen, _)| *seen == k) {
+                return Err(format!("the key {k:?} appears twice"));
+            }
             self.ws();
             if self.b.get(self.i) != Some(&b':') {
                 return Err(format!("expected ':' after {k:?}"));
             }
             self.i += 1;
-            kv.push((k, self.value()?));
+            let v = self.value(depth + 1)?;
+            kv.push((k, v));
+            self.ws();
+            match self.b.get(self.i) {
+                Some(b',') => { self.i += 1; }
+                Some(b'}') => { self.i += 1; return Ok(Json::Obj(kv)); }
+                _ => return Err(format!("expected ',' or '}}' at byte {}", self.i)),
+            }
         }
     }
 
-    fn array(&mut self) -> Result<Json, String> {
+    fn array(&mut self, depth: usize) -> Result<Json, String> {
         self.i += 1;                              // '['
         let mut out = Vec::new();
+        self.ws();
+        if self.b.get(self.i) == Some(&b']') { self.i += 1; return Ok(Json::Arr(out)); }
         loop {
+            out.push(self.value(depth + 1)?);
             self.ws();
             match self.b.get(self.i) {
+                Some(b',') => { self.i += 1; }
                 Some(b']') => { self.i += 1; return Ok(Json::Arr(out)); }
-                Some(b',') => { self.i += 1; continue; }
-                None => return Err("unterminated array".into()),
-                _ => out.push(self.value()?),
+                _ => return Err(format!("expected ',' or ']' at byte {}", self.i)),
             }
         }
     }
@@ -528,12 +691,56 @@ impl<'a> Scanner<'a> {
 
 pub(crate) fn parse_json(raw: &str) -> Result<Json, String> {
     let mut sc = Scanner::new(raw);
-    let v = sc.value()?;
+    let v = sc.value(0)?;
     sc.ws();
     if sc.i < sc.b.len() {
         return Err(format!("trailing data after the JSON value at byte {}", sc.i));
     }
     Ok(v)
+}
+
+/// A field `stats.sql` ALWAYS supplies -- including for a completely empty store, which is what
+/// the `coalesce(…, '{}')` and `'[]'` in that query are for.
+///
+/// So a missing or mistyped one does not mean "nothing there", it means the answer did not come
+/// from this query, and the console has to say so rather than print the zeroes that absence
+/// would otherwise become. An empty store and somebody else's answer are the one pair this
+/// console exists to keep apart: `{"memories":{"total":7,"active":5}}` used to exit 0 and report
+/// an empty corpus, an empty review queue, no stale memories and no pages.
+fn need<'a>(v: &'a Json, key: &str, whose: &str) -> Result<&'a Json, String> {
+    v.get(key).ok_or_else(|| format!("{whose}{key:?} is missing -- this is not the stats query"))
+}
+
+fn need_i64(v: &Json, key: &str, whose: &str) -> Result<i64, String> {
+    need(v, key, whose)?.as_i64()
+        .ok_or_else(|| format!("{whose}{key:?} is not a whole number"))
+}
+
+fn need_str<'a>(v: &'a Json, key: &str, whose: &str) -> Result<&'a str, String> {
+    need(v, key, whose)?.as_str()
+        .ok_or_else(|| format!("{whose}{key:?} is not a string"))
+}
+
+fn need_arr<'a>(v: &'a Json, key: &str, whose: &str) -> Result<&'a [Json], String> {
+    need(v, key, whose)?.as_arr()
+        .ok_or_else(|| format!("{whose}{key:?} is not a list"))
+}
+
+/// A `{name: count}` map, with every entry required to BE a count. `filter_map` here used to
+/// make a malformed entry vanish, which prints as a smaller store rather than as a problem.
+fn need_counts(v: &Json, key: &str, whose: &str) -> Result<BTreeMap<String, i64>, String> {
+    let mut out = BTreeMap::new();
+    match need(v, key, whose)? {
+        Json::Obj(kv) => {
+            for (k, val) in kv {
+                let n = val.as_i64()
+                    .ok_or_else(|| format!("{whose}{key:?}: {k:?} is not a whole number"))?;
+                out.insert(k.clone(), n);
+            }
+            Ok(out)
+        }
+        _ => Err(format!("{whose}{key:?} is not an object")),
+    }
 }
 
 fn parse(raw: &str) -> Result<Stats, String> {
@@ -548,57 +755,49 @@ fn parse(raw: &str) -> Result<Stats, String> {
         format!("the answer is not the JSON this query returns ({e}); it began: {head:?}")
     })?;
 
-    // Two fields are required, and their absence is an ERROR rather than a zero. Everything the
-    // console prints hangs off this answer, so an answer that merely parsed -- someone's
-    // `SELECT 1`, a wrapper script's status line -- must not become a complete dashboard reading
-    // zero everywhere. That is indistinguishable from a healthy empty store.
-    let mem = v.get("memories")
-        .ok_or("the answer parsed but has no \"memories\" -- this is not the stats query")?;
+    let mem = need(&v, "memories", "")?;
     let mut s = Stats {
-        memories_total: mem.get("total").and_then(Json::as_i64)
-            .ok_or("\"memories.total\" is missing or not a number")?,
-        memories_active: mem.get("active").and_then(Json::as_i64)
-            .ok_or("\"memories.active\" is missing or not a number")?,
+        memories_total: need_i64(mem, "total", "memories.")?,
+        memories_active: need_i64(mem, "active", "memories.")?,
+        pages: need_i64(mem, "pages", "memories.")?,
+        by_type: need_counts(mem, "by_type", "memories.")?,
+        stale: need_i64(&v, "stale", "")?,
+        db_size: need_str(&v, "db_size", "")?.to_string(),
+        components: need_counts(&v, "components", "")?,
         ..Stats::default()
     };
-    s.pages = mem.get("pages").and_then(Json::as_i64).unwrap_or(0);
-    s.by_type = counts(mem.get("by_type"));
-    s.by_project = mem.get("by_project").and_then(Json::as_arr).map(|rows| {
-        rows.iter().filter_map(|r| {
-            let n = r.get("n").and_then(Json::as_i64)?;
-            Some((r.get("project").and_then(Json::as_str).unwrap_or("(none)").to_string(), n))
-        }).collect()
-    }).unwrap_or_default();
+    let q = need(&v, "review_queue", "")?;
+    s.review_pending = need_i64(q, "pending", "review_queue.")?;
+    s.review_oldest_days = need_i64(q, "oldest_days", "review_queue.")?;
 
-    if let Some(q) = v.get("review_queue") {
-        s.review_pending = q.get("pending").and_then(Json::as_i64).unwrap_or(0);
-        s.review_oldest_days = q.get("oldest_days").and_then(Json::as_i64).unwrap_or(0);
+    for r in need_arr(mem, "by_project", "memories.")? {
+        s.by_project.push((need_str(r, "project", "memories.by_project[].")?.to_string(),
+                           need_i64(r, "n", "memories.by_project[].")?));
     }
-    s.stale = v.get("stale").and_then(Json::as_i64).unwrap_or(0);
-    s.db_size = v.get("db_size").and_then(Json::as_str).unwrap_or_default().to_string();
-    s.embedding_models = counts(v.get("embedding_models"));
-    s.components = counts(v.get("components"));
-    s.corpus = v.get("corpus").and_then(Json::as_arr).map(|rows| {
-        rows.iter().filter_map(|r| Some(RepoStats {
-            repo: r.get("repo").and_then(Json::as_str)?.to_string(),
-            docs: r.get("docs").and_then(Json::as_i64).unwrap_or(0),
-            chunks: r.get("chunks").and_then(Json::as_i64).unwrap_or(0),
-            embedded: r.get("embedded").and_then(Json::as_i64).unwrap_or(0),
-        })).collect()
-    }).unwrap_or_default();
-    Ok(s)
-}
-
-fn counts(v: Option<&Json>) -> BTreeMap<String, i64> {
-    let mut out = BTreeMap::new();
-    if let Some(Json::Obj(kv)) = v {
-        for (k, val) in kv {
-            if let Some(n) = val.as_i64() {
-                out.insert(k.clone(), n);
-            }
+    for r in need_arr(&v, "corpus", "")? {
+        s.corpus.push(RepoStats {
+            repo: need_str(r, "repo", "corpus[].")?.to_string(),
+            docs: need_i64(r, "docs", "corpus[].")?,
+            chunks: need_i64(r, "chunks", "corpus[].")?,
+            embedded: need_i64(r, "embedded", "corpus[].")?,
+        });
+    }
+    // A list, not a `{model: count}` map, because a chunk with NO recorded model has to stay
+    // distinguishable from one whose model is literally named "(null)" -- the query used to
+    // coalesce both into the same key, merging their counts. JSON null cannot collide with a
+    // string.
+    for r in need_arr(&v, "embedding_models", "")? {
+        let n = need_i64(r, "n", "embedding_models[].")?;
+        let m = need(r, "model", "embedding_models[].")?;
+        if m.is_null() {
+            s.embedding_unset += n;
+        } else {
+            let name = m.as_str()
+                .ok_or("\"embedding_models[].model\" is neither a string nor null")?;
+            s.embedding_models.insert(name.to_string(), n);
         }
     }
-    out
+    Ok(s)
 }
 
 #[cfg(test)]
@@ -607,7 +806,14 @@ mod tests {
 
     // A shortened snapshot of a real answer from a live store. The parser is checked against the
     // shape stats.sql actually returns, not one invented for the test.
-    const SAMPLE: &str = r#"{"memories" : {"total" : 682, "active" : 483, "by_type" : { "semantic" : 90, "preference" : 139 }, "by_project" : [{"project" : "(none)", "n" : 83}, {"project" : "myrepo", "n" : 68}], "pages" : 17}, "review_queue" : {"pending" : 0, "oldest_days" : 0}, "stale" : 0, "corpus" : [{"repo" : "myrepo", "docs" : 438, "chunks" : 7780, "embedded" : 7780}, {"repo" : "myrepo~mem", "docs" : 1, "chunks" : 1, "embedded" : 1}], "embedding_models" : { "bge-m3" : 25035 }, "components" : { "myrepo" : 20, "infra" : 38 }, "db_size" : "430 MB"}"#;
+    const SAMPLE: &str = r#"{"memories" : {"total" : 682, "active" : 483, "by_type" : { "semantic" : 90, "preference" : 139 }, "by_project" : [{"project" : "(none)", "n" : 83}, {"project" : "myrepo", "n" : 68}], "pages" : 17}, "review_queue" : {"pending" : 0, "oldest_days" : 0}, "stale" : 0, "corpus" : [{"repo" : "myrepo", "docs" : 438, "chunks" : 7780, "embedded" : 7780}, {"repo" : "myrepo~mem", "docs" : 1, "chunks" : 1, "embedded" : 1}], "embedding_models" : [{"model" : "bge-m3", "n" : 25035}], "components" : { "myrepo" : 20, "infra" : 38 }, "db_size" : "430 MB"}"#;
+
+    /// A complete answer with the three parts a test might want to vary. Every field is
+    /// required now, so a test probing ONE of them still has to supply the rest -- which is the
+    /// point of the change: an answer missing the others is itself the error.
+    fn answer(by_project: &str, corpus: &str, models: &str) -> String {
+        format!(r#"{{"memories":{{"total":1,"active":1,"by_type":{{}},"by_project":{by_project},"pages":0}},"review_queue":{{"pending":0,"oldest_days":0}},"stale":0,"corpus":{corpus},"embedding_models":{models},"components":{{}},"db_size":"1 MB"}}"#)
+    }
 
     #[test]
     fn parses_a_real_answer() {
@@ -621,6 +827,7 @@ mod tests {
         assert_eq!(s.review_pending, 0);
         assert_eq!(s.db_size, "430 MB");
         assert_eq!(s.embedding_models.get("bge-m3"), Some(&25035));
+        assert_eq!(s.embedding_unset, 0);
         assert_eq!(s.components.get("infra"), Some(&38));
         assert_eq!(s.corpus.len(), 2);
         assert_eq!(s.corpus[0].docs, 438);
@@ -653,8 +860,8 @@ mod tests {
     /// `docs=0 chunks=7780` for a row that says 438 docs.
     #[test]
     fn a_repo_named_like_a_key_does_not_shadow_it() {
-        let raw = r#"{"memories":{"total":1,"active":1},"corpus":[{"repo":"docs","docs":438,"chunks":7780,"embedded":7780}]}"#;
-        let s = parse(raw).expect("parse");
+        let raw = answer("[]", r#"[{"repo":"docs","docs":438,"chunks":7780,"embedded":7780}]"#, "[]");
+        let s = parse(&raw).expect("parse");
         assert_eq!(s.corpus.len(), 1);
         assert_eq!(s.corpus[0].repo, "docs");
         assert_eq!(s.corpus[0].docs, 438);
@@ -665,8 +872,8 @@ mod tests {
     /// name silently dropped every project after it.
     #[test]
     fn a_bracket_inside_a_name_does_not_truncate_the_list() {
-        let raw = r#"{"memories":{"total":2,"active":2,"by_project":[{"project":"a[1]","n":5},{"project":"b","n":7}]}}"#;
-        let s = parse(raw).expect("parse");
+        let raw = answer(r#"[{"project":"a[1]","n":5},{"project":"b","n":7}]"#, "[]", "[]");
+        let s = parse(&raw).expect("parse");
         assert_eq!(s.by_project.len(), 2);
         assert_eq!(s.by_project[0].0, "a[1]");
         assert_eq!(s.by_project[1].1, 7);
@@ -676,8 +883,8 @@ mod tests {
     /// not end it, and `\u` must decode.
     #[test]
     fn escapes_inside_names_are_decoded_not_obeyed() {
-        let raw = r#"{"memories":{"total":1,"active":1,"by_project":[{"project":"a\"b\\cA","n":3}]}}"#;
-        let s = parse(raw).expect("parse");
+        let raw = answer(r#"[{"project":"a\"b\\cA","n":3}]"#, "[]", "[]");
+        let s = parse(&raw).expect("parse");
         assert_eq!(s.by_project[0].0, "a\"b\\cA");
     }
 
@@ -700,6 +907,10 @@ mod tests {
     /// account can write is refused whole, and the refusal is the value of this test: verified by
     /// hand before it was written, a mode-0666 config containing `touch FILE; echo "{}"` created
     /// the file and printed a clean empty dashboard.
+    ///
+    /// Exercised through `read_config_file`, which is the path the console actually takes:
+    /// checking the guard alone would no longer prove anything, because the guard now judges the
+    /// descriptor that gets read rather than a second lookup of the same name.
     #[cfg(unix)]
     #[test]
     fn a_config_anyone_can_write_is_refused() {
@@ -710,17 +921,163 @@ mod tests {
         std::fs::write(&path, "HM_PSQL_CMD=echo nope\n").unwrap();
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(config_fault(&path).is_ok(), "a private file must be usable");
+        assert_eq!(read_config_file(&path).expect("a private file must be usable"),
+                   Some("HM_PSQL_CMD=echo nope\n".to_string()));
 
         for bad in [0o666, 0o622, 0o662] {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(bad)).unwrap();
-            let why = config_fault(&path).expect_err("mode {bad:o} must be refused");
+            let why = read_config_file(&path).expect_err("mode {bad:o} must be refused");
             assert!(why.contains("write"), "the refusal must say why: {why}");
         }
 
-        // A file that is not there is not a fault -- there is a working default.
-        assert!(config_fault(&dir.join("absent.conf")).is_ok());
+        // A file that is not there is not a fault -- there is a working default. Anything else
+        // IS a fault: both used to come back as an empty map, and an empty map means the
+        // default command, which is a different database.
+        assert_eq!(read_config_file(&dir.join("absent.conf")).expect("absence is not a fault"),
+                   None);
+        assert!(read_config_file(&dir).is_err(), "a directory is not a config");
+        // `/dev/null/not-a-file` was the audit's case: a path UNDER something that is not a
+        // directory. It came back as an absence and the default database was chosen silently.
+        assert!(read_config_file(&path.join("deeper")).is_err(),
+                "a path under a plain file is an error, not an absence");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Saving must not widen the file, and must not leave the previous one destroyed. Verified
+    /// against the failure it replaces: writing in place left an existing 0644 file at 0644
+    /// while the password was already in it.
+    #[cfg(unix)]
+    #[test]
+    fn saving_leaves_a_private_file_and_no_leftovers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join("hm-console-save-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("console.conf");
+        // The wizard writes wherever HM_CONSOLE_CONFIG points, so the test drives the real one.
+        std::env::set_var("HM_CONSOLE_CONFIG", &path);
+
+        std::fs::write(&path, "HM_PSQL_CMD=old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut cfg = BTreeMap::new();
+        cfg.insert("HM_PSQL_CMD".to_string(), "psql \"$DATABASE_URL\" -tAX".to_string());
+        save_config(&cfg).expect("save");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a file that held a password must not stay group-readable");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("DATABASE_URL"));
+        assert!(!dir.join("console.conf.new").exists(), "the temporary file must be gone");
+
+        std::env::remove_var("HM_CONSOLE_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every field this query always supplies is required. `{"memories":{"total":7,"active":5}}`
+    /// used to exit 0 and draw a complete dashboard: empty corpus, empty review queue, no stale
+    /// memories, no pages -- which is exactly what a healthy empty store looks like. An answer
+    /// that is not this query's must not be able to impersonate one.
+    #[test]
+    fn a_partial_answer_is_not_an_empty_store() {
+        assert!(parse(r#"{"memories":{"total":7,"active":5}}"#).is_err());
+        let full = answer("[]", "[]", "[]");
+        parse(&full).expect("the complete shape still parses");
+        for drop in ["\"stale\":0,", "\"components\":{},", ",\"pages\":0", "\"by_type\":{},",
+                     "\"review_queue\":{\"pending\":0,\"oldest_days\":0},"] {
+            let damaged = full.replace(drop, "");
+            assert_ne!(damaged, full, "the fixture must actually contain {drop}");
+            assert!(parse(&damaged).is_err(), "a missing {drop} became a zero");
+        }
+        // A field of the wrong type is the same lie by another route.
+        assert!(parse(&full.replace("\"stale\":0", "\"stale\":\"none\"")).is_err());
+        assert!(parse(&full.replace("\"components\":{}", "\"components\":[]")).is_err());
+        // ...and so is a row inside a collection that is missing a column: `filter_map` used to
+        // make such a row vanish, which prints as a smaller store rather than as a problem.
+        assert!(parse(&answer("[]", r#"[{"repo":"x","docs":1,"chunks":2}]"#, "[]")).is_err());
+        assert!(parse(&answer(r#"[{"n":5}]"#, "[]", "[]")).is_err());
+    }
+
+    /// Counts come from `count(*)` and must arrive unchanged. Every one of these used to pass
+    /// through an f64 and a saturating cast, and every one exited 0: `9007199254740993` printed
+    /// as `…992`, `7.9` as `7`, `1e999` as `i64::MAX`.
+    #[test]
+    fn counts_are_not_rounded_through_a_float() {
+        let big = answer("[]", "[]", "[]").replace("\"total\":1", "\"total\":9007199254740993");
+        assert_eq!(parse(&big).expect("parse").memories_total, 9007199254740993);
+        for wrong in ["7.9", "1e999", "-0.5", "1e30"] {
+            let raw = answer("[]", "[]", "[]").replace("\"total\":1", &format!("\"total\":{wrong}"));
+            assert!(parse(&raw).is_err(), "{wrong} was accepted as a count");
+        }
+    }
+
+    /// Two names that differ must stay two names. Decoding bad input to U+FFFD as it went was
+    /// not leniency but a merge: these two emoji escapes both became `?`, one count overwrote
+    /// the other, and the "more than one embedding model" warning went quiet with them.
+    #[test]
+    fn two_names_that_differ_must_not_decode_to_one() {
+        let pair = r#"[{"model":"😀","n":11},{"model":"😁","n":22}]"#;
+        let s = parse(&answer("[]", "[]", pair)).expect("a surrogate pair is one character");
+        assert_eq!(s.embedding_models.len(), 2, "two models, and the warning depends on it");
+        assert_eq!(s.embedding_models.get("\u{1f600}"), Some(&11));
+        // Half a pair is not a character. Accepting it is how the two above became one.
+        for half in [r#"[{"model":"\ud83d","n":1}]"#, r#"[{"model":"\ude00","n":1}]"#,
+                     r#"[{"model":"\ud83dA","n":1}]"#] {
+            assert!(parse(&answer("[]", "[]", half)).is_err(), "accepted a lone surrogate: {half}");
+        }
+    }
+
+    /// Bad bytes from the command are a failure, not a name. They used to be replaced with
+    /// U+FFFD before anything could look at them, so two different model names arrived at the
+    /// parser genuinely identical -- one count overwrote the other and the "more than one
+    /// embedding model" warning went quiet.
+    #[cfg(unix)]
+    #[test]
+    fn output_that_is_not_text_is_a_failure_not_a_name() {
+        let ok = run_with_timeout("printf 'hello'", "", Duration::from_secs(10));
+        assert_eq!(ok.as_deref(), Ok("hello"), "ordinary output still works");
+        let bad = run_with_timeout(r"printf 'a\377b'", "", Duration::from_secs(10))
+            .expect_err("invalid UTF-8 must not become a name");
+        assert!(bad.contains("UTF-8"), "the refusal must say why: {bad}");
+    }
+
+    /// A chunk with no recorded model is not a model named "(null)". The query used to coalesce
+    /// them into one key, so their counts merged into a single healthy-looking number.
+    #[test]
+    fn a_chunk_with_no_model_is_not_a_model_named_null() {
+        let both = r#"[{"model":null,"n":9},{"model":"(null)","n":4}]"#;
+        let s = parse(&answer("[]", "[]", both)).expect("parse");
+        assert_eq!(s.embedding_unset, 9);
+        assert_eq!(s.embedding_models.get("(null)"), Some(&4));
+        assert_eq!(s.embedding_models.len(), 1, "the unnamed bucket is not a model");
+    }
+
+    /// Damaged JSON is not a reading. Every one of these used to parse successfully.
+    #[test]
+    fn damaged_json_is_refused() {
+        let full = answer("[]", "[]", "[]");
+        for (what, raw) in [
+            ("a missing comma between fields", full.replace("\"total\":1,", "\"total\":1 ")),
+            ("a leading comma", full.replace("{\"memories\"", "{,\"memories\"")),
+            ("a trailing comma", full.replace("\"pages\":0}", "\"pages\":0,}")),
+            ("a repeated key", full.replace("\"stale\":0", "\"stale\":0,\"stale\":99")),
+            ("a leading plus", full.replace("\"stale\":0", "\"stale\":+01")),
+            ("a bare fraction", full.replace("\"stale\":0", "\"stale\":.5")),
+            ("an unknown escape", full.replace("\"1 MB\"", "\"1\\qMB\"")),
+            ("a raw NUL in a string", full.replace("\"1 MB\"", "\"1\0MB\"")),
+            ("a repeated comma in a list", full.replace("\"corpus\":[]", "\"corpus\":[,]")),
+        ] {
+            assert!(parse(&raw).is_err(), "{what} was accepted");
+        }
+    }
+
+    /// Deep nesting must be an error, not a crash. Verified before the limit existed: a hundred
+    /// thousand nested arrays in a field nobody reads aborted the release binary with a stack
+    /// overflow -- the one answer worse than a wrong number.
+    #[test]
+    fn deep_nesting_is_an_error_not_a_crash() {
+        let deep = format!("{}{}", "[".repeat(5000), "]".repeat(5000));
+        let raw = answer("[]", "[]", "[]").replace("\"corpus\":[]", &format!("\"corpus\":{deep}"));
+        assert!(parse(&raw).is_err(), "deep nesting must be refused");
     }
 
     #[test]

@@ -18,7 +18,7 @@ fn main() {
         print!("{}", HELP);
         return;
     }
-    let t = Target::default();
+    let t = Target::from_env().unwrap_or_else(|e| fail(&e));
 
     if args.iter().any(|a| a == "--json") {
         // The raw answer: if the parser loses something, comparing the two modes shows it.
@@ -68,15 +68,22 @@ fn render(s: &Stats) {
                  chunks - embedded);
     }
     println!("  page mirrors    {mdocs} (<project>~mem tags; the document search sees them)");
-    println!("  models          {}", if s.embedding_models.len() == 1 {
-        s.embedding_models.keys().next().cloned().unwrap_or_default()
-    } else {
+    println!("  models          {}", match s.embedding_models.len() {
+        0 => "none recorded".to_string(),
+        1 => s.embedding_models.keys().next().cloned().unwrap_or_default(),
         // Two models in one store means part of the corpus is unreachable: the vectors cannot
         // be compared with one another.
-        format!("! {} DIFFERENT: {}", s.embedding_models.len(),
-                s.embedding_models.iter().map(|(m, n)| format!("{m} {n}"))
-                    .collect::<Vec<_>>().join(", "))
+        n => format!("! {n} DIFFERENT: {}",
+                     s.embedding_models.iter().map(|(m, c)| format!("{m} {c}"))
+                         .collect::<Vec<_>>().join(", ")),
     });
+    if s.embedding_unset > 0 {
+        // Counted apart from the named models, not folded in under "(null)": a model with that
+        // name would have merged with them, and one number over two different things is the
+        // substitution this console refuses everywhere else.
+        println!("  ! {} embedded chunks record no model -- which one they can be compared \
+                  with is unknown", s.embedding_unset);
+    }
     println!("  Tier 0/1 map    {}",
              s.components.iter().map(|(r, n)| format!("{r} {n}")).collect::<Vec<_>>().join(", "));
 

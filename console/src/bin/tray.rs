@@ -135,7 +135,10 @@ still for a little while after a button is pressed.
     fn read_jobs() -> (Vec<Job>, Option<String>) {
         // Through jobs::job_prefix rather than a cached value: the tray runs for weeks, and a
         // prefix fixed in the config file in the meantime has to reach it without a restart.
-        match jobs::list(&jobs::job_prefix()) {
+        // A refused config is reported in the same place a failed listing is, rather than
+        // falling back to the default prefix: that prefix matches nothing in an installation
+        // that renamed its jobs, and an empty list reads as "no jobs installed".
+        match jobs::job_prefix().and_then(|p| jobs::list(&p)) {
             Ok(j) => (j, None),
             Err(e) => (Vec::new(), Some(e)),
         }
@@ -148,7 +151,7 @@ still for a little while after a button is pressed.
                 // Re-read the settings on every pass rather than once at startup. The tray runs
                 // for weeks; a connection fixed with the setup wizard in the meantime has to
                 // reach the running tray, or the fix looks like it did not work.
-                match fetch(&Target::default()) {
+                match Target::from_env().and_then(|t| fetch(&t)) {
                     Ok(stats) => {
                         let _ = tx.send(Update::Data(Box::new(Snapshot { stats, at: SystemTime::now() })));
                     }

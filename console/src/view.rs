@@ -43,6 +43,10 @@ pub fn summary(s: &Stats) -> Vec<String> {
         // Two models in one store means part of the corpus cannot be reached by meaning at all.
         out.push(format!("! embedding models: {}", s.embedding_models.len()));
     }
+    if s.embedding_unset > 0 {
+        // Its own line rather than a model called "(null)": see Stats::embedding_unset.
+        out.push(format!("! chunks with no model recorded: {}", s.embedding_unset));
+    }
     // Marked when there is something in it, so the title can be derived from these lines rather
     // than from a second list of conditions kept in step by hand.
     out.push(if s.review_pending > 0 {

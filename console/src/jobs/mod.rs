@@ -88,17 +88,21 @@ pub const UNITS_LOCATION: &str = "wherever this platform's scheduled jobs live";
 /// installation whose jobs are named differently could set HM_JOB_PREFIX in its shell forever and
 /// the tray would still show an empty job list -- while every command run by hand showed the
 /// right one.
-pub fn job_prefix() -> String {
+/// Fallible for the same reason `resolve_psql_cmd` is: a config this console has refused is not
+/// a config that says "use the default". The default prefix matches nothing in an installation
+/// that renamed its jobs, and a job list that matches nothing prints exactly like one with no
+/// jobs installed.
+pub fn job_prefix() -> Result<String, String> {
     if let Some(v) = std::env::var("HM_JOB_PREFIX").ok().filter(|s| !s.is_empty()) {
-        return v;
+        return Ok(v);
     }
     // Filtered the same way as the environment: an empty HM_JOB_PREFIX in the config makes
     // `starts_with` match every job the person owns, and this module edits and restarts what it
     // lists.
-    if let Some(v) = crate::config().get("HM_JOB_PREFIX").filter(|s| !s.is_empty()) {
-        return v.clone();
+    if let Some(v) = crate::config()?.get("HM_JOB_PREFIX").filter(|s| !s.is_empty()) {
+        return Ok(v.clone());
     }
-    DEFAULT_JOB_PREFIX.to_string()
+    Ok(DEFAULT_JOB_PREFIX.to_string())
 }
 
 /// One calendar slot, as launchd stores it -- and as a systemd `OnCalendar=` line is parsed into,
