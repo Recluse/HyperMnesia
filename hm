@@ -73,10 +73,14 @@ cmd_init() {
         sleep 1
     done
 
-    step "Loading the schema (both files are idempotent)"
+    # mem_multiuser.sql belongs here even for one person: every memory write inserts `author`
+    # and `scope`, which schema_mem.sql does not define, so without it the first write dies
+    # with UndefinedColumn -- and dies QUIETLY, because the hooks are fail-open and `hm doctor`
+    # only checks that mem.memories exists. All three are idempotent.
+    step "Loading the schema (all three files are idempotent)"
     docker compose -f "$ROOT/deploy/docker/docker-compose.yml" exec -T postgres \
         psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-        -f /sql/schema.sql -f /sql/schema_mem.sql >/dev/null
+        -f /sql/schema.sql -f /sql/schema_mem.sql -f /sql/mem_multiuser.sql >/dev/null
 
     url="postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@localhost:$PG_PORT/$POSTGRES_DB"
     cat <<EOF

@@ -118,9 +118,10 @@ pass.
 
 **Personal memory (background):** capture hooks enqueue session transcripts; a scheduled job
 distills them to memories via a pluggable LLM; a daily consolidator merges near-duplicates behind
-a confidence gate + review queue; a weekly reflect pass synthesizes each project's memories into
-one knowledge page, published as a document under a sibling `<project>~mem` tag so doc search can
-reach it. Recall/profile hooks inject relevant memories into the prompt.
+a confidence gate + review queue; a weekly reflect pass synthesizes each project's SHARED memories into
+one knowledge page, stored as a memory (`metadata.kind='page'`) that recall can surface as a
+single overview. Recall/profile hooks inject relevant memories into the prompt, scoped to the
+reader — see `MEMORY.md`.
 
 **Configuration (shared):** the tunables the passes read — thresholds, model names, batch sizes —
 come from one file, `~/.claude/hypermnesia.env`, loaded on import by `hooks/_mem_common.py` and

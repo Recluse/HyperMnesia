@@ -4,12 +4,16 @@ The `mem.*` schema stores durable, non-derivable facts about you and your work �
 decisions and their reasons, standing constraints, open intentions — so the agent stops
 re-learning them every session. Free text is the primary representation; structure is optional.
 
+"Personal" is about the kind of fact, not the number of people: more than one author can share
+one store, and what each may read is part of the model rather than a deployment detail.
+
 ## Model
 
 - **Types:** `preference | semantic | episodic | prospective | procedural | summary`.
 - **Bi-temporal.** `valid_from`/`valid_to` are *event time* (when the fact holds in the world);
   `created_at` is *ingestion time* (when we learned it). Retrieval reads `mem.active_memories`,
-  which hides anything superseded or outside its validity window.
+  which hides anything superseded, outside its validity window, **or belonging to another
+  author** (see "Author and audience" below).
 - **Supersede, don't overwrite.** A correction writes a new memory with `supersedes_id` pointing
   at the old one and closes the old one's validity window. History is never destroyed, so "what
   did I believe last month, and why did it change?" is answerable.
@@ -20,6 +24,14 @@ re-learning them every session. Free text is the primary representation; structu
   not the top-k least-bad rows. Injecting noise is worse than injecting nothing.
 - **Provenance.** Every memory records where it came from (`user_message` vs `assistant_inference`
   vs `consolidation`) in `mem.sources`.
+- **Author and audience.** Every row records `author` (who learned it) and `scope`
+  (`private` | `project`); `mem.project_members` says which projects an author may read the
+  shared memory of. `preference` defaults to private, anything else with a project tag is
+  shared with that project, and a row with no project stays private whatever its type.
+  Identity comes from `MEM_AUTHOR` and reaches Postgres as the connection option `mem.reader`.
+  **Writes are refused without it**, on a one-person store too: a memory with no author cannot
+  be scoped, shared or revoked. See "Two people, one store" in `INSTALL.md` for the rule, the
+  role and the database-level enforcement.
 
 ## Retrieval
 
@@ -46,10 +58,13 @@ So a wrong merge can never silently drop a memory.
 
 ## Reflect: per-project knowledge pages
 
-A scheduled reflect pass (`hooks/mem_reflect.py`) synthesizes each project's active memories into
-one coherent **knowledge page** (`metadata.kind='page'`), so recall can surface a single overview
-instead of N scattered fragments. **Anti-staleness by construction:** every run *rebuilds* the page
-from the project's current active memories and supersedes the prior page (`page_upsert`) — a page is
+A scheduled reflect pass (`hooks/mem_reflect.py`) synthesizes each project's active
+**project-scoped** memories into one coherent **knowledge page** (`metadata.kind='page'`), so
+recall can surface a single overview
+instead of N scattered fragments. Private rows are deliberately excluded: the page is written back
+project-scoped and read by everyone on the project, so a page summarising private memories would
+publish them in paraphrase. **Anti-staleness by construction:** every run *rebuilds* the page
+from the project's current shared memories and supersedes the author's prior page (`page_upsert`) — a page is
 never edited in place and can't drift from its sources; if the memories change, the next run
 regenerates it. Only projects with at least `MEM_REFLECT_MIN` (default 5) active memories get one.
 
@@ -101,4 +116,5 @@ guarantee); ordinary prose like "the password reset flow" is left untouched.
 (`HM_LLM_URL`/`HM_LLM_KEY`/`HM_LLM_MODEL`), `ollama` (`HM_LLM_MODEL`), or `cli` (`HM_LLM_CMD`).
 Auto-selected if unset: openai when `HM_LLM_URL` is set, else cli when `HM_LLM_CMD` is set, else ollama. It only needs to turn text into a small JSON array of memory items; nothing about the
 store depends on which model you use. If you don't want auto-capture, skip the hooks entirely and
-write memories yourself via the `memory_write` MCP tool or `mem_ops.py write`.
+write memories yourself via the `memory_write` MCP tool or `mem_ops.py write` — both still need
+`MEM_AUTHOR` set, since every write records its author.

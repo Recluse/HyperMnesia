@@ -193,7 +193,7 @@ See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full system picture
 | Path | What |
 |------|------|
 | `hm` | one wrapper over the documented steps: `init` (compose + schema), `ingest` (ingest -> embed -> ANN index, incremental when the scope already exists), `doctor`, `latency` |
-| `sql/` | schema: doc-RAG (`documents/components/constraints/relationships/chunks`) + personal memory (`mem.*`) |
+| `sql/` | schema: doc-RAG (`documents/components/constraints/relationships/chunks`) + personal memory (`mem.*`), the multi-user migration, and the role + row-level security that enforce it |
 | `ingest/` | markdown chunker, embedder (Ollama/TEI), hybrid RRF search, `mem_ops`; incremental re-ingest via `--known-hashes` (unchanged docs keep their embeddings) |
 | `rerank/` | optional cross-encoder reranker service + search orchestrator |
 | `hooks/` | Claude Code hooks: constraint inject (`arch_invariants`), profile inject, per-prompt recall, capture, extract, consolidate, reflect (per-project knowledge pages) |
@@ -214,8 +214,8 @@ TL;DR (single box). This ends at the first thing you can *see*: an invariant arr
 edit.
 
 ```bash
-cp deploy/docker/.env.example deploy/docker/.env   # POSTGRES_PASSWORD: openssl rand -hex 24
-./hm init                          # compose up, wait for Postgres, load both schemas
+./hm init                          # writes .env with a generated password, compose up,
+                                   # waits for Postgres, loads the schema
 export DATABASE_URL=...            # init prints the exact line
 ./hm ingest /path/to/your/repo myrepo    # ingest -> embed -> ANN index -> doctor
 ```

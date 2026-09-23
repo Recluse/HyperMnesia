@@ -139,7 +139,7 @@ have. What it says, and what each line means:
 | `loaded; no run since this login` (macOS) | launchd has the job and has not started it since the last login. Its exit column says 0, which it prints for "never finished" as well as for "finished well" |
 | `? the configured log is not there` | the job ran, but the file that would date its last run is gone. Neither health nor failure: the evidence is missing, and that is its own answer |
 | `! the hooks IGNORE this file entirely: <why>` | the settings file is out of force; the defaults are running |
-| `file (IGNORED)` / `5 (file: 9)` | the file says 9, the default 5 is what is actually in effect |
+| `5 (file: 9)` in the value column, with `default` as the source | the settings file says 9 and is refused, so the default 5 is what is actually in force |
 | `this shell` as a source | set here, but the jobs the service manager starts do not inherit it — the line below says what they use |
 | `memories."pages" is missing -- this is not the stats query` | something answered, but it was not this query's result. EVERY field this query returns is required, including for an empty store, so a partial answer cannot pose as one. Not a store full of zeros |
 | `the command exited successfully without reading the whole query` | it answered a different question from the one asked; whatever it printed is not this query's reading |

@@ -83,20 +83,29 @@ echo "$DATABASE_URL"   # put this in your shell profile and your MCP client's en
 # 2. Schema
 # -v ON_ERROR_STOP=1 on every psql call here and below, deliberately: without it psql prints
 # the error, keeps going and exits 0, so a failed statement is indistinguishable from success.
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f sql/schema.sql -f sql/schema_mem.sql
+# mem_multiuser.sql is NOT optional and NOT only for teams: every memory write inserts
+# `author` and `scope`, which schema_mem.sql does not define. Without it the first write
+# fails with UndefinedColumn -- silently, because the hooks are fail-open and `hm doctor`
+# only checks that the table exists.
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f sql/schema.sql -f sql/schema_mem.sql -f sql/mem_multiuser.sql
 
-# 2b. More than one person? See "Two people, one store" below and apply
-#     sql/mem_multiuser.sql + sql/mem_app_role.sql BEFORE anyone writes anything.
-#     One person: skip it, and add it later -- the migration backfills.
+# 2b. Say who you are. Writes are REFUSED without it, on a one-person store too --
+#     a memory with no author cannot be scoped, shared or revoked.
+mkdir -p ~/.claude && echo "MEM_AUTHOR=$(id -un)" >> ~/.claude/hypermnesia.env
+chmod 600 ~/.claude/hypermnesia.env
+
+# 2c. More than one person? Also apply sql/mem_app_role.sql and point DATABASE_URL at the
+#     role it creates -- see "Two people, one store" below, BEFORE anyone writes anything.
 
 # 3. Embedder: Ollama
 ollama pull bge-m3            # 1.2 GB
 export EMBED_BACKEND=ollama   # http://localhost:11434
 
 # 4. Ingest a repo's markdown, then embed
-python ingest/ingest_repo.py ~/code/myrepo myrepo /tmp/myrepo.sql
+python3 ingest/ingest_repo.py ~/code/myrepo myrepo /tmp/myrepo.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f /tmp/myrepo.sql
-python ingest/embed_chunks.py               # fills chunks.embedding
+python3 ingest/embed_chunks.py              # fills chunks.embedding
 
 # 5. Build the ANN index — AFTER the first bulk embed, and do not skip it.
 #    schema.sql leaves this commented on purpose: building HNSW before the rows exist is far
@@ -106,7 +115,7 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "CREATE INDEX IF NOT EXISTS chunks_em
   ON chunks USING hnsw (embedding vector_cosine_ops)"
 
 # 6. (optional) reranker on your GPU/Mac
-python -m venv rerank/.venv && rerank/.venv/bin/pip install torch transformers sentencepiece
+python3 -m venv rerank/.venv && rerank/.venv/bin/pip install torch transformers sentencepiece
 rerank/.venv/bin/python rerank/server.py &  # 127.0.0.1:8091, lazy-loads, idle-unloads
                                             # HM_RERANK_BIND=0.0.0.0 to serve it beyond localhost
 
@@ -130,9 +139,17 @@ docker compose -f deploy/docker/docker-compose.yml exec postgres \
   psql -v ON_ERROR_STOP=1 -U hm -d hypermnesia -f /sql/schema.sql -f /sql/schema_mem.sql
 ```
 
-Then ingest/embed as in A steps 4 and 5 — including the ANN index, which is easy to miss and
-costs you a sequential scan on every query if you do. Point the embedder at TEI first, since this
-stack has no Ollama: `export EMBED_BACKEND=tei TEI_URL=http://localhost:8080`. See
+Then ingest/embed as in A steps 2–5 — the schema (all three files), your identity, the ingest,
+the embed, and the ANN index, which is easy to miss and costs you a sequential scan on every
+query if you do. Export the connection string and the embedder first; A's steps assume both,
+and `psql ""` with an unset `DATABASE_URL` does not fail — it connects to a database named
+after your login and reports "relation does not exist" from the wrong store:
+
+```bash
+export DATABASE_URL="postgresql://hm:<the password in deploy/docker/.env>@localhost:5432/hypermnesia"
+export EMBED_BACKEND=tei TEI_URL=http://localhost:8080    # this stack has no Ollama
+```
+ See
 `deploy/docker/docker-compose.yml` for the services and ports. TEI serves `bge-m3` on CPU; add a
 GPU runtime to the compose service for speed.
 
@@ -234,7 +251,7 @@ Three ways to run it without remembering to:
 | When | How |
 |------|-----|
 | on every commit / pull | a `post-commit` and `post-merge` hook in the repo, calling the line above |
-| on a timer | cron, a systemd timer, or a launchd agent; `hypermnesia-jobs` lists them on both macOS and Linux, and reschedules them on macOS |
+| on a timer | cron, a systemd timer, or a launchd agent; `hypermnesia-jobs` lists, reschedules, enables and runs them on both macOS and Linux |
 | in CI | a step on push, if the runner can reach the database |
 
 A timer is the simplest and a git hook is the better one: it runs when something actually changed,
@@ -299,11 +316,20 @@ unaligned rows. The wizard offers the four usual shapes — direct psql, `docker
 | `~/.config/hypermnesia/console.conf` | the console's own settings: `HM_PSQL_CMD`, `HM_JOB_PREFIX`. Created mode 600 |
 | `~/.claude/hypermnesia.env` | the pipeline's shared tunables, the file `hypermnesia-settings` writes |
 
-Both are **refused entirely** — loudly, falling back to defaults — unless the file is yours, is
-unwritable by any other account, and sits in a directory with the same property. The first holds a
-command run through `sh -c` at every refresh and at login with nobody present; the second sets the
-environment of the jobs the service manager starts. `HM_PSQL_CMD` in the environment beats the
-config file.
+Both are **refused entirely**, loudly, unless the file is yours, is unwritable by any other
+account, and (on macOS) carries no access-control list — an ACL is not in the mode bits, so a
+0600 file can still be world-writable. The first holds a command run through `sh -c` at every
+refresh and at login with nobody present; the second sets the environment of the jobs the
+service manager starts.
+
+What a refusal does differs, and the difference is deliberate:
+
+- `console.conf` names the DATABASE. A refusal **stops the tool** — it does not fall back to the
+  default command, because that reaches a different store and its numbers look exactly like the
+  ones you asked for. `HM_PSQL_CMD` in the environment still beats the file, and `--show` will
+  say so rather than refusing to answer.
+- `hypermnesia.env` holds tunables. A refusal falls back to the defaults and says so: the
+  settings screen shows `5 (file: 9)` with `default` as the source.
 
 A password inside the psql command ends up in psql's argv, where any process running as you can
 read it. `~/.pgpass` or `PGPASSWORD` in the command's own environment avoids that.
@@ -343,24 +369,26 @@ the file is what is in force.
 
 ### The memory pipeline's tunables
 
-These are the knobs `hypermnesia-settings` offers. They come from the environment, or from the
-shared settings file below, or from the default — in that order.
+They come from the environment, or from the shared settings file below, or from the default —
+in that order. The **Set by** column says which are offered by `hypermnesia-settings` and
+accepted from the settings file: the rest are environment-only, so putting one in the file gets
+it listed as refused rather than applied.
 
-| Env | Default | Read by | Meaning |
-|-----|---------|---------|---------|
-| `MEM_NOVELTY_MAXDIST` | `0.12` | `hooks/mem_extract.py` | novelty gate on write: closer than this counts as the same fact |
-| `MEM_REVIEW_THRESHOLD` | `0.8` | `hooks/mem_consolidate.py` | below this confidence a merge waits in the review queue instead of being applied |
-| `MEM_REFLECT_MIN` | `5` | `hooks/mem_reflect.py` | the fewest memories a project needs before it gets a knowledge page |
-| `MEM_REFLECT_MAX` | `80` | `hooks/mem_reflect.py` | the most memories handed to the model in one pass |
-| `MEM_STALE_DAYS` | `180` | `hooks/mem_profile.py` | the age past which an unconfirmed, unrecalled fact is listed as stale |
-| `MEM_SEM_MAXDIST` | `0.5` | `ingest/mem_ops.py` | abstention gate: past this distance memory search returns nothing at all |
-| `MEM_LEX_MAXDIST` | = `MEM_SEM_MAXDIST` | `ingest/mem_ops.py` | lexical floor; unset it follows the gate above |
-| `EMBED_BATCH` | `16` | `ingest/embed_chunks.py` | chunks per request during a bulk embed |
-| `EMBED_MODEL` | `bge-m3` | `ingest/_common.py` | model name for Ollama, and the string stamped into `embedding_model` |
-| `MEM_CONSOLIDATE_MAXDIST` | `0.20` | `hooks/mem_consolidate.py` | how close two memories must be to be candidates for merging. Above ~0.25 the candidate graph starts collapsing into one blob; 0.35 meant "same topic" rather than "same fact" |
-| `MEM_CONSOLIDATE_MAX_GROUP` | `6` | `hooks/mem_consolidate.py` | the most memories one verdict may act on. A merge replaces every member, so this bounds the damage a wrong verdict can do, independently of the model's confidence |
-| `MEM_CONSOLIDATE_MAX_GROUPS` | `10` | `hooks/mem_consolidate.py` | groups examined per run; each one is an LLM call, and the rest wait for the next pass |
-| `MEM_CONSOLIDATE_MODEL` | `haiku` | `hooks/mem_consolidate.py` | the model the consolidation verdict is asked of |
+| Env | Default | Read by | Set by | Meaning |
+|-----|---------|---------|--------|---------|
+| `MEM_NOVELTY_MAXDIST` | `0.12` | `hooks/mem_extract.py` | settings | novelty gate on write: closer than this counts as the same fact |
+| `MEM_REVIEW_THRESHOLD` | `0.8` | `hooks/mem_consolidate.py` | settings | below this confidence a merge waits in the review queue instead of being applied |
+| `MEM_REFLECT_MIN` | `5` | `hooks/mem_reflect.py` | settings | the fewest memories a project needs before it gets a knowledge page |
+| `MEM_REFLECT_MAX` | `80` | `hooks/mem_reflect.py` | settings | the most memories handed to the model in one pass |
+| `MEM_STALE_DAYS` | `180` | `hooks/mem_profile.py` | settings | the age past which an unconfirmed, unrecalled fact is listed as stale |
+| `MEM_SEM_MAXDIST` | `0.5` | `ingest/mem_ops.py` | settings | abstention gate: past this distance memory search returns nothing at all |
+| `MEM_LEX_MAXDIST` | = `MEM_SEM_MAXDIST` | `ingest/mem_ops.py` | settings | lexical floor; unset it follows the gate above |
+| `EMBED_BATCH` | `16` | `ingest/embed_chunks.py` | settings | chunks per request during a bulk embed |
+| `EMBED_MODEL` | `bge-m3` | `ingest/_common.py` | settings | model name for Ollama, and the string stamped into `embedding_model` |
+| `MEM_CONSOLIDATE_MAXDIST` | `0.20` | `hooks/mem_consolidate.py` | **env only** | how close two memories must be to be candidates for merging. Above ~0.25 the candidate graph starts collapsing into one blob; 0.35 meant "same topic" rather than "same fact" |
+| `MEM_CONSOLIDATE_MAX_GROUP` | `6` | `hooks/mem_consolidate.py` | **env only** | the most memories one verdict may act on. A merge replaces every member, so this bounds the damage a wrong verdict can do, independently of the model's confidence |
+| `MEM_CONSOLIDATE_MAX_GROUPS` | `10` | `hooks/mem_consolidate.py` | **env only** | groups examined per run; each one is an LLM call, and the rest wait for the next pass |
+| `HM_LLM_MODEL` | backend-dependent | `hooks/_llm.py` | settings | the model every LLM step asks. There is no per-pass model knob: `MEM_CONSOLIDATE_MODEL` and `MEM_EXTRACT_MODEL` were documented for a while and read by nothing — `tests/test_settings_knobs.py` exists because of them |
 
 ### The shared settings file
 
@@ -374,7 +402,7 @@ your own private file, and only the exact names listed here are accepted.
 
 | Env | Default | Meaning |
 |-----|---------|---------|
-| `HM_PSQL_CMD` | `psql "$DATABASE_URL" -tAX -v ON_ERROR_STOP=1` | the command the console sends SQL to on stdin. The one setting that differs between deployments |
+| `HM_PSQL_CMD` | `psql "$DATABASE_URL" -tAX -v ON_ERROR_STOP=1` | the command the console sends SQL to on stdin. The one setting that differs between deployments. **On a multi-user store it must carry an identity**, or every memory counter reads 0 — the console has no `MEM_AUTHOR` of its own: `env PGOPTIONS=-c\ mem.reader=<you> psql …` |
 | `HM_JOB_PREFIX` | `com.hypermnesia` (macOS) / `hypermnesia-` (Linux) | the label/unit-name prefix the job tools manage |
 | `HM_CONSOLE_CONFIG` | `~/.config/hypermnesia/console.conf` | where the two settings above are stored. Refused whole if another account can write it, if it is not owned by you, or if it is not a plain file: it holds a command the tray runs at login. A refusal STOPS the tool — it does not fall back to the default command, because that reaches a different database and its numbers look exactly like the ones you asked for. A file that is simply absent is fine; the default applies then |
 | `HM_TIMEOUT_SECS` | `30` | ceiling on one reading of the store, covering the whole exchange — writing the query, waiting, and collecting the answer. Capped at 3600; a value outside 1..3600 is ignored and the default applies |
@@ -442,11 +470,26 @@ base tables instead — a history flag swapping the view out, a fetch-by-id that
 but forgot membership, a write that accepted any project, and a retract that checked nothing.
 
 `mem_app_role.sql` is what makes it hold anyway. `hm_app` is an ordinary role, so the row-level
-policies bind it: a query that forgets the rule comes back with **no rows** instead of every
-row. Point the application's `DATABASE_URL` at `hm_app`; keep the owning role for migrations,
-restores, and the one view with no rule on it (`mem.all_active_memories`, which a post-restore
-row count must use — `mem.active_memories` returns 0 for a connection with no identity, which
-is correct and looks exactly like an empty restore).
+policies bind it: a query that forgets the rule comes back with **no rows** instead of every row.
+
+It is created **with no password** — set one and point the application at it:
+
+```bash
+read -rs APP_PW
+printf "ALTER ROLE hm_app PASSWORD '%s';\n" "$APP_PW" | psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+export DATABASE_URL="postgresql://hm_app:$APP_PW@localhost:5432/hypermnesia"
+```
+
+Keep the owning role for migrations, restores, and the one view with no rule on it
+(`mem.all_active_memories`, which a post-restore row count must use — `mem.active_memories`
+returns 0 for a connection with no identity, which is correct and looks exactly like an empty
+restore).
+
+**Everything that connects has to move with it.** Anything still using the owner's credentials
+keeps working and silently bypasses every policy; anything using the owner's *name* with the
+app's password fails authentication outright. The second is how document search went down in
+this project's own deployment for half an hour — the pod's password was repointed and one
+script still named the old role.
 
 If the application connects as the role that OWNS the tables, RLS is inert — owners bypass
 their own policies and a superuser bypasses everything.
@@ -458,8 +501,10 @@ their own policies and a superuser bypasses everything.
 psql "$DATABASE_URL" -tAXc "SELECT count(*) FROM mem.memories;"
 
 # and the probe that fails if the rule is removed — it writes as one identity and reads as a
-# second, which is the only arrangement that can tell an isolating store from one that is not
-python3 eval/mem_probes.py
+# second, which is the only arrangement that can tell an isolating store from one that is not.
+# Run it with the OWNER's DATABASE_URL: its cleanup deletes the rows it wrote, and under the
+# app role a delete it is not entitled to make is a silent no-op that still reports success.
+DATABASE_URL="postgresql://hm:...@localhost:5432/hypermnesia" python3 eval/mem_probes.py
 ```
 
 ## Secrets and what the store keeps
