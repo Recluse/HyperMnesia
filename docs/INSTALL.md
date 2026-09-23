@@ -461,3 +461,30 @@ psql "$DATABASE_URL" -tAXc "SELECT count(*) FROM mem.memories;"
 # second, which is the only arrangement that can tell an isolating store from one that is not
 python3 eval/mem_probes.py
 ```
+
+## Secrets and what the store keeps
+
+Both write paths redact structured secrets before anything is persisted, and they use the same
+patterns (`ingest/_redact.py`): known key shapes (OpenAI, Anthropic, GitHub, GitLab, Slack, AWS,
+Google, JWT, PEM private keys), `name=value` assignments for sensitive names, and passwords
+inside connection strings.
+
+- **Documents.** A markdown file is redacted before it is chunked, so the chunk text, its
+  tsvector and its embedding are all built from the redacted string. Nothing downstream could
+  repair it: a secret that got past this point would be searchable, retrievable, and would end
+  up in a model's context. The file named in the `held something shaped like a secret` line on
+  stderr is the one to go and rotate — **the file on disk is not modified**.
+- **Memories.** The same, at the single write chokepoint, plus the verbatim source excerpt.
+
+**Redact, don't drop.** `the token is glpat-...` is stored as `the token is [REDACTED:gitlab-pat]`
+— the sentence stays searchable and the fact that a credential was committed stays visible. A
+redactor that ate ordinary prose would be switched off by the first person who lost a paragraph
+to it, so the patterns are structural: "the password reset flow" is untouched.
+
+**What this is not.** A best-effort filter over known shapes, not a guarantee. A secret with no
+recognisable structure — a bare high-entropy string, an internal token format — goes in as
+written. `tests/test_ingest_redaction.py` pins the shapes that are covered.
+
+**What is not indexed at all.** The ingester takes git-tracked `*.md` only, and skips the usual
+build and dependency directories. `.env`, key files, kubeconfigs and tfstate are not markdown
+and never enter — not because they are denied by name, but because nothing enumerates them.

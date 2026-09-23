@@ -32,6 +32,9 @@ is always added alongside so exact tokens (code identifiers, IDs) match regardle
 import re
 import sys, os, re, hashlib, subprocess
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _redact import scrub
+
 FTS_LANG = os.environ.get("HM_FTS_LANG", "english")
 if not re.fullmatch(r"[a-z_]+", FTS_LANG):   # it is interpolated into SQL literals
     FTS_LANG = "english"
@@ -267,6 +270,7 @@ def main():
 
     n_docs = n_chunks = n_kept = 0
     on_disk, replaced, bodies, unreadable, oversize, missing = set(), set(), [], [], [], []
+    redacted = []
     for rel in files:
         ap = os.path.join(repo_dir, rel)
         relp = rel.replace("\\", "/")
@@ -307,7 +311,20 @@ def main():
             continue
         if relp in known:
             replaced.add(relp)          # known but changed -> its old row must go first
-        content = raw.decode("utf-8", "replace")
+        # Redacted BEFORE anything is derived from it. The memory side has scrubbed since it
+        # existed, on the reasoning that a credential written into a store gets re-injected
+        # into a prompt later; documents are the same store and the same later prompt, and the
+        # markdown a team keeps -- runbooks, incident notes, deployment guides -- is precisely
+        # where a live token gets pasted "just for a moment". Nothing downstream can fix it:
+        # the chunk text, its tsvector and its embedding are all built from this string.
+        #
+        # AFTER the content hash, deliberately. `chash` tracks the file ON DISK, so that the
+        # incremental path can tell whether the source changed; hashing the redacted form would
+        # make a file re-ingest forever or never, depending on which side you compared.
+        text = raw.decode("utf-8", "replace")
+        content = scrub(text)
+        if content != text:
+            redacted.append(relp)
         chs = chunk_md(content)
         tok = approx_tokens(content)
         dt, ttl = doc_type(rel), title_of(content, rel)
@@ -390,6 +407,12 @@ def main():
         # after the SQL had already been written.)
         sys.stderr.write(f"{repo}: {relp} is listed by git but not on disk -- treating it as "
                          f"deleted; its stored document will be removed\n")
+    # Named, not counted. A silent redaction is its own "it looked fine": the document is
+    # stored and searchable and simply says [REDACTED:...] where the secret was, so nobody
+    # finds out that a credential was committed unless this says which file held it.
+    for relp in redacted:
+        sys.stderr.write(f"{repo}: {relp} held something shaped like a secret -- stored "
+                         f"redacted. The file on disk is unchanged: rotate it and remove it.\n")
     if incremental:
         sys.stderr.write(f"{repo}: {n_docs} docs re-emitted ({n_chunks} chunks), "
                          f"{n_kept} unchanged kept, {len(gone)} removed -> {out}\n")
