@@ -128,7 +128,16 @@ fn read_unit(stem: &str, timer_path: &PathBuf) -> Job {
         .and_then(|v| v.strip_prefix("append:"))
         .map(PathBuf::from)
         .or_else(|| service_log_from_file(stem));
-    let last_exit = get(&service_rows, "ExecMainStatus").and_then(|v| v.parse().ok());
+    // ExecMainStatus is 0 for a unit that has NEVER started -- systemd reports the property's
+    // default, not an absence. Taken at face value it reads as "last run ok", which is the exact
+    // substitution this project documents for `launchctl list` and refuses to repeat here.
+    // InvocationID is the honest witness: empty until the unit actually runs once. Verified on a
+    // live systemd 245 host, on a unit that had never been started.
+    let ran_at_least_once = get(&service_rows, "InvocationID").is_some_and(|v| !v.is_empty())
+        || get(&service_rows, "ExecMainExitTimestamp").is_some_and(|v| !v.is_empty());
+    let last_exit = ran_at_least_once
+        .then(|| get(&service_rows, "ExecMainStatus").and_then(|v| v.parse().ok()))
+        .flatten();
     let pid = get(&service_rows, "MainPID").and_then(|v| v.parse().ok()).filter(|p| *p != 0);
     let installed = get(&timer_rows, "FragmentPath")
         .map(PathBuf::from)

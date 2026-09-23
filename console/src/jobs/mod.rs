@@ -350,13 +350,21 @@ impl Job {
         if self.schedule == Schedule::None || self.broken() {
             return false;                     // a service without a schedule -- not a complaint
         }
-        match self.trigger {
-            TriggerState::At(_) => return false,   // the backend's own record says it fired
-            TriggerState::Never => return true,    // ...and here, that it never has
-            TriggerState::NotTracked => {}
+        if let TriggerState::At(_) = self.trigger {
+            return false;                     // the backend's own record says the timer fired
         }
+        // `TriggerState::Never` says the TIMER has not fired -- which is not the same as the job
+        // never having run. Anyone can start the unit by hand, and this console's own "run now"
+        // does exactly that. Taking it as the final word printed "never ran" on a line whose
+        // neighbour said "last output 2 s ago", which is the kind of self-contradiction this
+        // console exists to not produce. Observed on a live systemd host, not imagined.
         if self.log_after_install() {
             return false;                     // it has written something since: it ran
+        }
+        if matches!(self.trigger, TriggerState::Never) {
+            // No later evidence anywhere: the timer never fired, nothing has been written since
+            // it was installed, and the backend has no record of a completed or running process.
+            return self.last_exit.is_none() && self.pid.is_none();
         }
         match self.runs {
             Some(n) => n == 0,
@@ -643,11 +651,25 @@ mod tests {
         assert!(stale.freshness_unknown().is_none(), "the timestamp answers the question");
 
         // The backend tracks triggers AND says it has never fired -- `TriggerState::Never`, not
-        // an absence of evidence. Must be a settled "never ran", not a fall-through to the
-        // log/run-count logic that has nothing to say here (no log, no run counter) and would
-        // otherwise read this job as calm by accident.
-        let never = with_trigger(Schedule::Every(3600), None);
+        // an absence of evidence. With nothing else to go on that is a settled "never ran".
+        // `last_exit` is None here on purpose: systemd reports ExecMainStatus=0 for a unit that
+        // never started, and the backend now refuses to pass that on as an exit code (see
+        // systemd.rs), so this is what a genuinely never-run job looks like.
+        let mut never = with_trigger(Schedule::Every(3600), None);
+        never.last_exit = None;
         assert!(never.never_ran());
         assert!(never.freshness_unknown().is_none(), "never-fired is a settled answer too");
+
+        // But "the TIMER never fired" is not "the job never ran": `hypermnesia-jobs run` starts
+        // the service directly, and so does anyone with systemctl. Observed on a live host --
+        // the list said "never ran" on the same line as "last output 2 s ago".
+        let mut by_hand = with_trigger(Schedule::Every(3600), None);
+        by_hand.last_exit = Some(0);
+        assert!(!by_hand.never_ran(), "an exit code means it ran, whatever the timer says");
+        let mut logged = with_trigger(Schedule::Every(3600), None);
+        logged.last_exit = None;
+        logged.log = Some(PathBuf::from("/nope"));
+        logged.log_state = LogState::Written(SystemTime::now());
+        assert!(!logged.never_ran(), "and so does a log written since it was installed");
     }
 }

@@ -200,11 +200,12 @@ fn list(all: &[Job]) {
     println!("{:<13} {:<22} {:<14} {}", "JOB", "SCHEDULE", "LAST OUTPUT", "STATE");
     for j in all {
         if let Some(why) = &j.fault {
-            // An unreadable unit is one the service manager also refused: the job is not
-            // running. It used to be dropped from the list entirely, which is the one case the
-            // console had nothing at all to say about.
-            println!("{:<13} {:<22} {:<14} ! unreadable {}: {why}", j.short(), "—", "—",
-                     jobs::UNIT_NOUN);
+            // A faulted job is one the service manager cannot run as written: the row stays,
+            // with the reason, because dropping it was the one case the console had nothing at
+            // all to say about. The reason speaks for itself -- "unreadable" as a fixed prefix
+            // asserted something false about the half of these faults that read perfectly well
+            // and are simply not armed.
+            println!("{:<13} {:<22} {:<14} ! {why}", j.short(), "—", "—");
             continue;
         }
         let when = match j.since_last_output() {

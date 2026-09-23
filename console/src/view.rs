@@ -9,7 +9,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use crate::jobs::{self, Job};
+use crate::jobs::Job;
 use crate::Stats;
 
 /// What is visible without opening the menu. A mark
@@ -74,7 +74,7 @@ pub fn job_line(j: &Job) -> String {
         // The backend refused this unit too, so the job is not running. It used to be missing
         // from the menu entirely.
         let first = why.lines().next().unwrap_or(why);
-        return format!("{}  (! unreadable {}: {first})", j.short(), jobs::UNIT_NOUN);
+        return format!("{}  (! {first})", j.short());
     }
     let state = if j.running() {
         "running".to_string()
@@ -111,7 +111,7 @@ pub fn job_line(j: &Job) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::{LogState, Schedule};
+    use crate::jobs::{self, LogState, Schedule};
     use std::path::PathBuf;
 
     fn job(schedule: Schedule) -> Job {
@@ -138,15 +138,23 @@ mod tests {
         assert!(line.starts_with("extract  (every 4 h, !"), "and marked: {line}");
     }
 
-    /// A unit the backend also refused is one that is not running. It used to be absent from the
-    /// menu altogether.
+    /// A job the backend cannot run as written is one that is not running. It used to be absent
+    /// from the menu altogether. The reason is printed as given: these faults are not all of one
+    /// kind -- "the timer is loaded but not armed" reads perfectly well and is not unreadable --
+    /// so the line must not prepend a word that contradicts half of them.
     #[test]
-    fn an_unreadable_unit_is_a_visible_line() {
+    fn a_faulted_job_shows_its_reason_verbatim() {
         let mut j = job(Schedule::None);
         j.fault = Some("plutil: unexpected character\nsecond line".into());
         let line = job_line(&j);
-        assert!(line.contains(&format!("unreadable {}", jobs::UNIT_NOUN)), "{line}");
+        assert!(line.contains("plutil: unexpected character"), "{line}");
+        assert!(!line.contains("unreadable"), "the reason speaks for itself: {line}");
         assert!(!line.contains("second line"), "one line only, it is a menu: {line}");
+
+        let mut armed = job(Schedule::None);
+        armed.fault = Some("the timer is loaded but not armed".into());
+        let line = job_line(&armed);
+        assert!(line.contains("not armed") && !line.contains("unreadable"), "{line}");
     }
 
     #[test]
