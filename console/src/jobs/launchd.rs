@@ -7,9 +7,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
-use super::{log_state_of, Cal, Job, LogState, Schedule};
+use super::{log_state_of, Cal, Job, LogState, Schedule, TriggerState};
 
 /// Where the user's own LaunchAgents live.
 ///
@@ -76,7 +76,7 @@ fn broken_job(path: &PathBuf, name: &str, fault: String,
         runs: runs_of(name),
         pid,
         log_state: LogState::NotConfigured,
-        trigger: super::TriggerState::NotTracked,
+        trigger: TriggerState::NotTracked,
         fault: Some(fault),
         armed: None,
     }
@@ -101,7 +101,7 @@ fn read_plist(path: &PathBuf, states: &BTreeMap<String, (Option<u32>, Option<i32
     Ok(Job {
         program,
         label, source: path.clone(), schedule, log, last_exit, pid, log_state, runs, installed,
-        trigger: super::TriggerState::NotTracked,
+        trigger: TriggerState::NotTracked,
         fault: None,
         armed: None,
     })
@@ -525,7 +525,7 @@ mod tests {
         Job {
             label: "x".into(), source: PathBuf::new(), schedule, program: vec![], log: None,
             last_exit: None, pid: None, log_state: LogState::NotConfigured, runs: None,
-            installed: None, trigger: super::TriggerState::NotTracked, fault: None, armed: None,
+            installed: None, trigger: TriggerState::NotTracked, fault: None, armed: None,
         }
     }
 

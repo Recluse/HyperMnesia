@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 use crate::jobs::{self, Job};
 use crate::Stats;
 
-/// What is visible without opening the menu. What is visible without opening the menu. A mark
+/// What is visible without opening the menu. A mark
 /// matters more than a number here: the title/icon is where a problem is NOTICED, not where a
 /// report is read.
 ///
