@@ -241,7 +241,7 @@ and what the tunables are set to.
 cd console && cargo build --release
 ./target/release/hypermnesia-setup          # the walkthrough, including the connection
 ./target/release/hypermnesia-stats          # the numbers, once
-./target/release/hypermnesia --install      # the menu-bar tray, at login (macOS)
+./target/release/hypermnesia --install      # the tray, at login (launchd on macOS, a systemd user unit on Linux)
 ```
 
 The four command-line tools build the same way everywhere; the data layer has no dependencies at
@@ -259,11 +259,20 @@ sudo dnf install gtk3-devel libayatana-appindicator-gtk3-devel libxdo-devel  # F
 cargo build --release --features tray
 ```
 
-**Linux, what works today:** the tray icon, the store's numbers, and reading systemd user units
-(`~/.config/systemd/user/*.timer`) -- schedule, last exit code, whether it is running, and when it
-last fired, read straight from `systemctl --user show` with no date-parsing crate. Editing a
-schedule, running a job on demand, and installing the tray into autostart are not implemented on
-Linux yet; `hypermnesia-jobs` and the tray say so rather than doing nothing silently. See
+**Linux backend:** systemd user units (`~/.config/systemd/user/*.{timer,service}`), read through
+`systemctl --user show` with no date-parsing crate. Both platforms now read, run, reschedule and
+arm/disarm jobs, and install the tray itself into autostart:
+
+| | macOS (launchd) | Linux (systemd) |
+|---|---|---|
+| run a job now | `launchctl kickstart -k` | `systemctl --user start --no-block` |
+| change a schedule | edit the plist, `plutil -lint`, bootout/bootstrap | edit the unit, `systemd-analyze --user verify`, daemon-reload + restart |
+| arm / disarm | n/a — a loaded job is armed, full stop | `systemctl --user enable\|disable --now` (`hypermnesia-jobs enable\|disable`, and the tray's **Timers** submenu) |
+| install the tray | `~/Library/LaunchAgents/com.hypermnesia.tray.plist`, `RunAtLoad` | `~/.config/systemd/user/hypermnesia-tray.service`, `WantedBy=default.target`, enabled but not started (avoids running a second tray beside the one already open) |
+
+Every write is backed up, validated before it is reloaded, and read back afterward to confirm what
+actually landed rather than trusting the exit code of the command that asked for it; any failure
+along the way restores the backup and says, in words, whether the restore itself worked. See
 [the console message table](DIAGNOSTICS.md#what-the-console-tells-you-about-itself) for the exact
 Linux-side lines, and `HM_JOB_PREFIX` below for how job names differ (`hypermnesia-extract.timer`,
 not `com.hypermnesia.extract.plist`).

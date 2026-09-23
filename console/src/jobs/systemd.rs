@@ -1,13 +1,10 @@
 //! The systemd backend: user units under `~/.config/systemd/user/*.{service,timer}`, read through
-//! `systemctl --user show`.
-//!
-//! **Read-only, deliberately.** `list()` is real; `run_now`, `set_schedule`, `install_self` and
-//! `uninstall_self` all return "not implemented on Linux yet" rather than a silent no-op --
-//! writing a systemd timer safely (the launchd side of this file is the backup-edit-lint-reload
-//! dance in `launchd.rs`, about half its length) is real work this prototype does not yet do.
-//! `autostart_fault` returns `None`: an honest "nothing to report" for a check the tray does not
-//! yet perform, not a permanent warning about a missing feature -- a warning nobody can act on is
-//! a warning nobody reads.
+//! `systemctl --user show` and written through the same backup -> edit -> verify -> reload ->
+//! read-back -> rollback discipline `launchd.rs` uses for its plists. Nothing here claims success
+//! from an exit code alone: every write is checked against what `systemctl --user show` reports
+//! afterwards, because a `0` from `systemctl` means "the request was accepted", not "the change
+//! took" -- a timer already loaded holds its own copy of the schedule until it is reloaded, and a
+//! disabled unit still accepts `daemon-reload` without complaint.
 //!
 //! systemd answers two of the three questions this module needs directly, and better than
 //! launchd does: `ExecMainStatus`, `MainPID` and `LastTriggerUSec` are exactly "exit code", "is it
@@ -158,6 +155,8 @@ fn read_unit(stem: &str, timer_path: &PathBuf) -> Job {
         runs: None,               // systemd keeps no lifetime run counter
         pid,
         trigger,
+        armed: Some(get(&timer_rows, "UnitFileState") == Some("enabled")
+                    && get(&timer_rows, "ActiveState") == Some("active")),
         fault: enablement_fault(&timer_rows),
     }
 }
@@ -206,6 +205,7 @@ fn broken_job(stem: &str, path: &PathBuf, fault: String) -> Job {
         runs: None,
         pid: None,
         trigger: TriggerState::NotTracked,
+        armed: None,               // could not be read, so nothing is known about it either
         fault: Some(fault),
     }
 }
@@ -255,11 +255,16 @@ fn parse_schedule(timer_rows: &[(String, String)]) -> Schedule {
         1 => return Schedule::Calendar(cals.into_iter().next().unwrap()),
         _ => return Schedule::Several(cals),
     }
-    if let Some(raw) = get(timer_rows, "TimersMonotonic") {
-        if let Some(spec) = extract_between(raw, "OnUnitActiveUSec") {
-            if let Some(secs) = parse_systemd_duration(&spec) {
-                return Schedule::Every(secs);
-            }
+    // `TimersMonotonic` is one row PER monotonic directive -- a unit with `OnBootSec=` next to
+    // `OnUnitActiveSec=` (which `set_schedule` writes together, so an interval timer also fires
+    // after a boot) reports two rows, and `get`'s first-match would as likely hand back the
+    // `OnBootUSec` one, which has no `OnUnitActiveUSec=` key and reads as "no schedule at all".
+    // `OnUnitActiveUSec` is what this console's own interval schedules are -- and about the only
+    // monotonic key it would ever need to read back.
+    if let Some(spec) = get_all(timer_rows, "TimersMonotonic")
+        .find_map(|raw| extract_between(raw, "OnUnitActiveUSec")) {
+        if let Some(secs) = parse_systemd_duration(&spec) {
+            return Schedule::Every(secs);
         }
     }
     Schedule::None
@@ -408,30 +413,393 @@ fn parse_standard_output(unit_file: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-pub fn run_now(_label: &str) -> Result<String, String> {
-    Err("running a job on demand is not implemented on Linux yet -- use `systemctl --user start \
-        <name>.service` directly".into())
+/// A unit name is a shell argument and a path component both. Rejecting anything but the
+/// characters systemd itself allows in an instance/template name keeps every `Command::new`
+/// below from ever needing to worry about an escape.
+fn valid_stem(stem: &str) -> Result<(), String> {
+    if stem.is_empty() {
+        return Err("the job name is empty".into());
+    }
+    let ok = stem.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !stem.starts_with('-') && !stem.contains("..");
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("{stem:?} is not a valid systemd unit name"))
+    }
 }
 
-pub fn set_schedule(_job: &Job, _sched: &Schedule) -> Result<String, String> {
-    Err("changing a schedule is not implemented on Linux yet -- edit the `.timer` unit and run \
-        `systemctl --user daemon-reload`".into())
+/// Run the job immediately, without touching its schedule.
+///
+/// `--no-block` matters: these are `Type=oneshot` services, and a plain `start` waits for the
+/// unit to finish before returning -- which would sit on the tray's worker thread for as long as
+/// the job takes, well past the 90 s the tray gives up waiting for an answer at all.
+///
+/// systemd's `InvocationID` is the counterpart of launchd's run counter: a fresh UUID every time
+/// the unit starts, whether or not it succeeds. The state is read back rather than trusted from
+/// the exit code of `start`, which only says the request was accepted -- a program that is not
+/// there fails immediately and systemd records that asynchronously, the same race `launchd.rs`
+/// documents for `kickstart`.
+pub fn run_now(label: &str) -> Result<String, String> {
+    valid_stem(label)?;
+    let service = format!("{label}.service");
+    let before_id = show(&service).ok()
+        .and_then(|r| get(&r, "InvocationID").map(str::to_string));
+
+    let o = Command::new("systemctl").args(["--user", "start", "--no-block", "--", &service])
+        .output().map_err(|e| format!("could not call systemctl: {e}"))?;
+    if !o.status.success() {
+        let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+        return Err(if err.is_empty() { format!("systemctl start {service} failed") } else { err });
+    }
+
+    // A short look-back: long enough for a program that is not there to have failed and for
+    // systemd to have noticed, short enough that a person does not notice the wait.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let after = loop {
+        let rows = show(&service).ok();
+        let moved = rows.as_deref().and_then(|r| get(r, "InvocationID"))
+            .is_some_and(|id| Some(id) != before_id.as_deref());
+        let running = rows.as_deref().and_then(|r| get(r, "MainPID"))
+            .and_then(|v| v.parse::<u32>().ok()).is_some_and(|p| p != 0);
+        if moved || running || std::time::Instant::now() >= deadline {
+            break rows;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    };
+    let Some(after) = after else {
+        return Ok(format!("systemctl accepted the request for {service}; its state could not be \
+                           read back"));
+    };
+    if get(&after, "MainPID").and_then(|v| v.parse::<u32>().ok()).is_some_and(|p| p != 0) {
+        return Ok(format!("running: {label}"));
+    }
+    // The exit code systemd remembers belongs to a run, and only an InvocationID that MOVED
+    // proves which run that is -- without that check a job that failed yesterday and has not
+    // started yet would be reported as having just exited.
+    let moved = get(&after, "InvocationID").is_some_and(|id| Some(id) != before_id.as_deref());
+    let exit = get(&after, "ExecMainStatus").and_then(|v| v.parse::<i32>().ok());
+    match (moved, exit) {
+        (true, Some(0)) => Ok(format!("ran: {label} (exit 0)")),
+        (true, Some(c)) => Err(format!("{label} ran and exited {c}")),
+        (true, None) => Ok(format!("ran: {label} (systemd reports no exit code yet)")),
+        (false, _) => Err(format!(
+            "systemctl accepted the request but {label} has not started -- its invocation id \
+             has not moved. Check the log.")),
+    }
 }
 
-pub fn install_self(_label: &str) -> Result<String, String> {
-    Err("installing the tray into autostart is not implemented on Linux yet -- add a \
-        `hypermnesia-tray.service` user unit with `WantedBy=default.target` by hand".into())
+/// Replace the schedule keys inside a unit file's `[Timer]` section. Pure text in, text out -- no
+/// filesystem, no `systemctl` -- so this is where the tests live rather than against a real
+/// system.
+fn rewrite_timer(text: &str, sched: &Schedule) -> Result<String, String> {
+    let new_line = match sched {
+        Schedule::Every(secs) => format!("OnUnitActiveSec={secs}\nOnBootSec={secs}"),
+        Schedule::Calendar(c) => format!("OnCalendar={}", render_oncalendar(c)),
+        Schedule::Several(_) | Schedule::None => return Err(
+            "this console sets one schedule at a time; several calendar slots or no schedule \
+             at all has to be edited in the unit by hand".into()),
+    };
+
+    let lines: Vec<&str> = text.lines().collect();
+    let section = lines.iter().position(|l| l.trim() == "[Timer]")
+        .ok_or_else(|| "the unit has no [Timer] section to edit".to_string())?;
+    let end = lines[section + 1..].iter().position(|l| l.trim_start().starts_with('['))
+        .map(|i| section + 1 + i).unwrap_or(lines.len());
+
+    const SCHEDULE_KEYS: [&str; 4] =
+        ["OnCalendar=", "OnUnitActiveSec=", "OnUnitInactiveSec=", "OnBootSec="];
+    let mut out: Vec<String> = lines[..=section].iter().map(|s| s.to_string()).collect();
+    for l in &lines[section + 1..end] {
+        if !SCHEDULE_KEYS.iter().any(|k| l.trim_start().starts_with(k)) {
+            out.push(l.to_string());
+        }
+    }
+    out.push(new_line);
+    out.extend(lines[end..].iter().map(|s| s.to_string()));
+    let mut result = out.join("\n");
+    if text.ends_with('\n') {
+        result.push('\n');
+    }
+    Ok(result)
 }
 
-pub fn uninstall_self(_label: &str) -> Result<String, String> {
-    Err("removing the tray from autostart is not implemented on Linux yet".into())
+/// The inverse of `parse_oncalendar`: an omitted `Cal` field is a wildcard `*`, never a zero --
+/// the same rule `edit_schedule` in `launchd.rs` writes plist calendar keys by. The year is always
+/// `*`: `Cal` carries none, and every schedule this console sets is yearly at most.
+fn render_oncalendar(c: &Cal) -> String {
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let num = |v: Option<u32>| v.map(|n| format!("{n:02}")).unwrap_or_else(|| "*".to_string());
+    let weekday = c.weekday.map(|w| format!("{} ", DAYS[(w as usize) % 7])).unwrap_or_default();
+    format!("{weekday}*-{}-{} {}:{}:00", num(c.month), num(c.day), num(c.hour), num(c.minute))
 }
 
-/// Not implemented, so there is nothing to be wrong about -- `None`, not a permanent warning.
-/// `bin/tray.rs` draws whatever this returns on every single menu rebuild, and the project's own
-/// rule is that a warning shown forever is a warning nobody reads.
-pub fn autostart_fault(_label: &str) -> Option<String> {
-    None
+/// Check the edited unit before anything is reloaded into systemd -- the counterpart of
+/// `plutil -lint`. A unit that fails this check simply is not accepted by systemd, so reloading
+/// it anyway would leave the timer quietly unarmed rather than on the new schedule.
+///
+/// `systemd-analyze` is not present on every system (some minimal distros ship `systemctl`
+/// without it); the fallback asks the same question a different way, through `daemon-reload` and
+/// the `LoadState` this module already knows how to read.
+fn verify_unit(path: &str) -> Result<(), String> {
+    match Command::new("systemd-analyze").args(["--user", "verify", path]).output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            Err(if err.is_empty() { "systemd-analyze verify failed".into() } else { err })
+        }
+        Err(_) => {
+            let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).output();
+            let unit = std::path::Path::new(path).file_name()
+                .and_then(|f| f.to_str()).unwrap_or("").to_string();
+            match show(&unit) {
+                Ok(rows) => load_fault(&rows).map_or(Ok(()), Err),
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
+/// Reload systemd's view of the unit files and re-arm the timer. A reload alone is not enough:
+/// a running timer holds its own copy of the schedule from the moment it was armed, the same trap
+/// `launchd.rs` documents for `bootstrap` -- so the timer is restarted, not merely reloaded.
+fn reload_and_restart(label: &str) -> Result<(), String> {
+    let o = Command::new("systemctl").args(["--user", "daemon-reload"]).output()
+        .map_err(|e| format!("could not call systemctl: {e}"))?;
+    if !o.status.success() {
+        let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+        return Err(if err.is_empty() { "daemon-reload failed".into() } else { err });
+    }
+    let timer = format!("{label}.timer");
+    let o = Command::new("systemctl").args(["--user", "restart", "--", &timer]).output()
+        .map_err(|e| format!("could not call systemctl: {e}"))?;
+    if !o.status.success() {
+        let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+        return Err(if err.is_empty() { format!("restart {timer} failed") } else { err });
+    }
+    Ok(())
+}
+
+/// Change a job's schedule: edit the `.timer` unit and reload it into systemd.
+///
+/// Mirrors `launchd.rs::set_schedule`'s discipline, not its mechanics: a `.bak` copy is made
+/// first (refusing if one already exists -- the leftover of an edit that did not finish, and the
+/// only copy of the working schedule worth trusting), the file is rewritten, checked, reloaded,
+/// and finally **read back** through `systemctl --user show` -- the point of every step before it.
+/// Any failure restores the backup and says, in words, whether the restore itself worked.
+pub fn set_schedule(job: &Job, sched: &Schedule) -> Result<String, String> {
+    if matches!(sched, Schedule::None | Schedule::Several(_)) {
+        return Err("this console changes one calendar slot or one interval at a time; several \
+                    slots or no schedule at all has to be edited in the unit by hand".into());
+    }
+    if job.unwritable() {
+        return Err(format!("this unit could not be read ({}) -- I will not edit it",
+                            job.fault.as_deref().unwrap_or("")));
+    }
+    valid_stem(&job.label)?;
+    let path = job.source.to_string_lossy().to_string();
+    let backup = format!("{path}.bak");
+    if std::fs::metadata(&backup).is_ok() {
+        return Err(format!("{backup} already exists: an earlier edit did not finish. Compare it \
+                            with {path} and remove it before editing again -- it may be the only \
+                            copy of the working schedule."));
+    }
+    let original = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    std::fs::copy(&path, &backup).map_err(|e| format!("cannot make a backup copy {backup}: {e}"))?;
+
+    let rewritten = match rewrite_timer(&original, sched) {
+        Ok(text) => text,
+        Err(e) => {
+            let _ = std::fs::remove_file(&backup);
+            return Err(e);
+        }
+    };
+    if let Err(e) = std::fs::write(&path, &rewritten) {
+        return Err(match std::fs::copy(&backup, &path) {
+            Ok(_) => { let _ = std::fs::remove_file(&backup);
+                       format!("could not write the unit ({e}); the file was restored from the \
+                                backup copy") }
+            Err(c) => format!("could not write the unit ({e}) AND it could not be restored \
+                               ({c}). The good copy is at {backup}."),
+        });
+    }
+
+    if let Err(e) = verify_unit(&path) {
+        return Err(match std::fs::copy(&backup, &path) {
+            Ok(_) => { let _ = std::fs::remove_file(&backup);
+                       format!("the unit does not pass the check after the edit ({e}); the file \
+                                was restored from the backup copy, the schedule was not changed") }
+            Err(c) => format!("the unit does not pass the check after the edit ({e}) AND it \
+                               could NOT be restored ({c}). The good copy is at {backup}."),
+        });
+    }
+
+    if let Err(e) = reload_and_restart(&job.label) {
+        if let Err(c) = std::fs::copy(&backup, &path) {
+            return Err(format!("systemd did not accept the new schedule ({e}) AND the file \
+                could not be restored ({c}). The good copy is at {backup}; the file on disk \
+                carries the new schedule that systemd refused."));
+        }
+        let reloaded = reload_and_restart(&job.label);
+        let _ = std::fs::remove_file(&backup);
+        return Err(match reloaded {
+            Ok(()) => format!("systemd did not accept the new schedule ({e}); the file was \
+                               restored and the timer is armed again"),
+            Err(e2) => format!("systemd did not accept the new schedule ({e}); the file was \
+                restored BUT the timer could not be reloaded either ({e2}). Fix it with: \
+                systemctl --user daemon-reload && systemctl --user restart {}.timer", job.label),
+        });
+    }
+
+    // Read back what actually landed, not what was asked for -- the point of every step above.
+    let timer_label = format!("{}.timer", job.label);
+    let landed = show(&timer_label).ok().map(|rows| parse_schedule(&rows));
+    if landed.as_ref() != Some(sched) {
+        let _ = std::fs::copy(&backup, &path);
+        let _ = reload_and_restart(&job.label);
+        let _ = std::fs::remove_file(&backup);
+        return Err(format!(
+            "systemd reloaded the unit but reports a different schedule than was set ({}) -- \
+             the file was restored", landed.map(|s| s.human()).unwrap_or_else(|| "none".into())));
+    }
+
+    let _ = std::fs::remove_file(&backup);
+    Ok(format!("{}: {}", job.short(), sched.human()))
+}
+
+/// Arm or disarm a timer without touching its schedule -- the action `enablement_fault` can
+/// already see is needed but the read-only tray could not take.
+pub const SUPPORTS_ENABLE: bool = true;
+
+pub fn set_enabled(job: &Job, enabled: bool) -> Result<String, String> {
+    valid_stem(&job.label)?;
+    let timer = format!("{}.timer", job.label);
+    let before = show(&timer)?;
+    if matches!(get(&before, "UnitFileState"), Some("masked" | "masked-runtime")) {
+        return Err(format!("{timer} is masked -- unmask it first: \
+                            systemctl --user unmask {timer}"));
+    }
+    let verb = if enabled { "enable" } else { "disable" };
+    let o = Command::new("systemctl").args(["--user", verb, "--now", "--", &timer]).output()
+        .map_err(|e| format!("could not call systemctl: {e}"))?;
+    if !o.status.success() {
+        let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+        return Err(if err.is_empty() { format!("{verb} {timer} failed") } else { err });
+    }
+    let after = show(&timer)?;
+    let now_active = get(&after, "ActiveState") == Some("active");
+    if now_active != enabled {
+        return Err(format!("{timer} was asked to {verb}, but its ActiveState is now {:?}",
+                            get(&after, "ActiveState").unwrap_or("")));
+    }
+    Ok(format!("{}: {}", job.short(), if enabled { "enabled" } else { "disabled" }))
+}
+
+/// The tray's own autostart unit, as text. A function so a test can read what is actually
+/// written, the same role `tray_plist` plays in `launchd.rs`.
+///
+/// `Restart=on-failure`, not `always`: an unconditional restart makes Quit a menu item that lies
+/// -- the tray reappearing seconds after someone chose to close it -- which is exactly the trap
+/// `launchd.rs`'s `KeepAlive` comment documents for the plist side of this same unit.
+/// `WantedBy=default.target` rather than a graphical-session target: not every desktop environment
+/// reaches the latter, and `default.target` is the one every session manager pulls in.
+fn tray_unit(exe: &str, log: &str) -> String {
+    format!(
+        "[Unit]\n\
+         Description=HyperMnesia tray\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={exe}\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         StandardOutput=append:{log}\n\
+         StandardError=append:{log}\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n")
+}
+
+/// Put the console itself into autostart: a unit pointing at the current binary, enabled but not
+/// started -- starting it now would run a second tray beside the one already open.
+pub fn install_self(label: &str) -> Result<String, String> {
+    valid_stem(label)?;
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("cannot determine the path to myself: {e}"))?
+        .to_string_lossy().to_string();
+    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+    let dir = units_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = dir.join(format!("{label}.service"));
+    let log = format!("{home}/.hypermnesia/logs/tray.log");
+    if let Some(d) = PathBuf::from(&log).parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    std::fs::write(&path, tray_unit(&exe, &log)).map_err(|e| format!("{}: {e}", path.display()))?;
+
+    if let Err(e) = Command::new("systemctl").args(["--user", "daemon-reload"]).output() {
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("could not call systemctl: {e}"));
+    }
+    let unit = format!("{label}.service");
+    let o = Command::new("systemctl").args(["--user", "enable", "--", &unit]).output()
+        .map_err(|e| format!("could not call systemctl: {e}"))?;
+    if !o.status.success() {
+        let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+        let _ = std::fs::remove_file(&path);
+        let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).output();
+        return Err(format!("the unit was written but systemd would not enable it: {}",
+                            if err.is_empty() { "enable failed".into() } else { err }));
+    }
+    Ok(format!("{} installed into autostart\nbinary: {exe}\nlog: {log}\nit starts at your next \
+               login; to start it now: systemctl --user start {unit}", path.display()))
+}
+
+/// Take the console out of autostart.
+pub fn uninstall_self(label: &str) -> Result<String, String> {
+    valid_stem(label)?;
+    let path = units_dir()?.join(format!("{label}.service"));
+    let unit = format!("{label}.service");
+    let _ = Command::new("systemctl").args(["--user", "disable", "--now", "--", &unit]).output();
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).output();
+            Ok(format!("{} removed from autostart", path.display()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
+            Err(format!("{} is not there anyway", path.display())),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Is the installed autostart unit still pointing at this binary, and still armed?
+///
+/// A unit that has never been installed is `None`, not a fault -- `install_self` not having been
+/// run is not the same claim as "checked, and something is wrong". A unit that exists but points
+/// somewhere else, or is masked/disabled, is the same quiet failure `launchd.rs`'s version of this
+/// function was written to catch: a tray moved, rebuilt elsewhere, or installed from a copy that
+/// has since been deleted, failing at every login with nothing on screen to say so.
+pub fn autostart_fault(label: &str) -> Option<String> {
+    let path = units_dir().ok()?.join(format!("{label}.service"));
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(format!("{}: {e}", path.display())),
+    };
+    let installed = text.lines().find_map(|l| l.trim().strip_prefix("ExecStart="))?.to_string();
+    if !std::path::Path::new(&installed).exists() {
+        return Some(format!("autostart points at {installed}, which is not there any more"));
+    }
+    let me = std::env::current_exe().ok()?.to_string_lossy().to_string();
+    if installed != me {
+        return Some(format!("autostart starts {installed}, not this binary ({me})"));
+    }
+    let rows = show(&format!("{label}.service")).ok()?;
+    match get(&rows, "UnitFileState") {
+        Some("disabled" | "masked" | "masked-runtime") => Some(format!(
+            "the tray's autostart unit is {}", get(&rows, "UnitFileState").unwrap_or(""))),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -506,6 +874,21 @@ mod tests {
 
         let seconds = rows(&[("TimersMonotonic", "{ OnUnitActiveUSec=1min 30s ; next_elapse=0 }")]);
         assert_eq!(parse_schedule(&seconds), Schedule::Every(90));
+    }
+
+    /// `set_schedule` writes `OnBootSec=` next to `OnUnitActiveSec=`, so systemd reports TWO
+    /// `TimersMonotonic` rows -- one per directive. Reproduced against a real unit: `systemctl
+    /// show` lists the `OnBootUSec` row first, and `get`'s first-match used to hand that one
+    /// back, find no `OnUnitActiveUSec=` key in it, and read the whole timer as unscheduled --
+    /// which would have made `set_schedule`'s own read-back check fail every single interval
+    /// schedule it had just written.
+    #[test]
+    fn a_monotonic_schedule_is_found_even_behind_an_onboot_row() {
+        let r = rows(&[
+            ("TimersMonotonic", "{ OnBootUSec=1h ; next_elapse=1h }"),
+            ("TimersMonotonic", "{ OnUnitActiveUSec=1h ; next_elapse=12h }"),
+        ]);
+        assert_eq!(parse_schedule(&r), Schedule::Every(3_600));
     }
 
     #[test]
@@ -595,24 +978,109 @@ mod tests {
         assert_eq!(parse_standard_output("[Service]\nType=oneshot\n"), None);
     }
 
-    #[test]
-    fn write_actions_refuse_rather_than_pretend() {
-        assert!(run_now("hypermnesia-extract").is_err());
-        let job = Job {
-            label: "x".into(), source: PathBuf::new(), schedule: Schedule::None,
+    fn broken(label: &str, schedule: Schedule) -> Job {
+        Job {
+            label: label.into(), source: PathBuf::new(), schedule,
             program: vec![], log: None, log_state: LogState::NotConfigured, last_exit: None,
-            installed: None, runs: None, pid: None, trigger: TriggerState::NotTracked, fault: None,
-        };
-        assert!(set_schedule(&job, &Schedule::Every(3600)).is_err());
-        assert!(install_self("hypermnesia-tray").is_err());
-        assert!(uninstall_self("hypermnesia-tray").is_err());
+            installed: None, runs: None, pid: None, trigger: TriggerState::NotTracked,
+            armed: None, fault: Some("could not be read".into()),
+        }
     }
 
     #[test]
-    fn autostart_fault_is_none_not_a_permanent_warning() {
-        // Not implemented is not the same claim as "checked, and it's fine" -- but a permanent
-        // warning drawn on every menu rebuild is a warning nobody reads, so this returns the
-        // same `None` a passing check would.
-        assert_eq!(autostart_fault("hypermnesia-tray"), None);
+    fn set_schedule_refuses_a_job_with_a_fault_without_touching_the_filesystem() {
+        assert!(set_schedule(&broken("x", Schedule::Every(3600)), &Schedule::Every(3600)).is_err());
+    }
+
+    #[test]
+    fn set_schedule_refuses_none_and_several_before_touching_anything() {
+        let mut j = broken("x", Schedule::None);
+        j.fault = None;
+        assert!(set_schedule(&j, &Schedule::None).is_err());
+        assert!(set_schedule(&j, &Schedule::Several(vec![Cal::default()])).is_err());
+    }
+
+    /// A unit name is a path component and a shell argument both; anything that could escape
+    /// either is refused before a single `Command` is built.
+    #[test]
+    fn valid_stem_rejects_traversal_and_shell_metacharacters() {
+        assert!(valid_stem("hypermnesia-extract").is_ok());
+        assert!(valid_stem("").is_err());
+        assert!(valid_stem("../etc/passwd").is_err());
+        assert!(valid_stem("a/b").is_err());
+        assert!(valid_stem("-rf").is_err());
+        assert!(valid_stem("a b").is_err());
+        assert!(valid_stem("a;rm -rf ~").is_err());
+    }
+
+    /// The inverse of `parse_oncalendar`: every field it can produce round-trips, and an omitted
+    /// field renders as `*`, never a zero -- the same bug `parse_oncalendar`'s own tests guard
+    /// against, from the writing side this time.
+    #[test]
+    fn render_oncalendar_round_trips_through_parse_oncalendar() {
+        let weekly = Cal { hour: Some(6), minute: Some(10), day: None, weekday: Some(1),
+                            month: None };
+        assert_eq!(render_oncalendar(&weekly), "Mon *-*-* 06:10:00");
+        assert_eq!(parse_oncalendar(&render_oncalendar(&weekly)), Some(weekly));
+
+        let monthly = Cal { day: Some(1), hour: Some(3), minute: Some(0), weekday: None,
+                            month: None };
+        assert_eq!(render_oncalendar(&monthly), "*-*-01 03:00:00");
+        assert_eq!(parse_oncalendar(&render_oncalendar(&monthly)), Some(monthly));
+
+        let hourly = Cal { minute: Some(15), ..Cal::default() };
+        assert_eq!(render_oncalendar(&hourly), "*-*-* *:15:00");
+        assert_eq!(parse_oncalendar(&render_oncalendar(&hourly)), Some(hourly));
+    }
+
+    #[test]
+    fn rewrite_timer_replaces_an_existing_oncalendar_rather_than_doubling_it() {
+        let unit = "[Unit]\nDescription=x\n\n[Timer]\nOnCalendar=*-*-* 05:00:00\nPersistent=true\n\
+                    \n[Install]\nWantedBy=timers.target\n";
+        let sched = Schedule::at(6, 10, Some(1));
+        let out = rewrite_timer(unit, &sched).expect("rewrites");
+        assert_eq!(out.matches("OnCalendar=").count(), 1, "{out}");
+        assert!(out.contains("OnCalendar=Mon *-*-* 06:10:00"), "{out}");
+        assert!(out.contains("Persistent=true"), "unrelated keys survive: {out}");
+        assert!(out.contains("WantedBy=timers.target"), "sections after [Timer] survive: {out}");
+    }
+
+    #[test]
+    fn rewrite_timer_switches_an_interval_schedule_and_sets_onbootsec_too() {
+        let unit = "[Timer]\nOnCalendar=*-*-* 05:00:00\n\n[Install]\nWantedBy=timers.target\n";
+        let out = rewrite_timer(unit, &Schedule::Every(14_400)).expect("rewrites");
+        assert!(!out.contains("OnCalendar="), "{out}");
+        assert!(out.contains("OnUnitActiveSec=14400"), "{out}");
+        assert!(out.contains("OnBootSec=14400"), "so an interval timer also fires after a boot: {out}");
+    }
+
+    #[test]
+    fn rewrite_timer_refuses_without_a_timer_section() {
+        assert!(rewrite_timer("[Unit]\nDescription=x\n", &Schedule::Every(3600)).is_err());
+    }
+
+    #[test]
+    fn rewrite_timer_refuses_none_and_several() {
+        assert!(rewrite_timer("[Timer]\n", &Schedule::None).is_err());
+        assert!(rewrite_timer("[Timer]\n", &Schedule::Several(vec![Cal::default()])).is_err());
+    }
+
+    /// `Restart=on-failure`, not `always`: an unconditional restart makes Quit a button that
+    /// lies, the same trap `launchd.rs`'s `KeepAlive` comment documents for the plist side.
+    #[test]
+    fn tray_unit_restarts_on_failure_only_and_points_at_the_binary() {
+        let unit = tray_unit("/usr/local/bin/hypermnesia", "/home/you/.hypermnesia/logs/tray.log");
+        assert!(unit.contains("Restart=on-failure"), "{unit}");
+        assert!(!unit.contains("Restart=always"), "{unit}");
+        assert!(unit.contains("ExecStart=/usr/local/bin/hypermnesia"), "{unit}");
+        assert!(unit.contains("WantedBy=default.target"), "{unit}");
+    }
+
+    /// A unit that was never installed is an honest "nothing to report", not a fault -- the same
+    /// rule the read-only version of this function was already written to.
+    #[test]
+    fn autostart_fault_is_none_when_nothing_was_ever_installed() {
+        // A label no real installation would use, so the read simply finds no file.
+        assert_eq!(autostart_fault("hypermnesia-tray-selftest-does-not-exist"), None);
     }
 }

@@ -129,7 +129,12 @@ have. What it says, and what each line means:
 | `this shell` as a source | set here, but the jobs the service manager starts do not inherit it — the line below says what they use |
 | `the answer parsed but has no "memories"` | something answered, but it was not this query's result. Not a store full of zeros |
 | `systemctl --user is not reachable: <why>` (Linux) | no session bus, not "no jobs configured" — the two must never look alike |
-| `... is not implemented on Linux yet` | `run`, `every`, `at`, `--install`, `--uninstall`: read-only for now on the systemd backend |
+| `<path>.bak already exists: an earlier edit did not finish` | a previous `set_schedule` was interrupted before it could clean up; compare the `.bak` with the live file and remove it before editing again |
+| `the unit does not pass the check after the edit (...); the file was restored` (Linux) | `systemd-analyze --user verify` (or, failing that, a `daemon-reload` + `LoadState` check) refused the edit before anything was reloaded; nothing changed |
+| `systemd reloaded the unit but reports a different schedule than was set (...) -- the file was restored` (Linux) | the read-back after a reload did not match what was asked; the console does not call an edit done on the strength of an exit code alone |
+| `<name> ran and exited <code>` | `run` succeeded in the sense of starting; the program itself failed. The exit code is read back from `ExecMainStatus`/`InvocationID` after the request, not assumed from `systemctl start`'s own success |
+| `<timer> is masked -- unmask it first: systemctl --user unmask <timer>` (Linux) | `enable`/`disable` refuses a masked unit rather than fighting the mask |
+| `autostart starts <path>, not this binary (<path>)` | the installed autostart unit points at a binary that has moved, been rebuilt elsewhere, or been deleted — it will fail at every login with nothing on screen to say so until this line does |
 
 Schedules are read the way each backend means them. On macOS an omitted `StartCalendarInterval`
 field is a wildcard, so `{Minute: 15}` is "hourly at :15" and `{Day: 1, Hour: 3}` is "monthly day 1

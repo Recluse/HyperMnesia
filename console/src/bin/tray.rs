@@ -33,19 +33,28 @@ mod app {
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
     use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-    /// How often to refresh on its own. A minute: the numbers move slowly and every reading is a
-    /// round trip to the store.
+    /// How often to refresh the store's own numbers on its own. A minute: they move slowly and
+    /// every reading is a round trip over whatever transport the store is configured with.
     pub const REFRESH: Duration = Duration::from_secs(60);
+
+    /// How often to re-read the jobs on their own, apart from the store. A local `systemctl`/
+    /// `launchctl` call is cheap -- cheap enough that a person watching a job they just started
+    /// should not be stuck behind the store's minute-long cadence to see it finish.
+    const JOBS_REFRESH: Duration = Duration::from_secs(5);
+
+    /// How long after a write command (run, schedule, enable/disable) to keep polling the jobs at
+    /// the faster `BURST_REFRESH` cadence, so the result of pressing a button shows up in a
+    /// couple of seconds rather than waiting out `JOBS_REFRESH`.
+    const BURST_WINDOW: Duration = Duration::from_secs(10);
+    const BURST_REFRESH: Duration = Duration::from_secs(1);
 
     /// How long the worker may be silent after being asked something before the menu says so. The
     /// store's own timeout is 30 s by default, so this is well past any normal answer: the point
     /// is to notice a worker that will never answer at all, not to hurry a slow one.
     const WORKER_PATIENCE: Duration = Duration::from_secs(90);
 
-    /// Ready-made schedules offered in the menu. Exactly what is usually wanted and nothing more:
-    /// the rare case belongs on the command line -- where, on Linux today, it is the only place:
-    /// `jobs::set_schedule` refuses with "not implemented on Linux yet", and picking one of these
-    /// items just shows that refusal in the note line rather than silently doing nothing.
+    /// Ready-made schedules offered in the menu. Exactly what is usually wanted and nothing more
+    /// -- the rare case belongs on the command line, on every platform this tray runs on now.
     const PRESETS: &[(&str, jobs::Schedule)] = &[
         ("hourly", jobs::Schedule::Every(3600)),
         ("every 4 hours", jobs::Schedule::Every(14_400)),
@@ -58,13 +67,13 @@ mod app {
 hypermnesia — the memory console in the menu bar / system tray.
 
     hypermnesia              run the tray
-    hypermnesia --install    add to autostart, where supported
-    hypermnesia --uninstall  remove from autostart, where supported
+    hypermnesia --install    add to autostart
+    hypermnesia --uninstall  remove from autostart
 
 The numbers and the buttons are the same ones hypermnesia-stats and hypermnesia-jobs give: the
-tray calls the same functions. Connection settings come from hypermnesia-setup. Autostart and
-schedule editing are launchd-only for now; on Linux those actions say so rather than doing
-nothing silently.
+tray calls the same functions. Connection settings come from hypermnesia-setup. The store's own
+numbers refresh every minute; the jobs -- a local, cheap read -- refresh every few seconds, faster
+still for a little while after a button is pressed.
 ";
 
     /// Handle `--install` / `--uninstall` / `--help` before any window or GTK loop exists: all
@@ -99,16 +108,12 @@ nothing silently.
         Failed(String),
         /// The outcome of a button press: a line to show at the top of the menu.
         Note(String),
+        /// A jobs-only reading: local and cheap, refreshed on its own cadence from the store's.
+        Jobs(Vec<Job>, Option<String>),
     }
 
     pub struct Snapshot {
         stats: Stats,
-        jobs: Vec<Job>,
-        /// Why the job list is missing, if it is. `unwrap_or_default()` used to turn "could not
-        /// read the job directory" into an empty list, which rendered as empty Run-now and
-        /// Schedule submenus and a calm title -- "no jobs readable" and "every job healthy"
-        /// looked identical.
-        jobs_error: Option<String>,
         /// Wall clock, not `Instant`: the age of the data has to survive the machine sleeping,
         /// and a monotonic clock stops while it does. That made a two-hour nap look like a fresh
         /// reading.
@@ -116,39 +121,54 @@ nothing silently.
     }
 
     pub enum Command {
+        /// Both the store and the jobs.
         Refresh,
+        /// The jobs alone -- local, fast, and asked for far more often than `Refresh`. Does not
+        /// touch `awaiting`: this is a background heartbeat, not a question the watchdog should
+        /// hold the tray to.
+        RefreshJobs,
         RunJob(String),
         SetSchedule(String, jobs::Schedule),
+        SetEnabled(String, bool),
+    }
+
+    fn read_jobs() -> (Vec<Job>, Option<String>) {
+        // Through jobs::job_prefix rather than a cached value: the tray runs for weeks, and a
+        // prefix fixed in the config file in the meantime has to reach it without a restart.
+        match jobs::list(&jobs::job_prefix()) {
+            Ok(j) => (j, None),
+            Err(e) => (Vec::new(), Some(e)),
+        }
     }
 
     /// The worker: every slow thing lives here. The main thread only posts commands to it.
     pub fn spawn_worker(tx: mpsc::Sender<Update>, rx: mpsc::Receiver<Command>) {
         std::thread::spawn(move || {
-            let read_all = |tx: &mpsc::Sender<Update>| {
+            let read_store = |tx: &mpsc::Sender<Update>| {
                 // Re-read the settings on every pass rather than once at startup. The tray runs
                 // for weeks; a connection fixed with the setup wizard in the meantime has to
                 // reach the running tray, or the fix looks like it did not work.
-                let target = Target::default();
-                let prefix = jobs::job_prefix();
-                // Jobs are read locally and fast; the store is read over whatever transport was
-                // configured and may be slow. If the store does not answer, the jobs are still
-                // worth showing.
-                let (job_list, jobs_error) = match jobs::list(&prefix) {
-                    Ok(j) => (j, None),
-                    Err(e) => (Vec::new(), Some(e)),
-                };
-                match fetch(&target) {
+                match fetch(&Target::default()) {
                     Ok(stats) => {
-                        let _ = tx.send(Update::Data(Box::new(Snapshot {
-                            stats, jobs: job_list, jobs_error, at: SystemTime::now(),
-                        })));
+                        let _ = tx.send(Update::Data(Box::new(Snapshot { stats, at: SystemTime::now() })));
                     }
                     Err(e) => { let _ = tx.send(Update::Failed(e)); }
                 }
             };
+            let read_jobs_into = |tx: &mpsc::Sender<Update>| {
+                let (jobs, err) = read_jobs();
+                let _ = tx.send(Update::Jobs(jobs, err));
+            };
             while let Ok(cmd) = rx.recv() {
                 match cmd {
-                    Command::Refresh => read_all(&tx),
+                    Command::Refresh => {
+                        // Jobs first: they are local and fast, and worth showing even if the
+                        // store -- reached over whatever transport is configured, possibly slow
+                        // -- does not answer.
+                        read_jobs_into(&tx);
+                        read_store(&tx);
+                    }
+                    Command::RefreshJobs => read_jobs_into(&tx),
                     Command::RunJob(label) => {
                         let msg = match jobs::run_now(&label) {
                             Ok(m) => m,
@@ -156,14 +176,13 @@ nothing silently.
                             Err(e) => format!("! did not start: {e}"),
                         };
                         let _ = tx.send(Update::Note(msg));
-                        read_all(&tx);
+                        read_jobs_into(&tx);
                     }
                     Command::SetSchedule(label, sched) => {
-                        // Look the job up again: the list the menu was drawn from may be a
-                        // minute old, and editing a schedule from a stale record means editing
+                        // Look the job up again: the list the menu was drawn from may be several
+                        // seconds old, and editing a schedule from a stale record means editing
                         // something other than what the person saw.
-                        let msg = match jobs::list(&jobs::job_prefix()).ok()
-                            .and_then(|all| all.into_iter().find(|j| j.label == label)) {
+                        let msg = match read_jobs().0.into_iter().find(|j| j.label == label) {
                             Some(j) => match jobs::set_schedule(&j, &sched) {
                                 Ok(m) => m,
                                 Err(e) => format!("! {e}"),
@@ -171,7 +190,18 @@ nothing silently.
                             None => format!("! the job {label} is gone"),
                         };
                         let _ = tx.send(Update::Note(msg));
-                        read_all(&tx);
+                        read_jobs_into(&tx);
+                    }
+                    Command::SetEnabled(label, enabled) => {
+                        let msg = match read_jobs().0.into_iter().find(|j| j.label == label) {
+                            Some(j) => match jobs::set_enabled(&j, enabled) {
+                                Ok(m) => m,
+                                Err(e) => format!("! {e}"),
+                            },
+                            None => format!("! the job {label} is gone"),
+                        };
+                        let _ = tx.send(Update::Note(msg));
+                        read_jobs_into(&tx);
                     }
                 }
             }
@@ -188,6 +218,9 @@ nothing silently.
         quit: Option<MenuItem>,
         run: Vec<(MenuItem, String)>,
         sched: Vec<(MenuItem, String, jobs::Schedule)>,
+        /// One item per job that can be armed/disarmed, carrying the label and the state a click
+        /// on it should set (the opposite of what it currently is).
+        enable: Vec<(MenuItem, String, bool)>,
     }
 
     pub struct App {
@@ -196,6 +229,12 @@ nothing silently.
         rx: mpsc::Receiver<Update>,
         cmd: mpsc::Sender<Command>,
         last: Option<Snapshot>,
+        jobs: Vec<Job>,
+        /// Why the job list is missing, if it is. `unwrap_or_default()` used to turn "could not
+        /// read the job directory" into an empty list, which rendered as empty Run-now and
+        /// Schedule submenus and a calm title -- "no jobs readable" and "every job healthy"
+        /// looked identical.
+        jobs_error: Option<String>,
         status: String,
         /// The outcome of the last button press, on its own line and with its own age.
         ///
@@ -204,11 +243,26 @@ nothing silently.
         /// "updated just now". The outcome of something a person did is the last thing that
         /// should be overwritten.
         note: Option<(String, SystemTime)>,
-        /// What the worker was last asked, and when. Cleared by any answer.
+        /// What the worker was last asked, and when. Cleared by any answer to it. Only `Refresh`
+        /// and the write commands set this -- a background `RefreshJobs` tick is not a question
+        /// the watchdog should hold the tray to.
         awaiting: Option<(String, Instant)>,
         /// The worker thread is gone: nothing will ever be read again.
         worker_dead: bool,
         last_refresh: Instant,
+        last_jobs_refresh: Instant,
+        /// A `RefreshJobs` was sent and no `Update::Jobs` has answered it yet. Without this a
+        /// worker stuck on a slow `systemctl`/`launchctl` call would be sent a new request every
+        /// tick, piling up behind the one already running.
+        jobs_in_flight: bool,
+        /// Poll the jobs at `BURST_REFRESH` rather than `JOBS_REFRESH` until this instant --
+        /// set after every write command, so its result shows up in a couple of seconds rather
+        /// than waiting out the idle cadence.
+        burst_until: Instant,
+        /// The content last drawn, so an unchanged jobs-only reading at `JOBS_REFRESH` cadence
+        /// does not tear down and rebuild the menu -- which can close one open under the cursor
+        /// -- for no visible difference.
+        last_render: Option<String>,
     }
 
     /// What a platform's event loop should do after a tick.
@@ -221,25 +275,33 @@ nothing silently.
 
     impl App {
         pub fn new(rx: mpsc::Receiver<Update>, cmd: mpsc::Sender<Command>) -> Self {
+            let now = Instant::now();
             App {
                 tray: None,
                 items: Items::default(),
                 rx,
                 cmd,
                 last: None,
+                jobs: Vec::new(),
+                jobs_error: None,
                 status: "loading…".to_string(),
                 note: None,
-                awaiting: Some(("the first reading".into(), Instant::now())),
+                awaiting: Some(("the first reading".into(), now)),
                 worker_dead: false,
-                last_refresh: Instant::now(),
+                last_refresh: now,
+                last_jobs_refresh: now,
+                jobs_in_flight: false,
+                burst_until: now,
+                last_render: None,
             }
         }
 
-        /// Post a command and remember that an answer is owed. Every path to the worker goes
-        /// through here so that nothing can be asked without the watchdog knowing about it.
+        /// Post a command and remember that an answer is owed. Every path to the worker that the
+        /// watchdog should track goes through here.
         fn ask(&mut self, cmd: Command, status: &str, what: &str) {
             self.status = status.to_string();
             self.awaiting = Some((what.to_string(), Instant::now()));
+            self.burst_until = Instant::now() + BURST_WINDOW;
             let _ = self.cmd.send(cmd);
         }
 
@@ -248,36 +310,47 @@ nothing silently.
         pub fn tick(&mut self) -> Tick {
             if self.tray.is_none() {
                 self.rebuild();
+                self.last_render = Some(self.content_fingerprint());
             }
 
             let mut dirty = false;
             loop {
                 match self.rx.try_recv() {
-                    Ok(u) => {
+                    Ok(Update::Data(s)) => {
                         self.awaiting = None;
-                        match u {
-                            Update::Data(s) => {
-                                // Not a sentence: the sentence is rendered at rebuild time from
-                                // `last.at`. Frozen, it said "updated just now" for the whole
-                                // refresh cycle -- and after the machine slept, for as long as
-                                // the nap lasted, because the refresh timer is monotonic and
-                                // stops with it.
-                                self.status = String::new();
-                                self.last = Some(*s);
-                            }
-                            Update::Failed(e) => {
-                                // The old numbers stay -- they beat an empty screen -- but they
-                                // are labelled with the reason and with HOW OLD they are.
-                                // Without the age you cannot tell "could not reach it a second
-                                // ago" from "stuck since yesterday".
-                                let age = self.last.as_ref()
-                                    .map(|s| format!(", showing state from {} ago",
-                                                     view::ago(view::age_of(s.at))))
-                                    .unwrap_or_default();
-                                self.status = format!("! not updated: {e}{age}");
-                            }
-                            Update::Note(n) => self.note = Some((n, SystemTime::now())),
-                        }
+                        // Not a sentence: the sentence is rendered at rebuild time from `last.at`.
+                        // Frozen, it said "updated just now" for the whole refresh cycle -- and
+                        // after the machine slept, for as long as the nap lasted, because the
+                        // refresh timer is monotonic and stops with it.
+                        self.status = String::new();
+                        self.last = Some(*s);
+                        dirty = true;
+                    }
+                    Ok(Update::Failed(e)) => {
+                        self.awaiting = None;
+                        // The old numbers stay -- they beat an empty screen -- but they are
+                        // labelled with the reason and with HOW OLD they are. Without the age you
+                        // cannot tell "could not reach it a second ago" from "stuck since
+                        // yesterday".
+                        let age = self.last.as_ref()
+                            .map(|s| format!(", showing state from {} ago",
+                                             view::ago(view::age_of(s.at))))
+                            .unwrap_or_default();
+                        self.status = format!("! not updated: {e}{age}");
+                        dirty = true;
+                    }
+                    Ok(Update::Note(n)) => {
+                        self.awaiting = None;
+                        self.note = Some((n, SystemTime::now()));
+                        dirty = true;
+                    }
+                    Ok(Update::Jobs(jobs, err)) => {
+                        // Deliberately does NOT clear `awaiting`: a background jobs poll is not
+                        // an answer to whatever `Refresh` or a write command asked, and treating
+                        // it as one would let a hung store fetch hide behind it forever.
+                        self.jobs_in_flight = false;
+                        self.jobs = jobs;
+                        self.jobs_error = err;
                         dirty = true;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -330,6 +403,14 @@ nothing silently.
                     dirty = true;
                     continue;
                 }
+                if let Some((_, label, enabled)) =
+                    self.items.enable.iter().find(|(i, _, _)| i.id() == &ev.id) {
+                    let (label, enabled) = (label.clone(), *enabled);
+                    let what = format!("{} {label}", if enabled { "enabling" } else { "disabling" });
+                    self.ask(Command::SetEnabled(label, enabled), &format!("{what}…"), &what);
+                    dirty = true;
+                    continue;
+                }
                 // A press on an item from a menu that has since been rebuilt: the ids are new,
                 // so nothing above matched. Silently dropping it left a person pressing a button
                 // that did nothing, with no way to tell that from a button that did nothing
@@ -343,10 +424,58 @@ nothing silently.
                 self.last_refresh = Instant::now();
                 self.ask(Command::Refresh, &self.status.clone(), "a reading");
             }
+            // The jobs, cheap and local, on their own faster cadence -- faster still for a while
+            // after a button was pressed, so pressing it does not mean waiting out the idle
+            // cadence to see whether it worked.
+            let jobs_cadence = if Instant::now() < self.burst_until { BURST_REFRESH }
+                               else { JOBS_REFRESH };
+            if !self.jobs_in_flight && self.last_jobs_refresh.elapsed() >= jobs_cadence {
+                self.last_jobs_refresh = Instant::now();
+                self.jobs_in_flight = true;
+                let _ = self.cmd.send(Command::RefreshJobs);
+            }
             if dirty {
-                self.rebuild();
+                let fp = self.content_fingerprint();
+                if self.last_render.as_ref() != Some(&fp) {
+                    self.rebuild();
+                    self.last_render = Some(fp);
+                }
             }
             Tick::Continue
+        }
+
+        /// Everything that would change what is drawn, boiled down to one string -- compared
+        /// against the last one drawn so a `RefreshJobs` tick that changed nothing does not tear
+        /// down and rebuild the menu, which can close one open under the cursor, for no visible
+        /// difference. Deliberately leaves out anything that only ages (the "(N ago)" suffixes):
+        /// those are cosmetic, and `status_line`'s own coarse buckets already force a redraw when
+        /// the words themselves would change.
+        fn content_fingerprint(&self) -> String {
+            let mut fp = self.status_line();
+            fp.push('\n');
+            if let Some((note, _)) = &self.note {
+                fp.push_str(note);
+                fp.push('\n');
+            }
+            if let Some(why) = jobs::autostart_fault(jobs::DEFAULT_TRAY_LABEL) {
+                fp.push_str(&why);
+                fp.push('\n');
+            }
+            if let Some(s) = &self.last {
+                for line in view::summary(&s.stats) {
+                    fp.push_str(&line);
+                    fp.push('\n');
+                }
+            }
+            if let Some(why) = &self.jobs_error {
+                fp.push_str(why);
+                fp.push('\n');
+            }
+            for j in &self.jobs {
+                fp.push_str(&view::job_line(j));
+                fp.push_str(&format!(" armed={:?}\n", j.armed));
+            }
+            fp
         }
 
         fn rebuild(&mut self) {
@@ -372,12 +501,12 @@ nothing silently.
                 }
                 let _ = menu.append(&PredefinedMenuItem::separator());
 
-                if let Some(why) = &s.jobs_error {
+                if let Some(why) = &self.jobs_error {
                     let _ = menu.append(&MenuItem::new(format!("! jobs unreadable: {why}"),
                                                        false, None));
                 }
                 let run = Submenu::new("Run now", true);
-                for j in &s.jobs {
+                for j in &self.jobs {
                     let item = MenuItem::new(view::job_line(j), true, None);
                     let _ = run.append(&item);
                     items.run.push((item, j.label.clone()));
@@ -385,8 +514,8 @@ nothing silently.
                 let _ = menu.append(&run);
 
                 let sched = Submenu::new("Schedule", true);
-                for j in &s.jobs {
-                    if matches!(j.schedule, jobs::Schedule::None) || j.broken() {
+                for j in &self.jobs {
+                    if matches!(j.schedule, jobs::Schedule::None) || j.unwritable() {
                         continue;           // nothing to change, or nothing readable to change
                     }
                     let sub = Submenu::new(format!("{} ({})", j.short(), j.schedule.human()),
@@ -400,7 +529,33 @@ nothing silently.
                 }
                 let _ = menu.append(&sched);
 
-                warned = view::warned(&s.stats, &s.jobs, &s.jobs_error);
+                // A backend that tracks "armed" at all (systemd; not launchd, where a loaded job
+                // is armed by definition and there is nothing here to switch) gets a submenu to
+                // fix the one fault the read side could already see but not act on.
+                if jobs::SUPPORTS_ENABLE {
+                    let timers = Submenu::new("Timers", true);
+                    let mut any = false;
+                    for j in &self.jobs {
+                        // A job the backend could not load at all (`armed` is only ever `None`
+                        // there) has nothing to arm; a merely disabled one -- `armed ==
+                        // Some(false)`, which also carries a `fault` from `enablement_fault` --
+                        // is exactly the case this submenu exists to fix, so it is NOT excluded
+                        // here the way `j.broken()` alone would exclude it.
+                        let Some(armed) = j.armed else { continue };
+                        any = true;
+                        let label = format!("{} ({})", j.short(),
+                                            if armed { "enabled" } else { "disabled" });
+                        let action = if armed { "Disable" } else { "Enable" };
+                        let item = MenuItem::new(format!("{label} -- {action}"), true, None);
+                        let _ = timers.append(&item);
+                        items.enable.push((item, j.label.clone(), !armed));
+                    }
+                    if any {
+                        let _ = menu.append(&timers);
+                    }
+                }
+
+                warned = view::warned(&s.stats, &self.jobs, &self.jobs_error);
             }
             // The status line and the last note are as much a part of "does this need a mark" as
             // the store's own numbers: a failed refresh has no `Snapshot` to derive a warning

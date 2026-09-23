@@ -121,6 +121,7 @@ mod tests {
             log_state: LogState::Written(SystemTime::now() - Duration::from_secs(300)),
             runs: Some(9), trigger: jobs::TriggerState::NotTracked,
             installed: Some(SystemTime::now() - Duration::from_secs(90_000)), fault: None,
+            armed: None,
         }
     }
 

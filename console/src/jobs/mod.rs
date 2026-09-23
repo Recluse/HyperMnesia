@@ -21,17 +21,20 @@ use std::time::{Duration, SystemTime};
 #[cfg(target_os = "macos")]
 mod launchd;
 #[cfg(target_os = "macos")]
-pub use launchd::{autostart_fault, install_self, list, run_now, set_schedule, uninstall_self};
+pub use launchd::{autostart_fault, install_self, list, run_now, set_enabled, set_schedule,
+                   uninstall_self, SUPPORTS_ENABLE};
 
 #[cfg(target_os = "linux")]
 mod systemd;
 #[cfg(target_os = "linux")]
-pub use systemd::{autostart_fault, install_self, list, run_now, set_schedule, uninstall_self};
+pub use systemd::{autostart_fault, install_self, list, run_now, set_enabled, set_schedule,
+                   uninstall_self, SUPPORTS_ENABLE};
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod unsupported;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub use unsupported::{autostart_fault, install_self, list, run_now, set_schedule, uninstall_self};
+pub use unsupported::{autostart_fault, install_self, list, run_now, set_enabled, set_schedule,
+                       uninstall_self, SUPPORTS_ENABLE};
 
 /// Reverse-DNS prefix of the launchd labels this console manages, on macOS.
 #[cfg(target_os = "macos")]
@@ -285,6 +288,12 @@ pub struct Job {
     /// one that is not running, and that is precisely the case the console used to have nothing
     /// to say about, because the row was dropped from the list.
     pub fault: Option<String>,
+    /// Whether the schedule is armed, where the backend can say. `Some(true)` on systemd is a
+    /// timer that is `UnitFileState=enabled` and `ActiveState=active`; `Some(false)` is loaded but
+    /// not armed -- exactly what `enablement_fault` already flags as a fault. `None` on launchd,
+    /// which has no separate "loaded but not armed" state to report: a plist launchd has loaded is
+    /// armed, full stop, so there is nothing here to switch.
+    pub armed: Option<bool>,
 }
 
 impl Job {
@@ -314,6 +323,18 @@ impl Job {
     /// Something is wrong with the job itself, before any question of when it last ran.
     pub fn broken(&self) -> bool {
         self.fault.is_some()
+    }
+
+    /// Wrong enough that a write action should refuse to touch the unit -- unlike
+    /// `armed == Some(false)`, which means the unit loaded and parsed just fine and is simply
+    /// disabled, a state `set_enabled`/`set_schedule` exist to fix rather than a reason to
+    /// refuse them. `armed` is `Some(_)` on systemd whenever the unit could be loaded at all, and
+    /// `None` only when it could not -- the same distinction `read_unit`/`broken_job` already
+    /// draw there. On launchd, where enablement is not a separate state, `armed` is always
+    /// `None`, so this collapses back to plain `broken()` -- exactly what that backend's own
+    /// `fault` has always meant.
+    pub fn unwritable(&self) -> bool {
+        self.fault.is_some() && self.armed.is_none()
     }
 
     /// The service manager has never started it.
@@ -458,7 +479,7 @@ mod tests {
         Job {
             label: "x".into(), source: PathBuf::new(), schedule, program: vec![], log: None,
             last_exit: None, pid: None, log_state: LogState::NotConfigured, runs: None,
-            installed: None, trigger: TriggerState::NotTracked, fault: None,
+            installed: None, trigger: TriggerState::NotTracked, fault: None, armed: None,
         }
     }
 

@@ -18,6 +18,12 @@ pub fn set_schedule(_job: &Job, _sched: &Schedule) -> Result<String, String> {
     Err("scheduled jobs are not supported on this platform".into())
 }
 
+pub const SUPPORTS_ENABLE: bool = false;
+
+pub fn set_enabled(_job: &Job, _enabled: bool) -> Result<String, String> {
+    Err("scheduled jobs are not supported on this platform".into())
+}
+
 pub fn install_self(_label: &str) -> Result<String, String> {
     Err("autostart is not supported on this platform".into())
 }

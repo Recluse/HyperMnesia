@@ -78,6 +78,7 @@ fn broken_job(path: &PathBuf, name: &str, fault: String,
         log_state: LogState::NotConfigured,
         trigger: super::TriggerState::NotTracked,
         fault: Some(fault),
+        armed: None,
     }
 }
 
@@ -102,6 +103,7 @@ fn read_plist(path: &PathBuf, states: &BTreeMap<String, (Option<u32>, Option<i32
         label, source: path.clone(), schedule, log, last_exit, pid, log_state, runs, installed,
         trigger: super::TriggerState::NotTracked,
         fault: None,
+        armed: None,
     })
 }
 
@@ -486,6 +488,15 @@ pub fn autostart_fault(label: &str) -> Option<String> {
     (installed != me).then(|| format!("autostart starts {installed}, not this binary ({me})"))
 }
 
+/// launchd has no separate "loaded but not armed" state: a job it has loaded runs on its
+/// schedule, full stop. There is nothing here for a menu toggle to switch.
+pub const SUPPORTS_ENABLE: bool = false;
+
+pub fn set_enabled(_job: &Job, _enabled: bool) -> Result<String, String> {
+    Err("launchd has no separate enable/disable step -- a loaded job is armed; unload it with \
+        launchctl bootout instead".into())
+}
+
 /// Take the console out of autostart.
 pub fn uninstall_self(label: &str) -> Result<String, String> {
     let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
@@ -514,7 +525,7 @@ mod tests {
         Job {
             label: "x".into(), source: PathBuf::new(), schedule, program: vec![], log: None,
             last_exit: None, pid: None, log_state: LogState::NotConfigured, runs: None,
-            installed: None, trigger: super::TriggerState::NotTracked, fault: None,
+            installed: None, trigger: super::TriggerState::NotTracked, fault: None, armed: None,
         }
     }
 
