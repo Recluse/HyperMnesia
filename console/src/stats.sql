@@ -9,7 +9,11 @@ SELECT json_build_object(
      'active', (SELECT count(*) FROM mem.active_memories),
      'by_type', (SELECT coalesce(json_object_agg(t, n),'{}') FROM (
          SELECT memory_type::text AS t, count(*) AS n FROM mem.active_memories GROUP BY 1) x),
-     'by_project', (SELECT coalesce(json_agg(json_build_object('project', coalesce(project,'(none)'), 'n', n) ORDER BY n DESC),'[]')
+     -- 'project' raw, NULL and all: the coalesce used to run per row AFTER the GROUP BY, so a
+     -- memory with no project and a memory whose project is literally named '(none)' became two
+     -- array entries with the same label and no way to tell them apart. The same NULL-vs-literal
+     -- collision this query dropped from embedding_models, two lines below.
+     'by_project', (SELECT coalesce(json_agg(json_build_object('project', project, 'n', n) ORDER BY n DESC),'[]')
                     FROM (SELECT project, count(*) AS n FROM mem.active_memories GROUP BY 1) y),
      'pages', (SELECT count(*) FROM mem.active_memories WHERE metadata->>'kind'='page')
    ) FROM mem.memories),

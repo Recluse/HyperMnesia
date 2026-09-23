@@ -21,8 +21,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use hypermnesia_console::{config, config_path, jobs, probe, save_config, Target,
-                          DEFAULT_PSQL_CMD, PRESETS};
+use hypermnesia_console::{config, config_path, jobs, probe, resolve_psql_cmd, save_config,
+                          Target, DEFAULT_PSQL_CMD, PRESETS};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -119,8 +119,12 @@ fn walkthrough() {
         // A config this console refuses is not a config that says "use the default": say
         // so here rather than checking the default command for a shell variable it does
         // not have and reporting nothing wrong.
-        let cmd = match config() {
-            Ok(c) => c.get("HM_PSQL_CMD").cloned().unwrap_or_default(),
+        // Resolved the way everything else resolves it -- environment, then file, then the
+        // default -- rather than reading the file's raw value. Unfiltered, an `HM_PSQL_CMD=`
+        // line made this step skip its $DATABASE_URL warning while the command the tray would
+        // actually run was the default, which depends on exactly that variable.
+        let cmd = match resolve_psql_cmd() {
+            Ok(c) => c,
             Err(e) => { println!("! {e}"); String::new() }
         };
         if let Some(var) = shell_variable_in(&cmd) {
@@ -256,6 +260,22 @@ fn run_hm(args: &[&str]) -> bool {
 // -- the connection --------------------------------------------------------------------------
 
 fn connect() -> bool {
+    // Read BEFORE anything is asked or tried. It used to be read after the probe, so a refused
+    // file came back through the same boolean as "the store did not answer" -- and the
+    // walkthrough then printed "without a reachable store the remaining steps have nothing to
+    // act on" three lines under "The database answered: ...", and sent the operator to
+    // `--connect`, which takes this same path and fails identically every time. Nothing in the
+    // wizard can change a file's mode, so that advice could never work.
+    let existing: BTreeMap<String, String> = match config() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("\n! {e}");
+            println!("  Nothing can be written until that is fixed, and the console is reading \
+                      no settings meanwhile.");
+            println!("  Fix or remove the file, then run `hypermnesia-setup --connect` again.");
+            return false;
+        }
+    };
     println!("\nDeployments differ by exactly one thing: the command that runs psql.");
     println!("Pick the shape closest to yours:\n");
     println!("  (A password inside the command ends up in psql's argv, where any process running");
@@ -301,12 +321,10 @@ fn connect() -> bool {
         }
     };
 
-    // Merged into what is already there, so a config that cannot be read must stop the
-    // save: writing over it would silently drop every other setting in it.
-    let mut cfg: BTreeMap<String, String> = match config() {
-        Ok(c) => c,
-        Err(e) => { println!("! {e}\nNothing was written."); return false; }
-    };
+    // Merged into what was already there -- read at the top of this function, before the
+    // operator was asked to type anything, so a refused file stops the step with its own
+    // reason rather than through the reachability answer.
+    let mut cfg = existing;
     cfg.insert("HM_PSQL_CMD".into(), cmd);
     match save_config(&cfg) {
         Ok(()) => {
@@ -442,28 +460,41 @@ fn offer_hooks_block() {
 // -- the smaller commands ---------------------------------------------------------------------
 
 fn show() {
-    // The reason comes first and nothing else is printed: this command exists to answer
-    // "which database am I talking to", and the honest answer to a refused config is the
-    // refusal. It used to print the DEFAULT command here, which is a different store.
+    // The environment is read FIRST, because that is the order `resolve_psql_cmd` resolves in.
+    // Refusing to answer while an environment variable was deciding the matter told the
+    // operator a working install was broken, and advised them to do the thing they had already
+    // done.
+    let from_env = std::env::var("HM_PSQL_CMD").ok().filter(|s| !s.is_empty());
     let cfg = match config() {
         Ok(c) => c,
         Err(e) => {
             println!("Config file: {}", config_path().display());
             println!("! {e}");
-            println!("Refusing to guess which database that leaves. Fix or remove the \
-file, or set HM_PSQL_CMD in the environment.");
+            match &from_env {
+                // The file is refused AND ignored anyway: say both, in that order.
+                Some(v) => {
+                    println!("The environment decides this one, and it is set:\n  {v}");
+                    println!("  (the file above is refused whole and read by nothing)");
+                }
+                // Nothing else names a database, and the DEFAULT is a different store.
+                None => println!("Refusing to guess which database that leaves. Fix or remove \
+the file, or set HM_PSQL_CMD in the environment."),
+            }
             return;
         }
     };
     println!("Config file: {}{}", config_path().display(),
              if config_path().exists() { "" } else { "  (not created yet)" });
-    let from_env = std::env::var("HM_PSQL_CMD").ok().filter(|s| !s.is_empty());
-    match (&from_env, cfg.get("HM_PSQL_CMD")) {
+    // Filtered exactly as `resolve_psql_cmd` filters it. Unfiltered, a line `HM_PSQL_CMD=`
+    // printed "Command (from the file):" and a blank line, while every binary was in fact
+    // connecting with the default -- the reporting tool and the runtime naming two stores.
+    let cfg_cmd = cfg.get("HM_PSQL_CMD").filter(|s| !s.is_empty());
+    match (&from_env, cfg_cmd) {
         (Some(v), _) => {
             println!("Command (from the environment, HM_PSQL_CMD):\n  {v}");
             // Compared, not assumed: the two are usually identical right after --connect, and
             // announcing a disagreement that was never measured is its own small lie.
-            match cfg.get("HM_PSQL_CMD") {
+            match cfg_cmd {
                 Some(f) if f != v => println!("! the file holds a different one, and the \
                                                environment wins:\n  {f}"),
                 Some(_) => println!("  the file holds the same command."),

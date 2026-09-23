@@ -59,7 +59,7 @@ fn render(s: &Stats) {
 
     println!();
     let (docs, chunks, embedded) = totals(s, false);
-    let (mdocs, _, _) = totals(s, true);
+    let (mdocs, mchunks, membedded) = totals(s, true);
     println!("CORPUS            {docs} documents, {chunks} chunks, {embedded} with embeddings");
     if embedded < chunks {
         // Not an "error", but not a detail either: chunks left without an embedding are found by
@@ -67,7 +67,15 @@ fn render(s: &Stats) {
         println!("  ! {} chunks with no embedding -- found only by the exact word",
                  chunks - embedded);
     }
+    // Page mirrors are EXCLUDED from the corpus totals above, so their unembedded chunks used to
+    // be reported by nobody -- and the tray mark, derived from these lines, stayed calm over a
+    // knowledge page sitting in the store unreachable by meaning. Its own line, because it is
+    // its own population.
     println!("  page mirrors    {mdocs} (<project>~mem tags; the document search sees them)");
+    if membedded < mchunks {
+        println!("  ! {} page-mirror chunks with no embedding -- the pages are in the store but \
+                  not found by meaning", mchunks - membedded);
+    }
     println!("  models          {}", match s.embedding_models.len() {
         0 => "none recorded".to_string(),
         1 => s.embedding_models.keys().next().cloned().unwrap_or_default(),
@@ -81,8 +89,12 @@ fn render(s: &Stats) {
         // Counted apart from the named models, not folded in under "(null)": a model with that
         // name would have merged with them, and one number over two different things is the
         // substitution this console refuses everywhere else.
-        println!("  ! {} embedded chunks record no model -- which one they can be compared \
-                  with is unknown", s.embedding_unset);
+        //
+        // "of all chunks" is not padding: this figure comes from the whole chunks table, while
+        // the CORPUS line three above it has page mirrors taken out. Without saying so, the two
+        // numbers can contradict each other on one screen and both be right.
+        println!("  ! {} embedded chunks record no model (of ALL chunks, page mirrors included) \
+                  -- which model they can be compared with is unknown", s.embedding_unset);
     }
     println!("  Tier 0/1 map    {}",
              s.components.iter().map(|(r, n)| format!("{r} {n}")).collect::<Vec<_>>().join(", "));

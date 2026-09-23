@@ -39,6 +39,14 @@ pub fn summary(s: &Stats) -> Vec<String> {
     if embedded < chunks {
         out.push(format!("! not embedded: {}", chunks - embedded));
     }
+    // Page mirrors are filtered out of the totals above, so an unembedded knowledge page raised
+    // nothing here and the title -- derived from these lines -- stayed calm over it.
+    let (_, mchunks, membedded) = s.corpus.iter()
+        .filter(|r| r.is_memory_page())
+        .fold((0, 0, 0), |(d, c, e), r| (d + r.docs, c + r.chunks, e + r.embedded));
+    if membedded < mchunks {
+        out.push(format!("! pages not embedded: {}", mchunks - membedded));
+    }
     if s.embedding_models.len() > 1 {
         // Two models in one store means part of the corpus cannot be reached by meaning at all.
         out.push(format!("! embedding models: {}", s.embedding_models.len()));

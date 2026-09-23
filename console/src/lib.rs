@@ -118,11 +118,15 @@ pub fn config_path() -> std::path::PathBuf {
 /// lookups, so anyone able to create entries in that directory could let the checked file be the
 /// person's own and the READ file be theirs.
 #[cfg(unix)]
-pub fn fd_fault(path: &std::path::Path, md: &std::fs::Metadata) -> Result<(), String> {
+pub fn fd_fault(path: &std::path::Path, f: &std::fs::File, md: &std::fs::Metadata)
+    -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
     // Not libc: one extern declaration keeps the data layer dependency-free, which is the
     // reason a console built from it compiles in seconds.
     extern "C" { fn getuid() -> u32; }
+    // The descriptor itself is only consulted by the macOS ACL check below.
+    #[cfg(not(target_os = "macos"))]
+    let _ = f;
     if !md.is_file() {
         // A directory, a device or a fifo here is a misconfigured HM_CONSOLE_CONFIG. Reading it
         // fails, and falling back to the default without a word is how the console ends up
@@ -134,6 +138,33 @@ pub fn fd_fault(path: &std::path::Path, md: &std::fs::Metadata) -> Result<(), St
         return Err(format!("{}: mode {mode:o} -- another account can write it, and what it \
                             holds is the command this console runs. Ignoring the whole file.",
                            path.display()));
+    }
+    // An ACL is not in the mode bits. On macOS -- the tray's own platform -- a file at 0600
+    // carrying `chmod +a "everyone allow write"` passed this guard untouched, and its command
+    // went to `sh -c` at every refresh and at login. The likely way to arrive there is not a
+    // hostile neighbour but an inherited `file_inherit` ACE from a shared, network or
+    // MDM-managed home, and `save_config` will happily create the file under one.
+    //
+    // Refused rather than interpreted: reading an ACL well enough to decide it grants nobody
+    // anything is a much larger thing than this guard, and "there is an ACL on the file that
+    // decides who may run commands as you" is worth a person's attention either way.
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // acl_get_fd returns NULL and sets errno when the descriptor carries no ACL.
+        extern "C" {
+            fn acl_get_fd(fd: i32) -> *mut std::ffi::c_void;
+            fn acl_free(obj: *mut std::ffi::c_void) -> i32;
+        }
+        let acl = unsafe { acl_get_fd(f.as_raw_fd()) };
+        if !acl.is_null() {
+            unsafe { acl_free(acl) };
+            return Err(format!("{}: it carries an access-control list, which the mode bits do \
+                                not show and this console does not read. What the file holds \
+                                is a command run as you, at login, unattended -- so an ACL \
+                                nobody has looked at is a reason to ignore the whole file. \
+                                `ls -le` shows it; `chmod -N` removes it.", path.display()));
+        }
     }
     let me = unsafe { getuid() };
     if md.uid() != me {
@@ -165,7 +196,7 @@ fn read_config_file(path: &std::path::Path) -> Result<Option<String>, String> {
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
     let md = f.metadata().map_err(|e| format!("{}: {e}", path.display()))?;
-    fd_fault(path, &md)?;
+    fd_fault(path, &f, &md)?;
     let mut text = String::new();
     (&f).read_to_string(&mut text).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(Some(text))
@@ -192,12 +223,21 @@ pub fn config() -> Result<BTreeMap<String, String>, String> {
     let path = config_path();
     let mut out = BTreeMap::new();
     let Some(text) = read_config_file(&path)? else { return Ok(out) };
-    for line in text.lines() {
+    for (n, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') { continue; }
-        if let Some((k, v)) = line.split_once('=') {
-            out.insert(k.trim().to_string(), v.trim().to_string());
-        }
+        // A line that is not a setting is an ERROR, not a line with no setting in it. Skipping
+        // it left a file of `HM_PSQL_CMD: docker exec ...` (a colon, or a space) returning an
+        // empty map -- which is the signal for "there is no config file", so the console went
+        // to the default command and drew a complete healthy reading of a different store. The
+        // doc comment above this function claimed absence was the only quiet outcome; this is
+        // what made that claim true.
+        let Some((k, v)) = line.split_once('=') else {
+            return Err(format!("{}:{}: {line:?} is not `NAME=value`, and a settings file that \
+                                cannot be read whole is not a settings file",
+                               path.display(), n + 1));
+        };
+        out.insert(k.trim().to_string(), v.trim().to_string());
     }
     Ok(out)
 }
@@ -223,12 +263,23 @@ pub fn save_config(map: &BTreeMap<String, String>) -> Result<(), String> {
     {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt;
+        // Through a symlink to the file it points AT. Renaming over the link itself replaced
+        // it with a regular file and abandoned the target -- so a config kept in a dotfiles
+        // repo and symlinked here silently stopped being the config, while the old command
+        // stayed in the file the operator would go and look at.
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "console.conf".into());
         let tmp = path.with_file_name(format!("{name}.new"));
         // A leftover from an interrupted save would otherwise block every future one. Removing
         // it first is safe in a directory only this account can write -- which is the same
-        // assumption the guard above already makes about the config itself.
+        // assumption the guard above already makes about the config itself. A DIRECTORY there
+        // is not removed by this and would block every save for ever, so it is named as the
+        // obstacle it is rather than being reported against the config's own path.
+        if tmp.is_dir() {
+            return Err(format!("{} is a directory, so the settings cannot be written through \
+                                it. Remove it and try again.", tmp.display()));
+        }
         let _ = std::fs::remove_file(&tmp);
         let written = (|| -> std::io::Result<()> {
             let mut f = std::fs::OpenOptions::new()
@@ -446,16 +497,36 @@ fn run_with_timeout(cmd: &str, stdin_text: &str, timeout: Duration) -> Result<St
                 .to_string())
         }
     };
-    let err = match rx_e.recv_timeout(COLLECT_FLOOR) {
-        Ok(Ok(b)) => String::from_utf8_lossy(&b).into_owned(),   // for a person to read
-        Ok(Err(e)) => e,
-        Err(_) => "(its error output is still held open by something it started)".to_string(),
+    // stderr gets the same treatment as stdout, and for the same reason: a descendant holding
+    // it open is a descendant still running after this console has an answer. The first version
+    // of this rewrite only handled the stdout side -- measured afterwards, a grandchild holding
+    // ONLY stderr came back as a complete successful dashboard with `sleep 40` still on the
+    // process table. The answer itself IS good here (stdout reached EOF, so the writer had
+    // finished), so the reading stands; what must not stand is the leftovers.
+    // `None` when stderr never arrived, NOT a placeholder sentence: a non-empty string here
+    // satisfied the "did stderr say anything?" test below, so the stdout fallback -- the whole
+    // point of which is that some of these fail with everything on stdout -- never fired, and
+    // the console threw away the diagnostic it was holding.
+    let err: Option<String> = match rx_e.recv_timeout(COLLECT_FLOOR) {
+        Ok(Ok(b)) => Some(String::from_utf8_lossy(&b).into_owned()),   // for a person to read
+        Ok(Err(e)) => Some(e),
+        Err(_) => {
+            kill_tree(&mut child);
+            None
+        }
     };
+    let held_stderr = err.is_none();
+    let err = err.unwrap_or_default();
     // Checked after the exit status, never before it: psql that fails on the first line exits
     // while the rest of the query is still being written, and the EPIPE that causes is the
     // symptom. Reporting it instead of the real error is how "syntax error at or near" became
     // "writing the query: Broken pipe".
-    let write_failed = matches!(rx_w.recv_timeout(COLLECT_FLOOR), Ok(Err(_)));
+    //
+    // A writer still BLOCKED counts as failed, not as fine. `matches!(.., Ok(Err(_)))` read a
+    // timeout as "no error reported", so a query only half delivered -- the writer wedged on a
+    // full pipe -- could come back as a successful reading of whatever the child had already
+    // answered.
+    let write_failed = !matches!(rx_w.recv_timeout(COLLECT_FLOOR), Ok(Ok(())));
 
     // Our own reason for refusing the output comes before the exit status. When the size limit
     // is what stopped the read, the child dies of SIGPIPE BECAUSE of that -- and "the command
@@ -471,10 +542,13 @@ fn run_with_timeout(cmd: &str, stdin_text: &str, timeout: Duration) -> Result<St
             tail = out.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
         }
         let code = st.code().map(|c| c.to_string()).unwrap_or_else(|| "a signal".into());
+        let held = if held_stderr {
+            " (its error output was held open by something it started, and was not read)"
+        } else { "" };
         if tail.trim().is_empty() {
-            return Err(format!("the command exited {code} and said nothing at all"));
+            return Err(format!("the command exited {code} and said nothing at all{held}"));
         }
-        return Err(format!("the query failed (exit {code}): {tail}"));
+        return Err(format!("the query failed (exit {code}): {tail}{held}"));
     }
     if write_failed {
         // A clean exit that never took the whole query answered a DIFFERENT question from the
@@ -640,6 +714,11 @@ impl<'a> Scanner<'a> {
         let hex = self.b.get(self.i..self.i + 4)
             .and_then(|h| std::str::from_utf8(h).ok())
             .ok_or("short \\u escape")?;
+        // Four hex DIGITS. `from_str_radix` accepts a sign, so `\u+041` decoded to `A` instead
+        // of being refused -- a escape JSON does not have, silently given a meaning.
+        if !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!("bad \\u escape {hex:?}"));
+        }
         let n = u32::from_str_radix(hex, 16).map_err(|_| format!("bad \\u escape {hex:?}"))?;
         self.i += 4;
         Ok(n)
@@ -725,6 +804,7 @@ impl<'a> Scanner<'a> {
     fn object(&mut self, depth: usize) -> Result<Json, String> {
         self.i += 1;                              // '{'
         let mut kv: Vec<(String, Json)> = Vec::new();
+        let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
         self.ws();
         if self.b.get(self.i) == Some(&b'}') { self.i += 1; return Ok(Json::Obj(kv)); }
         loop {
@@ -732,8 +812,22 @@ impl<'a> Scanner<'a> {
             let k = self.string()?;
             // Duplicates used to resolve two different ways in the same answer -- first wins in
             // `get`, last wins in `counts`. Neither is a reading of anything.
-            if kv.iter().any(|(seen, _)| *seen == k) {
-                return Err(format!("the key {k:?} appears twice"));
+            //
+            // The linear scan is kept for small objects (this query's are 3-13 keys, and a Vec
+            // walk beats hashing at that size) and abandoned above a threshold, because it was
+            // quadratic: a single object of ~200k keys -- well inside the 16 MiB an answer may
+            // be -- had the console busy for minutes, and the deadline does not cover parsing.
+            if kv.len() < 32 {
+                if kv.iter().any(|(seen, _)| *seen == k) {
+                    return Err(format!("the key {k:?} appears twice"));
+                }
+            } else {
+                if seen_keys.is_empty() {
+                    seen_keys.extend(kv.iter().map(|(s, _)| s.clone()));
+                }
+                if !seen_keys.insert(k.clone()) {
+                    return Err(format!("the key {k:?} appears twice"));
+                }
             }
             self.ws();
             if self.b.get(self.i) != Some(&b':') {
@@ -795,6 +889,23 @@ fn need_i64(v: &Json, key: &str, whose: &str) -> Result<i64, String> {
         .ok_or_else(|| format!("{whose}{key:?} is not a whole number"))
 }
 
+/// A field that is a SQL `count(*)`, which cannot be negative. A negative one is not a small
+/// number, it is proof the answer did not come from this query -- and it does real damage on
+/// the way through: `-5` unembedded chunks silenced the warning this console added for them
+/// (both consumers gate on `> 0`), and a negative total printed "483 active of -1" in the CLI
+/// while the tray called the same reading calm.
+///
+/// `review_queue.oldest_days` is deliberately NOT one of these: it comes from a clock
+/// difference, and a clock can legitimately be behind.
+fn need_count(v: &Json, key: &str, whose: &str) -> Result<i64, String> {
+    let n = need_i64(v, key, whose)?;
+    if n < 0 {
+        return Err(format!("{whose}{key:?} is {n}, and a count of things cannot be negative -- \
+                            this is not the stats query"));
+    }
+    Ok(n)
+}
+
 fn need_str<'a>(v: &'a Json, key: &str, whose: &str) -> Result<&'a str, String> {
     need(v, key, whose)?.as_str()
         .ok_or_else(|| format!("{whose}{key:?} is not a string"))
@@ -814,6 +925,10 @@ fn need_counts(v: &Json, key: &str, whose: &str) -> Result<BTreeMap<String, i64>
             for (k, val) in kv {
                 let n = val.as_i64()
                     .ok_or_else(|| format!("{whose}{key:?}: {k:?} is not a whole number"))?;
+                if n < 0 {
+                    return Err(format!("{whose}{key:?}: {k:?} is {n}, and a count of things \
+                                        cannot be negative"));
+                }
                 out.insert(k.clone(), n);
             }
             Ok(out)
@@ -836,29 +951,37 @@ fn parse(raw: &str) -> Result<Stats, String> {
 
     let mem = need(&v, "memories", "")?;
     let mut s = Stats {
-        memories_total: need_i64(mem, "total", "memories.")?,
-        memories_active: need_i64(mem, "active", "memories.")?,
-        pages: need_i64(mem, "pages", "memories.")?,
+        memories_total: need_count(mem, "total", "memories.")?,
+        memories_active: need_count(mem, "active", "memories.")?,
+        pages: need_count(mem, "pages", "memories.")?,
         by_type: need_counts(mem, "by_type", "memories.")?,
-        stale: need_i64(&v, "stale", "")?,
+        stale: need_count(&v, "stale", "")?,
         db_size: need_str(&v, "db_size", "")?.to_string(),
         components: need_counts(&v, "components", "")?,
         ..Stats::default()
     };
     let q = need(&v, "review_queue", "")?;
-    s.review_pending = need_i64(q, "pending", "review_queue.")?;
+    s.review_pending = need_count(q, "pending", "review_queue.")?;
     s.review_oldest_days = need_i64(q, "oldest_days", "review_queue.")?;
 
     for r in need_arr(mem, "by_project", "memories.")? {
-        s.by_project.push((need_str(r, "project", "memories.by_project[].")?.to_string(),
-                           need_i64(r, "n", "memories.by_project[].")?));
+        // The unset bucket arrives as JSON null and is NAMED here, so a project actually
+        // called "(none)" stays a separate line from the memories that have no project.
+        let pj = need(r, "project", "memories.by_project[].")?;
+        let name = if pj.is_null() {
+            "(no project)".to_string()
+        } else {
+            pj.as_str().ok_or("\"memories.by_project[].project\" is neither a string nor null")?
+                .to_string()
+        };
+        s.by_project.push((name, need_count(r, "n", "memories.by_project[].")?));
     }
     for r in need_arr(&v, "corpus", "")? {
         s.corpus.push(RepoStats {
             repo: need_str(r, "repo", "corpus[].")?.to_string(),
-            docs: need_i64(r, "docs", "corpus[].")?,
-            chunks: need_i64(r, "chunks", "corpus[].")?,
-            embedded: need_i64(r, "embedded", "corpus[].")?,
+            docs: need_count(r, "docs", "corpus[].")?,
+            chunks: need_count(r, "chunks", "corpus[].")?,
+            embedded: need_count(r, "embedded", "corpus[].")?,
         });
     }
     // A list, not a `{model: count}` map, because a chunk with NO recorded model has to stay
@@ -866,14 +989,26 @@ fn parse(raw: &str) -> Result<Stats, String> {
     // coalesce both into the same key, merging their counts. JSON null cannot collide with a
     // string.
     for r in need_arr(&v, "embedding_models", "")? {
-        let n = need_i64(r, "n", "embedding_models[].")?;
+        let n = need_count(r, "n", "embedding_models[].")?;
         let m = need(r, "model", "embedding_models[].")?;
         if m.is_null() {
-            s.embedding_unset += n;
+            // Checked, because this is the one place in the parser that ADDS. Unchecked, two
+            // rows of i64::MAX panicked the debug build and, in release, wrapped negative --
+            // which silenced the very warning this field exists to raise.
+            s.embedding_unset = s.embedding_unset.checked_add(n)
+                .ok_or("\"embedding_models\": the chunks with no model sum past what a count \
+                        can hold")?;
         } else {
             let name = m.as_str()
                 .ok_or("\"embedding_models[].model\" is neither a string nor null")?;
-            s.embedding_models.insert(name.to_string(), n);
+            // The same collision the scanner refuses in an object, refused here too. Moving
+            // this field OUT of object form is what let it back in: the map silently kept the
+            // last of two rows naming one model, so a self-contradictory answer printed as a
+            // single healthy model with no mark on the tray at all.
+            if s.embedding_models.insert(name.to_string(), n).is_some() {
+                return Err(format!("\"embedding_models\": the model {name:?} appears twice, \
+                                    and neither count is a reading of anything"));
+            }
         }
     }
     Ok(s)
@@ -886,6 +1021,15 @@ mod tests {
     // A shortened snapshot of a real answer from a live store. The parser is checked against the
     // shape stats.sql actually returns, not one invented for the test.
     const SAMPLE: &str = r#"{"memories" : {"total" : 682, "active" : 483, "by_type" : { "semantic" : 90, "preference" : 139 }, "by_project" : [{"project" : "(none)", "n" : 83}, {"project" : "myrepo", "n" : 68}], "pages" : 17}, "review_queue" : {"pending" : 0, "oldest_days" : 0}, "stale" : 0, "corpus" : [{"repo" : "myrepo", "docs" : 438, "chunks" : 7780, "embedded" : 7780}, {"repo" : "myrepo~mem", "docs" : 1, "chunks" : 1, "embedded" : 1}], "embedding_models" : [{"model" : "bge-m3", "n" : 25035}], "components" : { "myrepo" : 20, "infra" : 38 }, "db_size" : "430 MB"}"#;
+
+    /// Tests that set HM_CONSOLE_CONFIG or HM_PSQL_CMD take this first. The environment is one
+    /// per process and cargo runs tests in threads, so two of them racing would make each other
+    /// fail at random -- and a suite that fails at random is one people learn to re-run.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     /// A complete answer with the three parts a test might want to vary. Every field is
     /// required now, so a test probing ONE of them still has to supply the rest -- which is the
@@ -982,6 +1126,33 @@ mod tests {
         }
     }
 
+    /// An ACL is not in the mode bits, and on macOS -- the tray's own platform -- a file at
+    /// 0600 carrying `everyone allow write` passed the guard untouched while holding a command
+    /// this console runs at login, unattended. The test beside this one asserts "anyone who can
+    /// write it is refused", a property strictly stronger than what the code checked.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_config_with_an_acl_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("hm-acl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("console.conf");
+        std::fs::write(&path, "HM_PSQL_CMD=echo mine\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_config_file(&path).is_ok(), "a plain private file is still usable");
+
+        let applied = std::process::Command::new("chmod")
+            .args(["+a", "everyone allow write,append"]).arg(&path).status();
+        // `chmod +a` needs a filesystem that carries ACLs; skipped rather than failing a
+        // machine whose temp dir does not.
+        if matches!(applied, Ok(s) if s.success()) {
+            let why = read_config_file(&path).expect_err("a file with an ACL must be refused");
+            assert!(why.contains("access-control list"), "{why}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The fixture the README tells a newcomer to try -- the console's one claim that works with
     /// no database at all. A parser change that leaves it behind is discovered by whoever
     /// followed the quickstart, which is the worst possible place to discover it. Written
@@ -1040,6 +1211,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn saving_leaves_a_private_file_and_no_leftovers() {
+        let _env = env_guard();
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join("hm-console-save-test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1060,6 +1232,19 @@ mod tests {
         assert!(std::fs::read_to_string(&path).unwrap().contains("DATABASE_URL"));
         assert!(!dir.join("console.conf.new").exists(), "the temporary file must be gone");
 
+        // A failed save must leave the PREVIOUS settings exactly as they were -- the sentence
+        // the error itself ends with. Only the success path was ever exercised. Forced here by
+        // taking write permission off the directory, so creating the temporary file fails.
+        std::fs::write(&path, "HM_PSQL_CMD=old command\n").unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let e = save_config(&cfg).expect_err("a save that cannot write must not report success");
+        assert!(e.contains("untouched"), "{e}");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before,
+                   "the previous settings were destroyed by a save that failed");
+        assert!(!dir.join("console.conf.new").exists(), "and no temporary file left behind");
+
         std::env::remove_var("HM_CONSOLE_CONFIG");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1073,8 +1258,14 @@ mod tests {
         assert!(parse(r#"{"memories":{"total":7,"active":5}}"#).is_err());
         let full = answer("[]", "[]", "[]");
         parse(&full).expect("the complete shape still parses");
+        // EVERY required field, not a sample of them: four of these -- corpus,
+        // embedding_models, db_size and by_project -- could be made optional again with the
+        // whole suite green, which is a check that reads as coverage and is not.
         for drop in ["\"stale\":0,", "\"components\":{},", ",\"pages\":0", "\"by_type\":{},",
-                     "\"review_queue\":{\"pending\":0,\"oldest_days\":0},"] {
+                     "\"review_queue\":{\"pending\":0,\"oldest_days\":0},",
+                     "\"corpus\":[],", "\"embedding_models\":[],", ",\"db_size\":\"1 MB\"",
+                     "\"by_project\":[],", "\"total\":1,", "\"active\":1,",
+                     "\"pending\":0,", "\"oldest_days\":0"] {
             let damaged = full.replace(drop, "");
             assert_ne!(damaged, full, "the fixture must actually contain {drop}");
             assert!(parse(&damaged).is_err(), "a missing {drop} became a zero");
@@ -1082,6 +1273,15 @@ mod tests {
         // A field of the wrong type is the same lie by another route.
         assert!(parse(&full.replace("\"stale\":0", "\"stale\":\"none\"")).is_err());
         assert!(parse(&full.replace("\"components\":{}", "\"components\":[]")).is_err());
+        assert!(parse(&full.replace("\"corpus\":[]", "\"corpus\":{}")).is_err());
+        assert!(parse(&full.replace("\"embedding_models\":[]", "\"embedding_models\":{}")).is_err());
+        assert!(parse(&full.replace("\"db_size\":\"1 MB\"", "\"db_size\":430")).is_err());
+        assert!(parse(&full.replace("\"by_project\":[]", "\"by_project\":{}")).is_err());
+        assert!(parse(&full.replace("\"by_type\":{}", "\"by_type\":[]")).is_err());
+        // A count map whose VALUE is not a count must fail too: `filter_map` here used to make
+        // the entry disappear, which prints as a smaller store rather than as a problem.
+        assert!(parse(&full.replace("\"by_type\":{}", "\"by_type\":{\"semantic\":\"nine\"}")).is_err());
+        assert!(parse(&full.replace("\"components\":{}", "\"components\":{\"r\":null}")).is_err());
         // ...and so is a row inside a collection that is missing a column: `filter_map` used to
         // make such a row vanish, which prints as a smaller store rather than as a problem.
         assert!(parse(&answer("[]", r#"[{"repo":"x","docs":1,"chunks":2}]"#, "[]")).is_err());
@@ -1136,11 +1336,27 @@ mod tests {
         assert!(began.elapsed() < one * 3, "waited {:?} on a held pipe", began.elapsed());
         assert!(r.is_err(), "a held-open pipe is not a complete answer: {r:?}");
 
-        // The same, holding only stderr. This one used to SUCCEED -- with stderr empty, which
-        // is how a failing command came back as "said nothing at all".
+        // The same, holding only stderr -- and this one is checked by what it LEAVES BEHIND,
+        // not by the clock. The first version of this test timed the call and ignored the
+        // outcome; an audit then measured what it had missed: the console returned a complete,
+        // successful dashboard and the grandchild was still on the process table. A test that
+        // asserts only "it was quick" passes just as happily when nothing was killed.
+        //
+        // The grandchild writes a marker AFTER the call should have ended it. `>/dev/null` on
+        // its stdout is what makes it a stderr-only holder: stdout reaches EOF, so the answer
+        // arrives and the success path is taken.
+        let mark = std::env::temp_dir().join(format!("hm-stderr-holder-{}", std::process::id()));
+        let _ = std::fs::remove_file(&mark);
+        let cmd = format!("(sleep 2; touch {}) >/dev/null & echo hi", mark.display());
         let began = Instant::now();
-        let _ = run_with_timeout("sleep 30 2>/dev/null & echo hi", "", one);
+        let r = run_with_timeout(&cmd, "", one);
         assert!(began.elapsed() < one * 3, "waited {:?} on a held stderr", began.elapsed());
+        assert_eq!(r.as_deref().map(str::trim), Ok("hi"), "the answer itself is good: {r:?}");
+        std::thread::sleep(Duration::from_secs(4));
+        assert!(!mark.exists(),
+                "the grandchild outlived the reading and wrote {} -- the group was not ended",
+                mark.display());
+        let _ = std::fs::remove_file(&mark);
 
         // A query far larger than a pipe's capacity, handed to a command that never reads it.
         // The write used to happen before the deadline existed, on the calling thread.
@@ -1176,11 +1392,62 @@ mod tests {
             .expect_err("a command that never read the query has not answered it");
         assert!(r.contains("whole query"), "{r}");
 
+        // The writer still BLOCKED is the case the first fix missed. Here the child exits at
+        // once but a grandchild keeps the READ end of stdin open without reading it, so the
+        // write neither completes nor fails -- it just sits there. `matches!(.., Ok(Err(_)))`
+        // read that as "no error was reported" and returned a successful reading of whatever
+        // the child had already printed, from a query that was never delivered.
+        let r = run_with_timeout("sleep 5 <&0 >/dev/null 2>&1 & echo partial", &big,
+                                 Duration::from_secs(2))
+            .expect_err("a query left half-written has not been answered");
+        assert!(r.contains("whole query") || r.contains("no answer"), "{r}");
+
         // ...but a command that FAILS reports its own error, not the broken pipe.
         let r = run_with_timeout("echo 'syntax error at or near' >&2; exit 3", &big,
                                  Duration::from_secs(20))
             .expect_err("a failing command is an error");
         assert!(r.contains("syntax error"), "the real error must survive the EPIPE: {r}");
+    }
+
+    /// The headline claim of this work: a refused config must not become the default database.
+    /// It had no check at all -- every config test exercised `read_config_file`, one layer below
+    /// the place where the substitution used to happen.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_config_never_becomes_the_default_database() {
+        let _env = env_guard();
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("hm-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("console.conf");
+        std::fs::write(&path, "HM_PSQL_CMD=echo mine\n").unwrap();
+        std::env::set_var("HM_CONSOLE_CONFIG", &path);
+        std::env::remove_var("HM_PSQL_CMD");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(resolve_psql_cmd().as_deref(), Ok("echo mine"), "a private file is used");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let e = resolve_psql_cmd().expect_err("a refused config must not resolve to a command");
+        assert!(e.contains("write"), "{e}");
+        assert!(Target::from_env().is_err(), "and no Target can be built from it either");
+
+        // A line that is not a setting is the same substitution by another route: the map came
+        // back empty, and empty is the signal for "there is no file".
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, "HM_PSQL_CMD: echo mine\n").unwrap();
+        let e = resolve_psql_cmd().expect_err("a malformed line must not resolve to the default");
+        assert!(e.contains("NAME=value"), "{e}");
+
+        // ...and an explicit environment variable still wins over both, because it names a
+        // database itself rather than leaving the console to guess one.
+        std::env::set_var("HM_PSQL_CMD", "echo explicit");
+        assert_eq!(resolve_psql_cmd().as_deref(), Ok("echo explicit"));
+
+        std::env::remove_var("HM_PSQL_CMD");
+        std::env::remove_var("HM_CONSOLE_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Bad bytes from the command are a failure, not a name. They used to be replaced with
@@ -1208,6 +1475,57 @@ mod tests {
         assert_eq!(s.embedding_models.len(), 1, "the unnamed bucket is not a model");
     }
 
+    /// A count of things cannot be negative, and one that is proves the answer is not this
+    /// query's. Each of these was measured doing real damage before the check existed: -5
+    /// unembedded chunks silenced the warning that field exists to raise (both consumers gate
+    /// on `> 0`), and a negative total printed "483 active of -1" in the CLI while the tray
+    /// called the same reading calm.
+    #[test]
+    fn a_count_of_things_cannot_be_negative() {
+        let full = answer("[]", "[]", "[]");
+        for (what, raw) in [
+            ("memories.total", full.replace("\"total\":1", "\"total\":-1")),
+            ("stale", full.replace("\"stale\":0", "\"stale\":-5")),
+            ("review_queue.pending", full.replace("\"pending\":0", "\"pending\":-3")),
+            ("a by_type entry", full.replace("\"by_type\":{}", "\"by_type\":{\"semantic\":-2}")),
+            ("a corpus row", answer("[]", r#"[{"repo":"x","docs":-1,"chunks":0,"embedded":0}]"#, "[]")),
+            ("an unnamed model bucket", answer("[]", "[]", r#"[{"model":null,"n":-5}]"#)),
+            ("a named model", answer("[]", "[]", r#"[{"model":"m","n":-5}]"#)),
+        ] {
+            assert!(parse(&raw).is_err(), "{what} was accepted as a negative count");
+        }
+        // ...but a clock difference is not a count. `oldest_days` comes from `now() - created_at`
+        // and a machine whose clock is behind may legitimately report it negative.
+        let skew = full.replace("\"oldest_days\":0", "\"oldest_days\":-1");
+        assert_eq!(parse(&skew).expect("clock skew is not a damaged answer").review_oldest_days, -1);
+    }
+
+    /// The unnamed-model bucket is the only place the parser adds, and it must not wrap. Two
+    /// rows of i64::MAX panicked the debug build; release wrapped to a negative, which silenced
+    /// the "chunks record no model" warning this very field was added to raise.
+    #[test]
+    fn the_unnamed_model_bucket_cannot_overflow() {
+        let pair = r#"[{"model":null,"n":9223372036854775807},{"model":null,"n":1}]"#;
+        assert!(parse(&answer("[]", "[]", pair)).is_err(), "overflow must be refused, not wrapped");
+        let ok = r#"[{"model":null,"n":4},{"model":null,"n":5}]"#;
+        assert_eq!(parse(&answer("[]", "[]", ok)).expect("parse").embedding_unset, 9);
+    }
+
+    /// The collision the scanner refuses in an object, refused in the list too. Moving this
+    /// field out of object form to keep NULL distinguishable is what let it back in: the map
+    /// kept the last of two rows naming one model, so a self-contradictory answer printed as
+    /// one healthy model -- and `view::summary` gates its warning on `len() > 1`, so the tray
+    /// title stayed calm over it.
+    #[test]
+    fn one_model_named_twice_is_not_a_reading() {
+        let dup = r#"[{"model":"bge-m3","n":25035},{"model":"bge-m3","n":7}]"#;
+        let e = parse(&answer("[]", "[]", dup)).expect_err("a repeated model must be refused");
+        assert!(e.contains("twice"), "{e}");
+        // The unnamed bucket is a bucket, not a name: repeating it is a sum, not a collision.
+        let nulls = r#"[{"model":null,"n":4},{"model":null,"n":5}]"#;
+        assert_eq!(parse(&answer("[]", "[]", nulls)).expect("parse").embedding_unset, 9);
+    }
+
     /// Damaged JSON is not a reading. Every one of these used to parse successfully.
     #[test]
     fn damaged_json_is_refused() {
@@ -1220,6 +1538,10 @@ mod tests {
             ("a leading plus", full.replace("\"stale\":0", "\"stale\":+01")),
             ("a bare fraction", full.replace("\"stale\":0", "\"stale\":.5")),
             ("an unknown escape", full.replace("\"1 MB\"", "\"1\\qMB\"")),
+            // `from_str_radix` takes a sign, so this used to decode to `A` -- an escape JSON
+            // does not have, quietly given a meaning.
+            ("a signed hex escape", full.replace("\"1 MB\"", "\"\\u+041\"")),
+            ("a spaced hex escape", full.replace("\"1 MB\"", "\"\\u 041\"")),
             ("a raw NUL in a string", full.replace("\"1 MB\"", "\"1\0MB\"")),
             ("a repeated comma in a list", full.replace("\"corpus\":[]", "\"corpus\":[,]")),
         ] {
