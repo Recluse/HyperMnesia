@@ -14,6 +14,11 @@
 #                              --walk enumerates the tree instead of asking git, for a directory
 #                              that is git-ignored or not a repository at all -- without it such a
 #                              directory ingests ZERO documents and says why.
+#   ./hm refresh               re-ingest every scope in $HM_SCOPES (default
+#                              ~/.config/hypermnesia/scopes: <dir><TAB><scope><TAB>[--walk] per
+#                              line), then assert no chunk was left without an embedding. This is
+#                              the one to put on a timer -- freshness.py reports drift, this ends
+#                              it.
 #   ./hm doctor                is this install actually working, or only appearing to
 #   ./hm latency               where the time goes: hook, embedder, database, reranker
 #
@@ -171,11 +176,111 @@ directory listing. See examples/seed_example.sql and skills/onboard-project.
 EOF
 }
 
+cmd_refresh() {
+    # Every scope, in one pass, from a list -- because the thing that rots a store is not a bad
+    # ingest, it is a good one that nobody re-runs. `ci/freshness.py` already counts the drift and
+    # writes it down; counting is not fixing, and a number in a log fixes nothing by itself.
+    #
+    # The list is tab-separated, one scope per line, `#` comments allowed:
+    #
+    #     /home/me/notes<TAB>notes<TAB>--walk
+    #     /home/me/src/api<TAB>api
+    #
+    # Tabs, not spaces: a directory with a space in its name is ordinary, and splitting on
+    # whitespace would quietly ingest the wrong path or nothing at all.
+    file=${HM_SCOPES:-$HOME/.config/hypermnesia/scopes}
+    [ -f "$file" ] || die "no scope list at $file -- one '<dir><TAB><scope><TAB>[--walk]' per line (or set HM_SCOPES)"
+    [ -n "${DATABASE_URL:-}" ] || die "DATABASE_URL is not set (./hm init prints it)"
+    need psql
+
+    # One refresh at a time. `mkdir` is the atomic test-and-set every shell has. Two overlapping
+    # runs would ingest the same scopes concurrently, and the second would delete and rebuild
+    # chunks the first is embedding.
+    lock="${TMPDIR:-/tmp}/hm-refresh.lock"
+    if ! mkdir "$lock" 2>/dev/null; then
+        die "another refresh holds $lock"
+    fi
+    trap 'rmdir "$lock" 2>/dev/null' EXIT INT TERM
+
+    failed=""
+    listed=""
+    while IFS= read -r line; do
+        case "$line" in ''|\#*) continue ;; esac
+        dir=$(printf %s "$line" | cut -f1)
+        scope=$(printf %s "$line" | cut -f2)
+        extra=$(printf %s "$line" | cut -f3)
+        [ -n "$scope" ] || die "malformed line in $file (need a TAB between the path and the scope): $line"
+        # A scope on the list and not on disk is a misconfiguration, not a reason to skip
+        # quietly: the list is hand-written, so a renamed or unmounted directory would drop a
+        # whole scope out of every refresh from then on while the run still reported success.
+        if [ ! -d "$dir" ]; then
+            printf '!! %s: no such directory -- scope %s was NOT refreshed\n' "$dir" "$scope" >&2
+            failed="$failed $scope:missing"
+            continue
+        fi
+        step "Refreshing $scope from $dir"
+        # In a subshell, because cmd_ingest calls die() on a bad scope or an unreachable store and
+        # one bad entry must not take the rest of the list with it.
+        #
+        # `set +e` around it, and `set -e` INSIDE it, and neither is decoration. A subshell that
+        # is the condition of `if` or the left side of `||` has errexit suppressed for everything
+        # in it -- and re-setting it inside does not bring it back (checked in dash and in bash's
+        # sh mode). Written as `if ! ( cmd_ingest ... )`, the embed step could die with a
+        # traceback and the ingest would carry on to build the index and report success. It did:
+        # the first run of this command against a live store crashed on a missing psycopg2, said
+        # nothing, and was only caught by the unembedded-chunk assertion at the very end.
+        set +e
+        # shellcheck disable=SC2086  # $extra is one optional flag or nothing, by construction
+        ( set -e; cmd_ingest "$dir" "$scope" $extra )
+        rc=$?
+        set -e
+        [ "$rc" -eq 0 ] || failed="$failed $scope"
+        listed="${listed:+$listed,}$scope"
+    done < "$file"
+
+    # Which scopes does the STORE hold that this list never names? Nothing ties the two together:
+    # a directory ingested once by hand and never added to the list is never refreshed again, and
+    # search keeps answering about it from whatever it held that day -- with no error, no empty
+    # result and no sign that anything is wrong. That is this project's whole subject matter, and
+    # the refresh command had the same blind spot it was written to close.
+    #
+    # A note and not a failure: a scope whose directory is gone for good is a legitimate resident
+    # of the store, its documents still searchable history. Failing the run nightly over one would
+    # teach whoever reads the output to stop reading it.
+    step "Checking the list against the store"
+    for r in $(psql "$DATABASE_URL" -tAX -c \
+               "SELECT repo FROM documents GROUP BY repo ORDER BY repo" 2>/dev/null); do
+        case ",$listed," in *",$r,"*) continue ;; esac
+        printf -- '-- %s: in the store, not in %s -- nothing refreshes it\n' "$r" "$file"
+    done
+
+    # The check that makes the loop mean something. A chunk with no embedding raises no error
+    # anywhere: it is simply absent from the vector half of every search, while the document it
+    # belongs to still counts as indexed and the scope still counts as refreshed.
+    step "Checking that nothing is left unembedded"
+    if ! left=$(psql "$DATABASE_URL" -tAX -v ON_ERROR_STOP=1 \
+                -c "SELECT count(*) FROM chunks WHERE embedding IS NULL" 2>&1); then
+        printf '!! could not count unembedded chunks: %s\n' "$left" >&2
+        failed="$failed count"
+    else
+        case "$left" in
+            0) printf -- '-- all chunks embedded\n' ;;
+            ''|*[!0-9]*) printf '!! unexpected count output: %s\n' "$left" >&2; failed="$failed count" ;;
+            *) printf '!! %s chunk(s) left without an embedding\n' "$left" >&2
+               failed="$failed embeddings:$left" ;;
+        esac
+    fi
+
+    [ -z "$failed" ] || die "refresh finished with problems:$failed"
+    printf '\nrefresh clean\n'
+}
+
 [ $# -ge 1 ] || usage 0
 sub=$1; shift
 case "$sub" in
     init)   cmd_init "$@" ;;
     ingest) cmd_ingest "$@" ;;
+    refresh) cmd_refresh "$@" ;;
     doctor)  exec "$PY" "$ROOT/ci/doctor.py" "$@" ;;
     latency) exec "$PY" "$ROOT/ci/latency.py" "$@" ;;
     -h|--help|help) usage 0 ;;
