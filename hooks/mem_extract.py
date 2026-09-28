@@ -50,7 +50,14 @@ Output must parse with a strict JSON parser."""
 
 
 def transcript_text(path):
-    """User+assistant text turns from a Claude Code transcript JSONL."""
+    """User+assistant text turns from a Claude Code transcript JSONL.
+
+    None means COULD NOT READ; "" means read fine and there was nothing in it. The two used to be
+    the same value, and the caller retries on None -- so a transcript that is readable and
+    genuinely empty (a session that only ran tool calls, a file of bookkeeping events) was retried
+    forever and held its place in the per-run window, which is the same way the queue jams on
+    deleted files. An empty transcript will still be empty next time.
+    """
     out = []
     try:
         with open(path, encoding="utf-8") as f:
@@ -73,7 +80,7 @@ def transcript_text(path):
                     out.append(f"[{role}] {txt[:2000]}")
     except OSError:
         return None
-    return "\n".join(out)[-TAIL_CHARS:] or None
+    return "\n".join(out)[-TAIL_CHARS:]
 
 
 def extract(text):
@@ -215,8 +222,21 @@ def main():
         print(f"{len(queue)} transcript(s) pending")
         for rec in queue[:limit]:
             tp = rec["transcript_path"]
+            # GONE is not BUSY. These two shared one branch, and the difference is whether the
+            # retry can ever succeed: a file locked right now will be readable later, a file that
+            # no longer exists will not. Merged, the queue can only grow -- measured on a live
+            # store, 56 of 59 pending entries were transcripts deleted weeks earlier. They filled
+            # the whole per-run window (`queue[:limit]`), so the three live transcripts sat at
+            # positions 45, 52 and 59 where no run ever reached them, and every new session
+            # appended behind those. Extraction had stopped, and said so nowhere: the log printed
+            # "will retry" thousands of times, which reads as a system doing something.
+            if not os.path.exists(tp):
+                print(f"  gone (marking done): {tp}")
+                with open(DONE, "a", encoding="utf-8") as f:
+                    f.write(done_key(tp) + "\n")
+                continue
             text = transcript_text(tp)
-            if text is None:                 # unreadable right now -> retry next run, do NOT mark done
+            if text is None:                 # present but unreadable right now -> retry next run
                 print(f"  unreadable (will retry): {tp}")
                 continue
             if len(text) < 500:              # genuinely tiny -> nothing durable, mark done
