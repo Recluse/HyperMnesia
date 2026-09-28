@@ -229,8 +229,15 @@ along with every request and start arriving a few chunks at a time, when they ar
 ```
 
 Re-run that same line whenever the notes change: it is incremental by content hash, so unchanged
-files keep their chunks and their embeddings. Put it in a git hook or a scheduled job and the
-index keeps itself current; `ci/freshness.py` reports when it has fallen behind.
+files keep their chunks and their embeddings. `./hm refresh` does every scope at once and is the
+thing to put on a timer; `ci/freshness.py` reports when the index has fallen behind.
+
+If something in that folder must stay OUT of the corpus, list it in a `.hmignore` beside
+it — one pattern per line, a trailing `/` for a whole subtree. Two kinds of thing belong there:
+a file of credentials, and a superseded set of documents that near-duplicates the current one.
+The second matters more than it looks. An obviously old document is harmless; one that says
+almost the same thing with a different answer ranks right beside the correct one and gives no
+sign in the text of which is which.
 
 `hm` is the recommended path because the *order* of those steps is load-bearing and getting it
 wrong is silent: the ANN index must be built after the first bulk embed, and a re-ingest without

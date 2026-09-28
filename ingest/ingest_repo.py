@@ -30,7 +30,7 @@ Env: HM_FTS_LANG (default 'english') -- the Postgres text-search config for stem
 is always added alongside so exact tokens (code identifiers, IDs) match regardless of language.
 """
 import re
-import sys, os, re, hashlib, subprocess
+import sys, os, re, fnmatch, hashlib, subprocess
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _redact import scrub
@@ -106,7 +106,56 @@ def list_md(repo_dir, walk=False):
                 if fn.lower().endswith(".md"):
                     files.append(os.path.relpath(os.path.join(root, fn), repo_dir).replace("\\", "/"))
     # drop anything under a skip dir (covers tracked-but-vendored too)
-    return commit, [f for f in files if not (set(f.replace("\\", "/").split("/")) & _SKIP_DIRS)]
+    files = [f for f in files if not (set(f.replace("\\", "/").split("/")) & _SKIP_DIRS)]
+    return commit, _apply_ignore(repo_dir, files)
+
+
+IGNORE_FILE = ".hmignore"
+
+
+def read_ignore(repo_dir):
+    """Patterns from <repo>/.hmignore -- the per-repo answer to "this is on disk and is
+    NOT corpus".
+
+    _SKIP_DIRS says what is never worth indexing anywhere: vendored trees, build output. It
+    cannot say the thing that actually bites, which is that a directory of perfectly good
+    markdown must still stay out of THIS corpus. The two cases that produced this were a file of
+    live credentials, and a superseded specification set that near-duplicates the current one
+    while contradicting it -- the worst possible input to retrieval, because similarity ranks it
+    right beside the correct document and nothing in either text says which is which.
+
+    Without this the only lever is `--walk`, and it is all-or-nothing: turning it off to exclude
+    one subtree also drops every other git-ignored document beside it.
+
+    One pattern per line, '#' comments, blank lines ignored. A line ending in '/' excludes a
+    directory and everything under it; anything else is an fnmatch pattern against the
+    repo-relative path. Deliberately not a new glob dialect -- two forms cover the cases, and
+    neither of them needs explaining to the person writing the file.
+    """
+    try:
+        with open(os.path.join(repo_dir, IGNORE_FILE), encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def _apply_ignore(repo_dir, files):
+    pats = read_ignore(repo_dir)
+    if not pats:
+        return files
+    keep = []
+    for f in files:
+        rel = f.replace("\\", "/")
+        if any(rel.startswith(p) if p.endswith("/") else fnmatch.fnmatch(rel, p) for p in pats):
+            continue
+        keep.append(f)
+    return keep
 
 
 def dq(s: str) -> str:

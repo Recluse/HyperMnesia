@@ -19,13 +19,14 @@ Generic: connects via DATABASE_URL (ingest/_common). Scope is one repo (the map 
 Usage: ci/freshness.py <repo_dir> <repo> [--mark]   (--mark sets documents.status='stale')
 Exit 1 if any map orphans.
 """
+import fnmatch
 import hashlib
 import os
 import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ingest.ingest_repo import list_md, _SKIP_DIRS, MAX_FILE_BYTES  # noqa: E402
+from ingest.ingest_repo import list_md, read_ignore, _SKIP_DIRS, MAX_FILE_BYTES  # noqa: E402
 from hooks._arch import _glob_matches         # noqa: E402
 
 
@@ -171,10 +172,21 @@ def main():
     # skip list applied -- so a TRACKED `vendor/README.md` survives into it while list_md drops it
     # at both ends, `--walk` included. Without the same filter here it would sit under OUTSIDE THE
     # ENUMERATION forever, under advice ("re-run with --walk") that cannot move it.
+    # ...and the same for a path the tree's own .hmignore excludes. That file is a
+    # DECISION that something stays out of the corpus -- a credentials file, a superseded set of
+    # documents. Listing it here under "re-run with --walk to include them" advertises the one
+    # action that would undo the decision, on every single run.
+    ignored = read_ignore(repo_dir)
+
+    def is_ignored(rel):
+        return any(rel.startswith(p) if p.endswith("/") else fnmatch.fnmatch(rel, p)
+                   for p in ignored)
+
     seen_md = set(enumerated)
     beyond = [f for f in files
               if f.lower().endswith(".md") and f not in seen_md and f not in indexed
               and not (set(f.split("/")) & _SKIP_DIRS)
+              and not is_ignored(f)
               and why_skipped(f) is None]
 
     # 3. constraints with no source document. NOT "dangling pointer": the FK is

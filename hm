@@ -14,6 +14,10 @@
 #                              --walk enumerates the tree instead of asking git, for a directory
 #                              that is git-ignored or not a repository at all -- without it such a
 #                              directory ingests ZERO documents and says why.
+#                              A `.hmignore` in <dir> keeps paths OUT of the corpus (one
+#                              pattern per line, trailing '/' = whole subtree). For the file of
+#                              credentials and the superseded spec set that live next to the real
+#                              documents: --walk cannot exclude them, it is all-or-nothing.
 #   ./hm refresh               re-ingest every scope in $HM_SCOPES (default
 #                              ~/.config/hypermnesia/scopes: <dir><TAB><scope><TAB>[--walk] per
 #                              line), then assert no chunk was left without an embedding. This is
