@@ -473,6 +473,11 @@ pub fn install_self(label: &str) -> Result<String, String> {
 pub fn autostart_fault(label: &str) -> Option<String> {
     let home = std::env::var("HOME").ok()?;
     let path = PathBuf::from(&home).join("Library/LaunchAgents").join(format!("{label}.plist"));
+    // Autostart is optional; an absent plist is not an unreadable installation.
+    if matches!(std::fs::symlink_metadata(&path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+        return None;
+    }
     let out = Command::new("plutil").args(["-convert", "json", "-o", "-"]).arg(&path)
         .output().ok()?;
     if !out.status.success() {
@@ -613,6 +618,12 @@ mod tests {
     /// Quit has to stick. `KeepAlive` set unconditionally relaunches the tray about ten seconds
     /// after the person chooses Quit, which makes the menu item a lie. Conditional on a failed
     /// exit keeps the intent -- restart a tray that crashed.
+    #[test]
+    fn autostart_fault_is_none_when_nothing_was_ever_installed() {
+        let label = format!("hypermnesia-tray-selftest-does-not-exist-{}", std::process::id());
+        assert_eq!(autostart_fault(&label), None);
+    }
+
     #[test]
     fn autostart_restarts_a_crash_but_not_a_deliberate_quit() {
         let plist = tray_plist("com.hypermnesia.tray", "/opt/hm/hypermnesia", "/tmp/tray.log");

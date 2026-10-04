@@ -808,8 +808,12 @@ checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
 name = "hypermnesia-console"
 version = "0.1.0"
 dependencies = [
+ "block2 0.6.2",
  "glib",
  "gtk",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
+ "png",
  "tray-icon",
  "winit",
 ]

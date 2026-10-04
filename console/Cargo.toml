@@ -10,12 +10,17 @@ license = "MIT"
 # The data layer has no dependencies at all: a console that takes a minute to build is a console
 # nobody rebuilds.
 
-# Two dependencies in the whole crate, only the tray binary uses them, and only on macOS -- which
+# GUI dependencies are used only by the tray binary, and only on macOS -- which
 # is where the tray belongs anyway, since the schedules it reads are launchd's. Declaring them
 # per-target keeps the command-line tools buildable on a machine with no GUI libraries at all,
 # which is what CI is. A menu, not a window: everything this console has to show is a dozen lines
 # and a dozen buttons, and a window would mean a GUI framework for the same result.
 [target.'cfg(target_os = "macos")'.dependencies]
+# Already used by tray-icon; observe AppKit's menu tracking notifications.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSNotification", "NSOperation", "NSString", "block2"] }
+block2 = "0.6"
+png = "0.18"
 tray-icon = "0.25"
 winit = "0.30"
 
@@ -28,9 +33,10 @@ winit = "0.30"
 tray-icon = { version = "0.25", optional = true }
 gtk = { version = "0.18", optional = true }
 glib = { version = "0.18", optional = true }
+png = { version = "0.18", optional = true }
 
 [features]
-tray = ["dep:tray-icon", "dep:gtk", "dep:glib"]
+tray = ["dep:tray-icon", "dep:gtk", "dep:glib", "dep:png"]
 
 [[bin]]
 name = "hypermnesia-stats"

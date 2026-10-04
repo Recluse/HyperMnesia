@@ -341,11 +341,13 @@ What is in the menu:
 The tray carries one mark for "something here needs a look", derived from the lines below rather
 than computed beside them: anything the menu would show with a `!` raises it. That is the whole
 design in one detail — the mark is where a problem is noticed, so it must not be able to disagree
-with the menu. On macOS the mark is in the menu-bar title, `HM !`; a system tray icon has no text
-of its own, so on Linux it is the icon itself, calm green or warned red.
+with the menu. The embedded icon is calm green or warned red; its tooltip names the status.
+On macOS, background updates wait until the open menu closes, so refreshing data does not
+dismiss it while you read or navigate a submenu.
 
 `hypermnesia --install` puts it in autostart to start at login, restarted if it crashes and not if
 you quit it — launchd on macOS, a systemd user unit on Linux. `--uninstall` takes it back out.
+Autostart is optional: an absent macOS plist does not raise a warning.
 
 **Try it without a database.** The console's only connection setting is a command that prints the
 query's answer, so a file works:

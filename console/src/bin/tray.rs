@@ -266,6 +266,10 @@ still for a little while after a button is pressed.
         /// does not tear down and rebuild the menu -- which can close one open under the cursor
         /// -- for no visible difference.
         last_render: Option<String>,
+        render_pending: bool,
+        icon_warned: Option<bool>,
+        #[cfg(target_os = "macos")]
+        menu_tracking: super::menu_tracking::Tracking,
     }
 
     /// What a platform's event loop should do after a tick.
@@ -296,6 +300,10 @@ still for a little while after a button is pressed.
                 jobs_in_flight: false,
                 burst_until: now,
                 last_render: None,
+                render_pending: false,
+                icon_warned: None,
+                #[cfg(target_os = "macos")]
+                menu_tracking: super::menu_tracking::Tracking::new(),
             }
         }
 
@@ -437,7 +445,13 @@ still for a little while after a button is pressed.
                 self.jobs_in_flight = true;
                 let _ = self.cmd.send(Command::RefreshJobs);
             }
-            if dirty {
+            self.render_pending |= dirty;
+            // Replacing a tracking menu dismisses it, even when only an age label changed.
+            #[cfg(target_os = "macos")]
+            let menu_open = self.menu_tracking.is_open();
+            #[cfg(not(target_os = "macos"))]
+            let menu_open = false;
+            if self.take_render_request(menu_open) {
                 let fp = self.content_fingerprint();
                 if self.last_render.as_ref() != Some(&fp) {
                     self.rebuild();
@@ -445,6 +459,10 @@ still for a little while after a button is pressed.
                 }
             }
             Tick::Continue
+        }
+
+        fn take_render_request(&mut self, menu_open: bool) -> bool {
+            !menu_open && std::mem::take(&mut self.render_pending)
         }
 
         /// Everything that would change what is drawn, boiled down to one string -- compared
@@ -577,17 +595,19 @@ still for a little while after a button is pressed.
             items.quit = Some(quit);
 
             self.items = items;
-            let title = if self.last.is_none() && !warned { "HM …".to_string() }
-                        else { format!("HM{}", if warned { " !" } else { "" }) };
-            let icon = mark_icon(warned);
+            let tooltip = if warned { "HyperMnesia — needs attention" }
+                          else if self.last.is_none() { "HyperMnesia — loading" }
+                          else { "HyperMnesia" };
             match self.tray.as_ref() {
                 Some(t) => {
                     t.set_menu(Some(Box::new(menu)));
-                    // `set_title` only draws anything on macOS; harmless, and cheaper than a
-                    // second cfg-gated code path, to call it everywhere and let the icon carry
-                    // the mark where there is no menu-bar text to put it in.
-                    let _ = t.set_title(Some(&title));
-                    let _ = t.set_icon(Some(icon));
+                    let _ = t.set_tooltip(Some(tooltip));
+                    if self.icon_warned != Some(warned) {
+                        match t.set_icon(Some(mark_icon(warned))) {
+                            Ok(()) => self.icon_warned = Some(warned),
+                            Err(e) => eprintln!("hypermnesia: could not update the tray icon: {e}"),
+                        }
+                    }
                 }
                 None => {
                     // Not `.ok()`: an icon that never appeared leaves a process running with no
@@ -595,11 +615,13 @@ still for a little while after a button is pressed.
                     // to say so and stop.
                     match TrayIconBuilder::new()
                         .with_menu(Box::new(menu))
-                        .with_icon(icon)
-                        .with_title(title)
-                        .with_tooltip("HyperMnesia")
+                        .with_icon(mark_icon(warned))
+                        .with_tooltip(tooltip)
                         .build() {
-                        Ok(t) => self.tray = Some(t),
+                        Ok(t) => {
+                            self.tray = Some(t);
+                            self.icon_warned = Some(warned);
+                        }
                         Err(e) => {
                             eprintln!("hypermnesia: the tray icon could not be created: {e}");
                             std::process::exit(1);
@@ -632,17 +654,111 @@ still for a little while after a button is pressed.
         }
     }
 
-    /// A flat, solid-colour square: everything this tray's icon needs to say is "fine" or "not
-    /// fine", which two colours already say without a single asset file. 22x22 is a comfortable
-    /// size for a Linux system tray at typical DPI; macOS scales `set_icon`'s image itself.
+    /// Embedded artwork: the installed binary needs no asset files beside it.
     fn mark_icon(warned: bool) -> Icon {
-        const SIZE: u32 = 22;
-        let (r, g, b) = if warned { (196, 60, 48) } else { (52, 150, 90) };
-        let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-        for _ in 0..(SIZE * SIZE) {
-            rgba.extend_from_slice(&[r, g, b, 255]);
+        let bytes: &[u8] = if warned { include_bytes!("../../assets/tray-warning.png") }
+                          else { include_bytes!("../../assets/tray-ok.png") };
+        let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        decoder.set_transformations(png::Transformations::normalize_to_color8());
+        let mut reader = decoder.read_info().expect("embedded tray PNG header");
+        let mut rgba = vec![0; reader.output_buffer_size().expect("embedded tray PNG size")];
+        let info = reader.next_frame(&mut rgba).expect("embedded tray PNG pixels");
+        assert_eq!(info.color_type, png::ColorType::Rgba, "tray artwork must have alpha");
+        rgba.truncate(info.buffer_size());
+        Icon::from_rgba(rgba, info.width, info.height).expect("embedded tray icon dimensions")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn both_embedded_status_icons_decode() {
+            let _ = mark_icon(false);
+            let _ = mark_icon(true);
         }
-        Icon::from_rgba(rgba, SIZE, SIZE).expect("a fixed-size solid RGBA buffer is always valid")
+
+        #[test]
+        fn background_updates_wait_for_menu_close_and_render_once() {
+            let (_, rx) = mpsc::channel();
+            let (cmd, _) = mpsc::channel();
+            let mut app = App::new(rx, cmd);
+            for _ in 0..15 {
+                app.render_pending = true;
+                assert!(!app.take_render_request(true), "an open menu must stay attached");
+            }
+            assert!(app.take_render_request(false), "deferred updates must reach the next menu");
+            assert!(!app.take_render_request(false), "unchanged data must not replace it again");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod menu_tracking {
+    use std::ptr::NonNull;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use block2::RcBlock;
+    use objc2::{rc::Retained, runtime::ProtocolObject};
+    use objc2_foundation::{NSNotification, NSNotificationCenter, NSObjectProtocol, NSString};
+
+    const BEGIN: &str = "NSMenuDidBeginTrackingNotification";
+    const END: &str = "NSMenuDidEndTrackingNotification";
+
+    pub struct Tracking {
+        depth: Arc<AtomicUsize>,
+        observers: [Retained<ProtocolObject<dyn NSObjectProtocol>>; 2],
+    }
+
+    impl Tracking {
+        pub fn new() -> Self {
+            let depth = Arc::new(AtomicUsize::new(0));
+            let center = NSNotificationCenter::defaultCenter();
+            let observers = [(BEGIN, true), (END, false)].map(|(name, begin)| {
+                let depth = depth.clone();
+                let block = RcBlock::new(move |_: NonNull<NSNotification>| {
+                    if begin {
+                        depth.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        let _ = depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+                                                   |d| Some(d.saturating_sub(1)));
+                    }
+                });
+                // No queue: AppKit posts synchronously, before the next menu-render tick.
+                // The block captures only an atomic, so it is safe on any posting thread.
+                unsafe { center.addObserverForName_object_queue_usingBlock(
+                    Some(&NSString::from_str(name)), None, None, &block) }
+            });
+            Self { depth, observers }
+        }
+
+        pub fn is_open(&self) -> bool { self.depth.load(Ordering::Relaxed) > 0 }
+    }
+
+    impl Drop for Tracking {
+        fn drop(&mut self) {
+            let center = NSNotificationCenter::defaultCenter();
+            for observer in &self.observers {
+                // These are the tokens returned by this center's registration calls.
+                unsafe { center.removeObserver(ProtocolObject::as_ref(&**observer)); }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn native_notifications_keep_parent_menu_open_after_submenu_closes() {
+        let tracking = Tracking::new();
+        let center = NSNotificationCenter::defaultCenter();
+        let post = |name| unsafe {
+            center.postNotificationName_object(&NSString::from_str(name), None);
+        };
+        assert!(!tracking.is_open());
+        post(BEGIN);
+        post(BEGIN);
+        post(END);
+        assert!(tracking.is_open(), "closing a submenu must not release the parent menu");
+        post(END);
+        assert!(!tracking.is_open());
     }
 }
 
