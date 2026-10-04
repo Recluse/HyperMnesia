@@ -78,6 +78,10 @@ Two caveats when porting to a non-Claude client:
 
 So profile + recall are portable as-is; capture and the constraint hook need a per-client touch.
 
+For agent-directed `memory_search` / `memory_get` and project document search, also register the
+MCP server: [Codex configuration](../docs/INSTALL.md#codex). Hook injection and MCP discovery
+are separate connections; verify both with a real prompt and tool call.
+
 The hooks read `DATABASE_URL` / `EMBED_BACKEND` from their environment (Claude Code passes the
 shell env through). Keep those exported, or set them in the hook command.
 

@@ -197,6 +197,38 @@ PATH (Tier 0/1 map/constraints/get_document read the DB via `psql "$DATABASE_URL
 `HM_SEARCH`/`HM_MEM_OPS` scripts need `psycopg2` on `HM_PYTHON` (default `python3`). Omit
 `HM_RERANK` to skip reranking (plain RRF).
 
+### Codex
+
+For agent-directed memory search, add the following to `~/.codex/config.toml`.
+Export your existing `DATABASE_URL`, `EMBED_BACKEND`, and `MEM_AUTHOR`; adjust the
+binary path to your checkout. This enables the reading tools:
+
+```toml
+[mcp_servers.hypermnesia]
+command = "/opt/hypermnesia/mcp-server/target/release/hypermnesia-mcp"
+env_vars = ["DATABASE_URL", "EMBED_BACKEND", "MEM_AUTHOR"]
+enabled_tools = ["get_project_map", "get_constraints", "locate", "get_document", "search_docs", "memory_search", "memory_get", "status"]
+tool_timeout_sec = 130
+```
+
+In a trusted project's `.codex/config.toml`, pin its exact ingested tag:
+
+```toml
+[mcp_servers.hypermnesia.env]
+HM_REPO = "myrepo"
+```
+
+`memory_search` accepts a natural-language query, result count `k`, memory-type and
+project filters; `memory_get` returns the full memory with provenance and replacement
+history. `search_docs` searches the project's document corpus. Identity comes from
+`MEM_AUTHOR` or the shared settings file, not a tool argument.
+
+Verify configuration with `codex mcp get hypermnesia`, then call `memory_search` and
+`memory_get` from the agent to verify the store. A remote app-server can queue an MCP
+refresh with `config/mcpServer/reload` without restarting windows. See the
+[official MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
+Keep machine paths and credentials out of version control.
+
 ### Other MCP clients
 
 The server is a plain **stdio** MCP server. It has no client-specific behaviour, reads its whole
@@ -213,9 +245,10 @@ gets an explicit refusal rather than silence.
 Verify a client is really talking to it by calling the `status` tool: it answers from the store,
 so a reply proves the whole chain, not just that the process started.
 
-**What does not port: the hooks.** `PreToolUse` injection, per-prompt recall and the session
-profile are Claude Code features, and they are the part that makes this more than a search index —
-they deliver without being asked. In a client with no hook mechanism you get the same data through
+**Hook delivery depends on the client.** Codex supports the profile and per-prompt recall
+hooks described in [hooks/README.md](../hooks/README.md#other-clients-eg-codex-cli).
+Transcript capture and pre-edit tool matching still need client-specific adapters.
+In a client with no hook mechanism you get the same data through
 the same tools, but only when the agent decides to call one, which is exactly the weakness the
 hooks exist to remove. If your client supports any pre-edit or pre-prompt extension point, wire
 `hooks/arch_invariants.py` into it: it reads one JSON object on stdin (`tool_name`, `cwd`,
