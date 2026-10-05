@@ -284,6 +284,15 @@ smoke check against your own store. `--standalone` did not demonstrate memory ca
 in that experiment, and the cause was not established. Project configuration outside
 a Git root was also not discovered in an earlier attempt.
 
+A later fresh bridged `--standalone` run on the same day completed all three
+calls against the private deployment, with expected content, identity and scope,
+exit 0 and empty stderr, without priming. Its bridge adapter waits for connected
+MCP servers and effective tools before admitting the prompt; the first provider
+request already contained both memory and bridge tools. This result applies to
+that adapter with its readiness gate. Standalone without the adapter was not
+retested, and the memory backend was unchanged; this repository does not include
+the bridge adapter.
+
 MCP registration does not install automatic profile, per-prompt recall or transcript
 capture. Those need an OpenCode V2 event adapter; the Claude/Codex hook configuration
 below does not register them with OpenCode. No such adapter is included here.
