@@ -657,8 +657,44 @@ fn tool_status() -> Result<String, String> {
 }
 
 // -- MCP JSON-RPC over stdio -------------------------------------------------
+// Fresh, project-scoped snapshot; never uses the structural graph cache.
+fn tool_project_status(args: &Value) -> Result<Value, String> {
+    use std::process::{Command, Stdio};
+    if !args.as_object().map_or(false, |obj| obj.is_empty()) {
+        return Err("project_status takes no arguments; scope belongs to the server".into());
+    }
+    let cwd = std::env::current_dir().map_err(|_| "server cwd unavailable")?;
+    let scope = std::env::var("HM_REPO").ok().filter(|s| !s.is_empty())
+        .unwrap_or_else(|| cwd.file_name().unwrap_or_default().to_string_lossy().into_owned());
+    let root = std::env::var("HM_ROOT").ok().filter(|s| !s.is_empty())
+        .unwrap_or_else(|| cwd.to_string_lossy().into_owned());
+    let snapshot = if scope.is_empty() || !scope.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)) {
+        json!({"error":"invalid scope"})
+    } else {
+        // One statement provides a consistent snapshot; explicitly read-only transaction.
+        let sql = format!("BEGIN READ ONLY; SELECT json_build_object(\
+            'documents',(SELECT coalesce(json_agg(json_build_object('path',path,'hash',content_hash)),'[]') FROM documents WHERE repo='{scope}'),\
+            'chunks',(SELECT count(*) FROM chunks c JOIN documents d ON d.id=c.document_id WHERE d.repo='{scope}'),\
+            'components',(SELECT count(*) FROM components WHERE repo='{scope}')); COMMIT;");
+        match db_query(&sql).and_then(|raw| serde_json::from_str(raw.lines().find(|line| line.starts_with('{')).unwrap_or("")).map_err(|e| e.to_string())) {
+            Ok(value) => value,
+            Err(_) => json!({"error":"database unavailable"}),
+        }
+    };
+    let script = script_path("HM_PROJECT_STATUS", "ci/project_status.py");
+    let mut child = Command::new(py()).arg(script).arg(root).arg(scope)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().map_err(|e| format!("spawn project_status: {e}"))?;
+    child.stdin.take().ok_or("no stdin")?.write_all(snapshot.to_string().as_bytes())
+        .map_err(|e| format!("write project_status snapshot: {e}"))?;
+    let (ok, so, _se) = wait_with_timeout(child, 60, "project_status")?;
+    if !ok { return Err("project_status source check failed".into()); }
+    serde_json::from_str(so.trim()).map_err(|e| format!("project_status JSON: {e}"))
+}
+
 fn tool_defs() -> Value {
     json!([
+        {"name":"project_status","description":"Read-only counts, source hash freshness and map presence for this server project scope. No embeddings, ingest or cached freshness.","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true},"inputSchema":{"type":"object","properties":{},"additionalProperties":false},"outputSchema":{"type":"object","properties":{"version":{"type":"integer","const":1},"repo":{"type":"string"},"root":{"type":"string"},"checked_at":{"type":"string"},"documents":{"type":"object","properties":{"indexed":{"type":["integer","null"],"minimum":0}},"required":["indexed"],"additionalProperties":false},"chunks":{"type":"object","properties":{"indexed":{"type":["integer","null"],"minimum":0}},"required":["indexed"],"additionalProperties":false},"freshness":{"type":"object","properties":{"state":{"enum":["fresh","stale","unknown","error"]},"checked_at":{"type":["string","null"]},"stale":{"type":["integer","null"],"minimum":0},"unindexed":{"type":["integer","null"],"minimum":0},"missing":{"type":["integer","null"],"minimum":0},"reason":{"type":["string","null"]}},"required":["state","checked_at","stale","unindexed","missing","reason"],"additionalProperties":false},"map":{"type":"object","properties":{"state":{"enum":["available","missing","unknown"]},"components":{"type":["integer","null"],"minimum":0},"checked_at":{"type":["string","null"]}},"required":["state","components","checked_at"],"additionalProperties":false}},"required":["version","repo","root","checked_at","documents","chunks","freshness","map"],"additionalProperties":false}},
         {"name":"get_project_map","description":"Tier 0: this workspace repo's component map + global invariants. Call first when orienting in the repo.","inputSchema":{"type":"object","properties":{}}},
         {"name":"get_constraints","description":"Tier 1: deterministic must/should constraints for the given changed file paths (touched components + globals + 1-hop graph). Call before editing config.","inputSchema":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"},"description":"repo-relative file paths"}},"required":["paths"]}},
         {"name":"locate","description":"Where does X live? Substring search over component slugs/names/responsibilities/key_paths.","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
@@ -778,6 +814,14 @@ fn main() {
             "tools/call" => {
                 let name = req["params"]["name"].as_str().unwrap_or("");
                 let args = req["params"].get("arguments").cloned().unwrap_or(json!({}));
+                if name == "project_status" {
+                    match tool_project_status(&args) {
+                        Ok(value) => reply(&id, json!({"structuredContent":value,
+                            "content":[{"type":"text","text":value.to_string()}],"isError":false})),
+                        Err(e) => reply(&id, json!({"content":[{"type":"text","text":e}],"isError":true})),
+                    }
+                    continue;
+                }
                 match call_tool(name, &args) {
                     Ok(text) => reply(&id, json!({"content":[{"type":"text","text":text}],"isError":false})),
                     Err(e) => reply(&id, json!({"content":[{"type":"text","text":format!("error: {e}")}],"isError":true})),

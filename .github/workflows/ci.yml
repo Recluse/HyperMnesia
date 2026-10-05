@@ -68,6 +68,10 @@ jobs:
       - name: Build the MCP server
         working-directory: mcp-server
         run: cargo build --release --locked
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Project status (source hashes, scope and real MCP transport)
+        run: python tests/test_project_status.py
       - name: Rust unit tests (glob parity with the Python hook)
         working-directory: mcp-server
         run: cargo test --locked
