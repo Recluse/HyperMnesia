@@ -82,6 +82,10 @@ For agent-directed `memory_search` / `memory_get` and project document search, a
 MCP server: [Codex configuration](../docs/INSTALL.md#codex). Hook injection and MCP discovery
 are separate connections; verify both with a real prompt and tool call.
 
+For OpenCode, use the [V2 MCP configuration](../docs/INSTALL.md#opencode-v2).
+The profile/recall JSON above does not wire OpenCode events; automatic injection
+and transcript capture require a separate V2 adapter. MCP search works independently.
+
 The hooks read `DATABASE_URL` / `EMBED_BACKEND` from their environment (Claude Code passes the
 shell env through). Keep those exported, or set them in the hook command.
 

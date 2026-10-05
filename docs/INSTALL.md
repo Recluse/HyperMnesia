@@ -229,6 +229,65 @@ refresh with `config/mcpServer/reload` without restarting windows. See the
 [official MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 Keep machine paths and credentials out of version control.
 
+### OpenCode V2
+
+Merge this fragment into a Git project's `opencode.json`, or into
+`~/.config/opencode/opencode.json` for all projects. Keep your existing provider,
+model and plugins, and append the two deny rules to existing permissions.
+Use your built binary and export the same store environment as above; secrets
+stay in the environment, outside version control:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "hypermnesia": {
+        "type": "local",
+        "command": ["/opt/hypermnesia/mcp-server/target/release/hypermnesia-mcp"],
+        "environment": {
+          "DATABASE_URL": "{env:DATABASE_URL}",
+          "EMBED_BACKEND": "{env:EMBED_BACKEND}",
+          "MEM_AUTHOR": "{env:MEM_AUTHOR}"
+        },
+        "protocol": "legacy",
+        "codemode": false,
+        "timeout": {"startup": 15000, "catalog": 15000, "execution": 130000}
+      }
+    }
+  },
+  "permissions": [
+    {"action": "hypermnesia_memory_write", "resource": "*", "effect": "deny"},
+    {"action": "hypermnesia_memory_supersede", "resource": "*", "effect": "deny"}
+  ]
+}
+```
+
+This uses the [V2 MCP schema](https://opencode.ai/v2/docs/mcp-servers/), with native
+tools (`codemode: false`) and the classic initialization handshake. The execution
+budget also covers `status`, whose server-side deadline is 120 seconds.
+To pin a project's exact ingested tag, add `"HM_REPO": "myrepo"` to its server
+environment. Leave it out of the global configuration when projects have different
+tags. A project override replaces the whole same-named server object in V2, so
+repeat the command and other required fields, not just the environment.
+
+Run `opencode mcp list`, then ask the agent to call `hypermnesia_memory_search`,
+read a returned ID with `hypermnesia_memory_get`, and call `hypermnesia_search_docs`
+with a query whose sources belong to your project. Check the returned content and
+scope; a connected process alone proves neither. An empty resource list says
+nothing about this tools-only server.
+
+On 2026-10-05, OpenCode 2.0.22 with local MTPLX/Bonsai completed all three calls
+against the private agent-memory deployment, using a scoped Git-root configuration
+and ordinary `opencode run`: expected content, no truncation, exit 0, empty stderr.
+This validates that client path; the standalone OSS binary still needs the same
+smoke check against your own store. `--standalone` did not demonstrate memory calls
+in that experiment, and the cause was not established. Project configuration outside
+a Git root was also not discovered in an earlier attempt.
+
+MCP registration does not install automatic profile, per-prompt recall or transcript
+capture. Those need an OpenCode V2 event adapter; the Claude/Codex hook configuration
+below does not register them with OpenCode. No such adapter is included here.
+
 ### Other MCP clients
 
 The server is a plain **stdio** MCP server. It has no client-specific behaviour, reads its whole
