@@ -197,6 +197,47 @@ PATH (Tier 0/1 map/constraints/get_document read the DB via `psql "$DATABASE_URL
 `HM_SEARCH`/`HM_MEM_OPS` scripts need `psycopg2` on `HM_PYTHON` (default `python3`). Omit
 `HM_RERANK` to skip reranking (plain RRF).
 
+### Project status without a model turn
+
+Call MCP `tools/call` with `{"name":"project_status","arguments":{}}`. The tool
+returns the same JSON in `structuredContent` and its text content, declares
+`readOnlyHint: true`, and publishes an `outputSchema` with `version: 1`.
+
+Scope belongs to the server: `HM_REPO` is the exact ingested tag, falling back
+to the server cwd basename; `HM_ROOT` is the source directory, falling back
+to the server cwd. The returned `root` is its physical resolved path. Arguments
+cannot select another repo or root. Consumers must check root identity before
+presenting these numbers as the current project's status. Invalid scope names
+produce `unknown`, rather than silently selecting a rewritten tag.
+
+The result contains `repo`, `root`, `checked_at`, `documents.indexed`,
+`chunks.indexed`, `freshness` (`state`, `checked_at`, `stale`, `unindexed`,
+`missing`, `reason`), and `map` (`state`, `components`, `checked_at`). Counts
+include only this repo's document rows and their chunks, excluding separate
+knowledge-page scopes. Freshness compares raw-file SHA256 with indexed hashes;
+it does not infer freshness from Git commits or database update timestamps.
+Unindexed candidates follow normal ingest enumeration: tracked markdown in Git,
+filtered walk outside Git, with the existing ignore, size and symlink exclusions.
+An index created with `--walk` can still have its stored files checked, but
+unindexed Git-ignored files are outside this default enumeration.
+
+Every call takes a new read-only database snapshot and checks the files; no
+embeddings, ingest, model turn, graph cache, or install-wide doctor pass runs.
+Unavailable DB yields `freshness.state = "error"` and null counts. Unavailable
+or unsafe sources yield `unknown`, retaining any observed DB counts. Missing or
+changed indexed files, or eligible unindexed files, yield `stale`. An empty index
+is not evidence of freshness. `map.state = "available"` means scoped component
+rows exist; it does not assert that key paths or constraints are current.
+
+`HM_PROJECT_STATUS` can locate `ci/project_status.py` when the binary is
+installed separately from its checkout; it uses `HM_PYTHON` (default
+`python3`). The helper consumes an internal DB snapshot on stdin, so external
+consumers should use MCP. Allow up to 90 seconds for the DB and source checks;
+close short-lived connections after the call and coalesce concurrent UI polls.
+
+After building the release binary, run `python3 tests/test_project_status.py`
+for source comparisons and real stdio MCP checks against a simulated DB transport.
+
 ### Codex
 
 For agent-directed memory search, add the following to `~/.codex/config.toml`.
@@ -207,7 +248,7 @@ binary path to your checkout. This enables the reading tools:
 [mcp_servers.hypermnesia]
 command = "/opt/hypermnesia/mcp-server/target/release/hypermnesia-mcp"
 env_vars = ["DATABASE_URL", "EMBED_BACKEND", "MEM_AUTHOR"]
-enabled_tools = ["get_project_map", "get_constraints", "locate", "get_document", "search_docs", "memory_search", "memory_get", "status"]
+enabled_tools = ["get_project_map", "get_constraints", "locate", "get_document", "search_docs", "memory_search", "memory_get", "status", "project_status"]
 tool_timeout_sec = 130
 ```
 
@@ -241,7 +282,7 @@ stay in the environment, outside version control:
 {
   "mcp": {
     "servers": {
-      "hypermnesia": {
+      "HyperMnesia": {
         "type": "local",
         "command": ["/opt/hypermnesia/mcp-server/target/release/hypermnesia-mcp"],
         "environment": {
@@ -256,8 +297,8 @@ stay in the environment, outside version control:
     }
   },
   "permissions": [
-    {"action": "hypermnesia_memory_write", "resource": "*", "effect": "deny"},
-    {"action": "hypermnesia_memory_supersede", "resource": "*", "effect": "deny"}
+    {"action": "HyperMnesia_memory_write", "resource": "*", "effect": "deny"},
+    {"action": "HyperMnesia_memory_supersede", "resource": "*", "effect": "deny"}
   ]
 }
 ```
@@ -270,8 +311,8 @@ environment. Leave it out of the global configuration when projects have differe
 tags. A project override replaces the whole same-named server object in V2, so
 repeat the command and other required fields, not just the environment.
 
-Run `opencode mcp list`, then ask the agent to call `hypermnesia_memory_search`,
-read a returned ID with `hypermnesia_memory_get`, and call `hypermnesia_search_docs`
+Run `opencode mcp list`, then ask the agent to call `HyperMnesia_memory_search`,
+read a returned ID with `HyperMnesia_memory_get`, and call `HyperMnesia_search_docs`
 with a query whose sources belong to your project. Check the returned content and
 scope; a connected process alone proves neither. An empty resource list says
 nothing about this tools-only server.
@@ -323,6 +364,12 @@ hooks exist to remove. If your client supports any pre-edit or pre-prompt extens
 `tool_input.file_path`) and prints one JSON object, so adapting it is a matter of renaming fields.
 If it supports none, tell the agent in its system prompt to call `get_constraints` before editing
 and accept that it will sometimes forget.
+
+The OpenCode registration name `HyperMnesia` also supplies its native tool prefix.
+When renaming an existing registration, replace its old server key and add deny
+rules for `HyperMnesia_memory_write` and `HyperMnesia_memory_supersede`; retain
+the previous namespace's deny rules while old sessions remain active. Binary paths,
+`HM_*` variables and database identifiers do not change with the display name.
 
 ## Personal-memory hooks (optional, Claude Code)
 
