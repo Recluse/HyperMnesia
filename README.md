@@ -27,6 +27,27 @@ an edit, memory recalled per prompt, sessions captured — is a set of **Claude 
 Another client gets the data through the same tools, but only when the agent decides to call one,
 which is the weakness the hooks exist to remove.
 
+## PolyDaemon (optional integration)
+
+[PolyDaemon](https://github.com/Recluse/PolyDaemon) is a separate agent/Telegram bridge
+project being prepared for an MIT open-source release. HyperMnesia and PolyDaemon are
+independent projects: the bridge works without memory, and HyperMnesia works with MCP
+clients without the bridge. To use them together, register HyperMnesia's MCP server
+in your agent client alongside the bridge — see the [MCP setup](docs/INSTALL.md#mcp-client)
+and [OpenCode V2 configuration](docs/INSTALL.md#opencode-v2). Bridge connectivity does
+not register memory tools or install automatic profile, recall or transcript capture.
+
+The OpenCode sidebar can read project document/chunk counts, source hash freshness
+and map presence through the read-only `project_status({})` tool, after checking
+that the returned physical root matches the session directory. A connection or
+cached map alone does not establish freshness, and `checked_at` is the time of
+the check, not the last indexing time.
+
+**Publication check:** the planned PolyDaemon repository is not publicly accessible
+as of 2026-10-05. After its public release, verify the repository and documentation
+links without signing in, and check its reciprocal link to HyperMnesia before
+treating this cross-reference as a published integration guide.
+
 ## Why
 
 A coding agent repeats mistakes when the rule, the earlier decision or the stated preference is
