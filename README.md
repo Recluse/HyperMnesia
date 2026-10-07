@@ -29,8 +29,8 @@ which is the weakness the hooks exist to remove.
 
 ## PolyDaemon (optional integration)
 
-[PolyDaemon](https://github.com/Recluse/PolyDaemon) is a separate agent/Telegram bridge
-project being prepared for an MIT open-source release. HyperMnesia and PolyDaemon are
+[PolyDaemon](https://github.com/Recluse/PolyDaemon) is an open-source agent/Telegram bridge
+published under the MIT license. HyperMnesia and PolyDaemon are
 independent projects: the bridge works without memory, and HyperMnesia works with MCP
 clients without the bridge. To use them together, register HyperMnesia's MCP server
 in your agent client alongside the bridge — see the [MCP setup](docs/INSTALL.md#mcp-client)
@@ -43,10 +43,8 @@ that the returned physical root matches the session directory. A connection or
 cached map alone does not establish freshness, and `checked_at` is the time of
 the check, not the last indexing time.
 
-**Publication check:** the planned PolyDaemon repository is not publicly accessible
-as of 2026-10-05. After its public release, verify the repository and documentation
-links without signing in, and check its reciprocal link to HyperMnesia before
-treating this cross-reference as a published integration guide.
+PolyDaemon's [companion documentation](https://github.com/Recluse/PolyDaemon/blob/main/docs/companions.md)
+describes the optional integration and links back to HyperMnesia.
 
 ## Why
 
