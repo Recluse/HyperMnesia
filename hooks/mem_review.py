@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Owner CLI for the consolidation review queue (A2).
+"""CLI for the consolidation and Dreamer review queue (A2).
 
 The daily consolidator parks low-confidence merge/supersede proposals instead of
-auto-mutating. Review them here:
+auto-mutating. The Dreamer parks every deductive or inductive proposal. Review them here:
 
     python3 hooks/mem_review.py list
     python3 hooks/mem_review.py approve <id>

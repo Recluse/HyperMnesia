@@ -47,6 +47,21 @@ One installation serves many projects. `documents`, `components`, and `constrain
 `repo` column; search and the map are scoped by it (`HM_REPO`, or the MCP server's working-dir
 name). Component slugs are unique per repo, not globally.
 
+## Memory is a graph, but recall stays bounded
+
+Free text remains the primary memory representation. Two small graphs add the structure needed
+for reasoning without turning the store into an ontology: observer-to-observed perspective edges
+say whose point of view a row represents, and evidence-to-derived edges say why a conclusion
+exists. Identity nodes are author-owned. The evidence trigger checks the full graph for cycles,
+while RLS still decides which endpoints a reader may see.
+
+Recall does not traverse that graph without a ceiling. A fixed depth controls whether the result
+contains explicit rows, derived conclusions, direct premises, or deeper ancestry. `auto` chooses
+among those same fixed policies from retrieval evidence and reports its reason. The Dreamer can
+propose new derived rows, but it cannot approve them; the Dialectic can phrase cited claims, but
+it cannot keep a claim whose IDs are absent or inactive. Structure narrows the model's freedom
+instead of creating a second autonomous writer.
+
 ## Fail-open, everywhere
 
 Memory is an enhancement, never a gate. The personal-memory hooks always exit 0 and never block a

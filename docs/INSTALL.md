@@ -24,7 +24,7 @@ If you have Docker and want the single-box stack, the wrapper runs the documente
 order that works:
 
 ```bash
-./hm init                        # .env with a generated password, compose up, both schemas loaded
+./hm init                        # generated password, compose up, schemas and migrations loaded
 export DATABASE_URL=...          # init prints the exact line
 ./hm ingest ~/code/myrepo myrepo # ingest -> embed -> build the ANN index -> check
 ./hm doctor                      # any time you suspect the store is answering worse than it should
@@ -83,20 +83,26 @@ echo "$DATABASE_URL"   # put this in your shell profile and your MCP client's en
 # 2. Schema
 # -v ON_ERROR_STOP=1 on every psql call here and below, deliberately: without it psql prints
 # the error, keeps going and exits 0, so a failed statement is indistinguishable from success.
-# mem_multiuser.sql is NOT optional and NOT only for teams: every memory write inserts
-# `author` and `scope`, which schema_mem.sql does not define. Without it the first write
-# fails with UndefinedColumn -- silently, because the hooks are fail-open and `hm doctor`
-# only checks that the table exists.
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
-  -f sql/schema.sql -f sql/schema_mem.sql -f sql/mem_multiuser.sql
+# The order is load-bearing. The owner value claims only unreferenced legacy entities; on a
+# fresh store it changes no rows. Every file is idempotent.
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -v owner="$(id -un)" \
+  -f sql/schema.sql \
+  -f sql/schema_mem.sql \
+  -f sql/mem_multiuser.sql \
+  -f sql/migrate_entity_ownership.sql \
+  -f sql/migrate_memory_perspectives.sql \
+  -f sql/migrate_memory_evidence.sql \
+  -f sql/migrate_peer_cards.sql \
+  -f sql/migrate_dreamer.sql \
+  -f sql/mem_app_role.sql
 
 # 2b. Say who you are. Writes are REFUSED without it, on a one-person store too --
 #     a memory with no author cannot be scoped, shared or revoked.
 mkdir -p ~/.claude && echo "MEM_AUTHOR=$(id -un)" >> ~/.claude/hypermnesia.env
 chmod 600 ~/.claude/hypermnesia.env
 
-# 2c. More than one person? Also apply sql/mem_app_role.sql and point DATABASE_URL at the
-#     role it creates -- see "Two people, one store" below, BEFORE anyone writes anything.
+# 2c. More than one person? Set a password for hm_app and point DATABASE_URL at it -- see
+#     "Two people, one store" below, before anyone writes anything.
 
 # 3. Embedder: Ollama
 ollama pull bge-m3            # 1.2 GB
@@ -128,22 +134,20 @@ python3 ci/doctor.py
 
 ## B. Single server (docker-compose) — recommended for a homelab
 
-Everything (Postgres, TEI embedder, optional reranker) in one compose stack:
+Everything (Postgres, TEI embedder, optional reranker) in one compose stack. The CLI owns the
+schema order, including all personal-memory migrations:
 
 ```bash
-cp deploy/docker/.env.example deploy/docker/.env    # POSTGRES_PASSWORD has no default:
-                                                   # openssl rand -hex 24  (hex, not base64 --
-                                                   # a `/` breaks the postgresql:// URI)
-docker compose -f deploy/docker/docker-compose.yml up -d          # + --profile rerank for the reranker
-docker compose -f deploy/docker/docker-compose.yml exec postgres \
-  psql -v ON_ERROR_STOP=1 -U hm -d hypermnesia -f /sql/schema.sql -f /sql/schema_mem.sql
+./hm init   # creates a private .env with a generated hex password when none exists
+# Optional after initialization:
+docker compose -f deploy/docker/docker-compose.yml --profile rerank up -d
 ```
 
-Then ingest/embed as in A steps 2–5 — the schema (all three files), your identity, the ingest,
-the embed, and the ANN index, which is easy to miss and costs you a sequential scan on every
-query if you do. Export the connection string and the embedder first; A's steps assume both,
-and `psql ""` with an unset `DATABASE_URL` does not fail — it connects to a database named
-after your login and reports "relation does not exist" from the wrong store:
+`hm init` prints the exact connection string for the generated or retained password. Add your
+identity, export that connection string and the embedder, then ingest with `hm ingest`; it loads,
+embeds, and builds the ANN index in the order that avoids a permanent sequential scan. An unset
+`DATABASE_URL` is especially deceptive: `psql ""` connects to a database named after your login
+and reports "relation does not exist" from the wrong store.
 
 ```bash
 export DATABASE_URL="postgresql://hm:<the password in deploy/docker/.env>@localhost:5432/hypermnesia"
@@ -248,7 +252,7 @@ binary path to your checkout. This enables the reading tools:
 [mcp_servers.hypermnesia]
 command = "/opt/hypermnesia/mcp-server/target/release/hypermnesia-mcp"
 env_vars = ["DATABASE_URL", "EMBED_BACKEND", "MEM_AUTHOR"]
-enabled_tools = ["get_project_map", "get_constraints", "locate", "get_document", "search_docs", "memory_search", "memory_get", "status", "project_status"]
+enabled_tools = ["get_project_map", "get_constraints", "locate", "get_document", "search_docs", "memory_search", "memory_perspectives", "memory_evidence", "memory_peer_card", "memory_context", "memory_ask", "memory_get", "status", "project_status"]
 tool_timeout_sec = 130
 ```
 
@@ -259,9 +263,12 @@ In a trusted project's `.codex/config.toml`, pin its exact ingested tag:
 HM_REPO = "myrepo"
 ```
 
-`memory_search` accepts a natural-language query, result count `k`, memory-type and
-project filters; `memory_get` returns the full memory with provenance and replacement
-history. `search_docs` searches the project's document corpus. Identity comes from
+`memory_search` accepts a natural-language query, result count `k`, memory-type, project, and
+perspective filters. `memory_context` returns a bounded, auditable selection with fixed or
+evidence-selected depth; `memory_ask` adds grounded claims and structured citations. The graph
+tools expose perspectives, evidence, and peer cards without a model. `memory_get` returns the
+full memory with provenance and replacement history. `search_docs` searches the project's
+document corpus. Identity comes from
 `MEM_AUTHOR` or the shared settings file, not a tool argument.
 
 Verify configuration with `codex mcp get hypermnesia`, then call `memory_search` and
@@ -375,7 +382,7 @@ the previous namespace's deny rules while old sessions remain active. Binary pat
 
 To auto-capture/inject personal memory, register the hooks in Claude Code settings — see
 [docs/MEMORY.md](MEMORY.md) for the SessionStart / UserPromptSubmit / SessionEnd wiring and the
-`mem_extract` / `mem_consolidate` schedule. Configure the distiller via `HM_LLM_BACKEND` + `HM_LLM_URL`/`HM_LLM_MODEL` (OpenAI-compatible),
+`mem_extract` / `mem_consolidate` / `mem_reflect` / `mem_dream` schedule. Configure the model-backed passes via `HM_LLM_BACKEND` + `HM_LLM_URL`/`HM_LLM_MODEL` (OpenAI-compatible),
 `HM_LLM_MODEL` (Ollama), or `HM_LLM_CMD` (a CLI) — see `hooks/_llm.py`. Everything is fail-open: if the store is unreachable, the agent keeps working.
 
 ## Keeping the index current
@@ -500,13 +507,18 @@ the file is what is in force.
 | `HM_RERANK` | unset | path to `rerank/search_reranked.py` (unset = RRF only) |
 | `HM_RERANK_URL` | `http://127.0.0.1:8091` | reranker service; `ci/doctor.py` (and `status`) check it whenever either this or `HM_RERANK` is set, and say so when neither is |
 | `HM_LLM_BACKEND` | auto | `openai` \| `ollama` \| `cli` (auto: openai if HM_LLM_URL set, else cli if HM_LLM_CMD, else ollama) |
-| `HM_LLM_URL`/`HM_LLM_KEY` | — | OpenAI-compatible endpoint (memory extraction/consolidation) |
+| `HM_LLM_URL`/`HM_LLM_KEY` | — | OpenAI-compatible endpoint for extraction, consolidation, reflect, Dreamer, and Dialectic |
 | `HM_LLM_MODEL` | `qwen2.5:7b` | model name for the `openai` and `ollama` backends |
 | `HM_LLM_CMD` | — | CLI distiller (prompt appended as arg, text on stdin) |
+| `HM_PYTHON` | `python3` | interpreter used by the MCP server's Python tools; environment only |
+| `HM_SEARCH` | bundled `ingest/search.py` | document-search script path; environment only |
+| `HM_MEM_OPS` | bundled `ingest/mem_ops.py` | memory operation script path; environment only |
+| `HM_DIALECTIC` | bundled `hooks/mem_dialectic.py` | grounded Q&A script path; environment only |
 | `HM_RERANK_BIND` | `127.0.0.1` | address the reranker listens on (the endpoint has no auth) |
 | `HM_DB_TIMEOUT_SECS` | `30` | MCP server: ceiling on one `psql` call |
 | `HM_SEARCH_TIMEOUT_SECS` | `60` | MCP server: ceiling on one search |
 | `HM_MEMOPS_TIMEOUT_SECS` | `60` | MCP server: ceiling on one memory operation |
+| `HM_DIALECTIC_TIMEOUT_SECS` | `420` | MCP server: ceiling on grounded `memory_ask`, including the configured LLM call |
 | `HM_STATUS_TIMEOUT_SECS` | `120` | MCP server: ceiling on `status` (every check inside is itself bounded) |
 | `HM_GRAPH_TTL_SECS` | `300` | how long the MCP server may serve a cached component map before re-reading it |
 | `HM_DOC_MAX_CHARS` | `60000` | `get_document` cap; past it the text is cut and the cut is announced |
@@ -536,6 +548,11 @@ it listed as refused rather than applied.
 | `MEM_CONSOLIDATE_MAXDIST` | `0.20` | `hooks/mem_consolidate.py` | **env only** | how close two memories must be to be candidates for merging. Above ~0.25 the candidate graph starts collapsing into one blob; 0.35 meant "same topic" rather than "same fact" |
 | `MEM_CONSOLIDATE_MAX_GROUP` | `6` | `hooks/mem_consolidate.py` | **env only** | the most memories one verdict may act on. A merge replaces every member, so this bounds the damage a wrong verdict can do, independently of the model's confidence |
 | `MEM_CONSOLIDATE_MAX_GROUPS` | `10` | `hooks/mem_consolidate.py` | **env only** | groups examined per run; each one is an LLM call, and the rest wait for the next pass |
+| `MEM_DREAM_MIN_MEMORIES` | `3` | `hooks/mem_dream.py` | console / settings file | minimum explicit memories in one perspective before Dreamer considers it |
+| `MEM_DREAM_MAX_MEMORIES` | `24` | `hooks/mem_dream.py` | console / settings file | maximum explicit premises shown for one perspective |
+| `MEM_DREAM_MAX_GROUPS` | `2` | `hooks/mem_dream.py` | console / settings file | perspective groups processed per run |
+| `MEM_DREAM_MAX_CANDIDATES` | `4` | `hooks/mem_dream.py` | console / settings file | candidates accepted from one model reply before human review |
+| `MEM_DIALECTIC_TIMEOUT` | `300` | `hooks/mem_dialectic.py` | console / settings file | LLM timeout inside grounded `memory_ask`, clamped to 30..600 seconds |
 | `HM_LLM_MODEL` | backend-dependent | `hooks/_llm.py` | settings | the model every LLM step asks. There is no per-pass model knob: `MEM_CONSOLIDATE_MODEL` and `MEM_EXTRACT_MODEL` were documented for a while and read by nothing — `tests/test_settings_knobs.py` exists because of them |
 
 ### The shared settings file
@@ -558,8 +575,10 @@ your own private file, and only the exact names listed here are accepted.
 ## Two people, one store
 
 A personal memory store stops being one person's the moment a second author can write to it.
-`sql/mem_multiuser.sql` + `sql/mem_app_role.sql` make that safe. Apply them after
-`schema_mem.sql` and before anyone else connects.
+`sql/mem_multiuser.sql`, the entity/perspective/evidence migrations, and `sql/mem_app_role.sql`
+make that safe. Apply them in the quick-start order before anyone else connects. The later
+migrations rely on author-owned entities; `mem_app_role.sql` comes last because it grants the
+tables and views those migrations create.
 
 ### Why not a namespace per person
 

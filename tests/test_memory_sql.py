@@ -35,9 +35,12 @@ def check(name, ok, detail=""):
 
 
 def psql(sql):
+    # Every invocation opens a fresh session. The production connection sets this identity before
+    # it queries the RLS-aware views, so the SQL contract must do the same on every call.
+    env = {**os.environ, "PGOPTIONS": "-c mem.reader=ci"}
     try:
         p = subprocess.run(["psql", DATABASE_URL, "-tAX", "-v", "ON_ERROR_STOP=1"],
-                           input=sql.encode(), capture_output=True, timeout=60)
+                           input=sql.encode(), capture_output=True, timeout=60, env=env)
     except FileNotFoundError:
         # Say which of the two it is. A stack trace ending in FileNotFoundError reads like a
         # broken test, and this test needs a live store on purpose.
@@ -61,10 +64,13 @@ def main():
     meta = "'{\"sqltest\":true}'::jsonb"
     psql(f"""
       INSERT INTO mem.memories (memory_type, content, lang, importance, confidence, project,
-                                metadata, embedding, embedding_model)
-      VALUES ('semantic','active fact about widgets','en',0.5,0.8,'t', {meta}, '{vec(1)}', 'test'),
-             ('semantic','expired fact about widgets','en',0.5,0.8,'t', {meta}, '{vec(2)}', 'test'),
-             ('semantic','superseded fact about widgets','en',0.5,0.8,'t', {meta}, '{vec(3)}', 'test');
+                                metadata, embedding, embedding_model, author, scope)
+      VALUES ('semantic','active fact about widgets','en',0.5,0.8,'t', {meta}, '{vec(1)}', 'test',
+              'ci', 'private'),
+             ('semantic','expired fact about widgets','en',0.5,0.8,'t', {meta}, '{vec(2)}', 'test',
+              'ci', 'private'),
+             ('semantic','superseded fact about widgets','en',0.5,0.8,'t', {meta}, '{vec(3)}', 'test',
+              'ci', 'private');
       UPDATE mem.memories SET valid_to = now() - interval '1 day'
        WHERE content = 'expired fact about widgets' AND (metadata->>'sqltest') = 'true';
       UPDATE mem.memories SET status = 'superseded'

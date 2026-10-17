@@ -24,6 +24,12 @@ one store, and what each may read is part of the model rather than a deployment 
   not the top-k least-bad rows. Injecting noise is worse than injecting nothing.
 - **Provenance.** Every memory records where it came from (`user_message` vs `assistant_inference`
   vs `consolidation`) in `mem.sources`.
+- **Perspective.** A memory can name an `observer` and an `observed` entity. `subject` remains a
+  compatibility alias for `observed`. Entities are author-owned, so one person's alias or
+  mutable attributes cannot silently rewrite another person's identity graph.
+- **Evidence.** `mem.derivations` records directed support edges such as `supports`,
+  `inferred_from`, `summarizes`, `supersedes`, and `contradicts`. A database trigger rejects
+  cycles across the full graph while RLS requires both endpoints to be visible to the reader.
 - **Author and audience.** Every row records `author` (who learned it) and `scope`
   (`private` | `project`); `mem.project_members` says which projects an author may read the
   shared memory of. `preference` defaults to private, anything else with a project tag is
@@ -38,6 +44,38 @@ one store, and what each may read is part of the model rather than a deployment 
 `mem_ops.py search` runs the same hybrid RRF as doc search (bge-m3 + composite FTS) over
 `active_memories`, with importance and recency as tiebreakers, a distance floor on the dense leg, and the SAME floor applied to lexical-only hits — the lexical leg exists to rescue near-misses, not to admit a memory that shares one incidental token with the query. The floor is on the
 dense leg. `write` / `supersede` / `get` / `mark` round out the CRUD; all take JSON on stdin.
+
+`memory_context` composes prompt-ready memory under a strict token budget. Its `depth` can be
+`minimal`, `low`, `medium`, `high`, `max`, or `auto`. Fixed levels progressively add derived
+conclusions, direct premises, and bounded premise ancestry. `auto` uses retrieval signals and
+returns the selected level and reason; it does not ask a model to choose. Routing is either the
+server's project or every RLS-visible workspace. Global routing reports ranked
+observer-to-observed routes backed by materialized peer cards.
+
+`memory_ask` is the synchronous Dialectic. It gives a model only the bounded context, then checks
+the reply as data: each atomic claim needs one or more IDs from that exact context, and every
+cited row must still be active. One unsupported claim rejects the whole answer. Returned prose
+and citations are built by code; a failed check becomes an explicit abstention.
+
+The read-only graph tools are useful without a model:
+
+- `memory_perspectives` lists visible observer-to-observed edges;
+- `memory_evidence` walks incoming or outgoing provenance edges;
+- `memory_peer_card` returns a materialized navigation summary for one peer;
+- `memory_context` returns selected sections, IDs, token estimate, routes, and depth reason.
+
+## Dreamer: derived memory behind review
+
+`hooks/mem_dream.py` groups explicit memories by perspective and asks the configured LLM for
+new deductive or inductive conclusions. Candidates must cite only IDs from the bounded input;
+inductive conclusions need at least two independent premises. The process records each run, but
+it cannot create a memory. Every candidate enters `mem.review_queue` with action `derive`, and
+approval rechecks ownership, visibility, perspective, active premises, duplicates, and scope in
+one transaction before writing the conclusion and its evidence edges.
+
+The Dreamer and Dialectic use the same pluggable backend as extraction and consolidation
+(`HM_LLM_BACKEND`, `HM_LLM_URL`, `HM_LLM_MODEL`, or `HM_LLM_CMD`). Their prompts are English;
+the Dialectic asks the model to answer in the query's language.
 
 ## Consolidation and the review queue
 

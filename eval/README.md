@@ -49,6 +49,23 @@ abstains. It deliberately does NOT exercise the near-topic case the distance tun
 addresses: a query that shares one incidental token with a memory is not covered by any probe
 today.
 
+## `auto_depth_eval.py` — bounded context policy
+
+This read-only gate runs the same probe at `auto` and every fixed depth. It records query hashes,
+selected IDs, depth reasons, token counts, latency, and the declared expectations/gates; it never
+writes query text or memory content to the report. The committed `auto_depth_probes.json` is a
+template: replace its queries and expected IDs with labelled examples from your own RLS-visible
+store before treating a live result as evidence. `auto_depth_contract_probes.json` is synthetic
+and exercises the medium/high/max policy branches in the DB-free contract test.
+
+```bash
+MEM_AUTHOR=your-handle python3 eval/auto_depth_eval.py \
+  --probes eval/auto_depth_probes.json --output /tmp/auto-depth.json
+```
+
+The runner refuses a live evaluation without `MEM_AUTHOR`, checks that repeated selections are
+deterministic, and verifies that the scoped access counter did not change.
+
 ## `ci/latency.py` — where the time goes
 
 Latency, per stage, against your own store: the PreToolUse hook end to end (the one that runs on

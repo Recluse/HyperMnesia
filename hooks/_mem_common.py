@@ -4,7 +4,7 @@ All hooks are FAIL-OPEN: any error/timeout -> empty output, exit 0. A broken mem
 must never block the agent. DB access is local: mem_ops() shells to the bundled mem_ops.py
 (which connects via DATABASE_URL), psql() shells to `psql "$DATABASE_URL"`.
 """
-import json, os, re, secrets, subprocess, sys
+import json, os, re, secrets, subprocess, sys, time
 
 # -- shared pipeline settings ------------------------------------------------
 # The tunables below (HM_LLM_MODEL, MEM_NOVELTY_MAXDIST, EMBED_BATCH and the rest) are read
@@ -40,6 +40,9 @@ _SETTABLE = frozenset((
     "MEM_NOVELTY_MAXDIST", "MEM_REVIEW_THRESHOLD",
     "MEM_REFLECT_MIN", "MEM_REFLECT_MAX", "MEM_STALE_DAYS",
     "MEM_SEM_MAXDIST", "MEM_LEX_MAXDIST",
+    "MEM_DREAM_MIN_MEMORIES", "MEM_DREAM_MAX_MEMORIES",
+    "MEM_DREAM_MAX_GROUPS", "MEM_DREAM_MAX_CANDIDATES",
+    "MEM_DIALECTIC_TIMEOUT",
     "EMBED_BATCH", "EMBED_MODEL", "EMBED_BACKEND",
     "OLLAMA_URL", "TEI_URL",
 ))
@@ -145,6 +148,46 @@ def fence(kind, header, body, max_body=None):
         b = b[:max_body].rstrip() + "\n...(truncated)"
     return (f"<personal-memory-{kind} nonce={n}>\n{_FENCE_NOTE}\n{header}\n{b}\n"
             f"</personal-memory-{kind} nonce={n}>")
+
+
+def acquire_lock(path, stale_after=7200):
+    """Atomically acquire a PID lock and recover it only after its process is gone."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    while True:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    holder = int(fh.read().strip() or 0)
+                age = time.time() - os.path.getmtime(path)
+            except (OSError, ValueError):
+                holder, age = 0, 0
+            try:
+                alive = holder > 0 and (os.kill(holder, 0) is None)
+            except OSError:
+                alive = False
+            if alive or (not holder and age < stale_after):
+                return False
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            continue
+        with os.fdopen(fd, "w", encoding="ascii") as fh:
+            fh.write(str(os.getpid()))
+        return True
+
+
+def release_lock(path):
+    """Release only the lock still owned by this process."""
+    try:
+        with open(path, encoding="ascii") as fh:
+            holder = int(fh.read().strip() or 0)
+        if holder == os.getpid():
+            os.unlink(path)
+    except (OSError, ValueError):
+        pass
 
 
 # -- who is reading and writing ----------------------------------------------

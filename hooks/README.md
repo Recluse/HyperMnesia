@@ -14,6 +14,8 @@ to ask. All are **fail-open** — they never block a tool call — but none is f
 | `mem_extract.py` | schedule (cron/systemd/launchd) | distill queued transcripts -> memories |
 | `mem_consolidate.py` | schedule (daily) | merge/supersede near-duplicates: cliques only, bounded group size, low-confidence proposals parked for you |
 | `mem_reflect.py` | schedule (daily) | synthesize per-project knowledge pages (regenerated, never stale) |
+| `mem_dream.py` | schedule or manual | propose perspective-scoped derived memories; every candidate waits for explicit review |
+| `mem_dialectic.py` | MCP `memory_ask` | return claims grounded in one bounded context, or abstain |
 | `mem_review.py`  | you, manually | `list \| approve <id> \| reject <id>` the review queue; `stale [days]` lists active facts nothing has recalled in that long, to confirm or retire |
 
 `arch_invariants.py` is what makes constraint delivery *deterministic and unprompted*: before an
@@ -78,9 +80,10 @@ Two caveats when porting to a non-Claude client:
 
 So profile + recall are portable as-is; capture and the constraint hook need a per-client touch.
 
-For agent-directed `memory_search` / `memory_get` and project document search, also register the
-MCP server: [Codex configuration](../docs/INSTALL.md#codex). Hook injection and MCP discovery
-are separate connections; verify both with a real prompt and tool call.
+For agent-directed memory search, graph navigation, bounded context, grounded Q&A, and project
+document search, also register the MCP server: [Codex configuration](../docs/INSTALL.md#codex).
+Hook injection and MCP discovery are separate connections; verify both with a real prompt and
+tool call.
 
 For OpenCode, use the [V2 MCP configuration](../docs/INSTALL.md#opencode-v2).
 The profile/recall JSON above does not wire OpenCode events; automatic injection
@@ -100,17 +103,20 @@ the permissions it demands.
 
 ## Schedule the background jobs
 
-`mem_extract.py`, `mem_consolidate.py` and `mem_reflect.py` are NOT hooks — run them out of band so they never
-block a session. They need `HM_LLM*` (see `_llm.py`: OpenAI-compatible endpoint, Ollama, or a CLI).
+`mem_extract.py`, `mem_consolidate.py`, `mem_reflect.py`, and `mem_dream.py` are NOT hooks — run
+them out of band so they never block a session. The Dreamer has a PID lock and records each run;
+it still cannot write a derived memory until `mem_review.py approve` revalidates the proposal.
+They need `HM_LLM*` (see `_llm.py`: OpenAI-compatible endpoint, Ollama, or a CLI).
 
 cron:
 ```cron
 0 */4 * * *  cd /opt/hypermnesia && DATABASE_URL=... HM_LLM_BACKEND=ollama HM_LLM_MODEL=qwen2.5:7b python3 hooks/mem_extract.py
 30 5 * * *   cd /opt/hypermnesia && DATABASE_URL=... HM_LLM_BACKEND=ollama HM_LLM_MODEL=qwen2.5:7b python3 hooks/mem_consolidate.py
 50 5 * * *   cd /opt/hypermnesia && DATABASE_URL=... HM_LLM_BACKEND=ollama HM_LLM_MODEL=qwen2.5:7b python3 hooks/mem_reflect.py
+10 6 * * *   cd /opt/hypermnesia && DATABASE_URL=... HM_LLM_BACKEND=ollama HM_LLM_MODEL=qwen2.5:7b python3 hooks/mem_dream.py
 ```
 
-systemd timer, launchd agent, or any scheduler works equally — they just invoke the three scripts.
+systemd timer, launchd agent, or any scheduler works equally — they just invoke the scripts.
 On macOS, `hypermnesia-jobs` (in `console/`) lists whatever launchd holds, runs one now, and
 changes a schedule without hand-editing a plist.
 

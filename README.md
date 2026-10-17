@@ -129,7 +129,7 @@ flowchart TB
         direction LR
         DOC[("doc chunks<br/>embedding + tsvector")]
         MAP[("component / constraint<br/>map + graph")]
-        MEM[("mem.* personal memory<br/>bi-temporal, supersede")]
+        MEM[("mem.* personal memory<br/>perspectives + evidence")]
     end
 
     subgraph ingest["📥 Ingest · offline"]
@@ -153,7 +153,9 @@ flowchart TB
         SESS["session transcript"] --> EX["extract · LLM<br/>durable facts only"]
         EX --> MEM
         MEM --> RC["recall → inject<br/>into the prompt"]
-        MEM --> CO["consolidate<br/>merge / supersede · review-gated"]
+        MEM --> CO["consolidate / Dreamer<br/>every derived fact review-gated"]
+        MEM --> CTX["context depth<br/>fixed or evidence-selected"]
+        CTX --> DIA["Dialectic<br/>grounded claims or abstention"]
     end
 
     MAP -.-> T01
@@ -167,10 +169,14 @@ flowchart TB
   **cross-encoder reranker** ([bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3))
   reorders the top candidates. (It measurably helped on a private evaluation set; the figure is
   in [eval/README.md](eval/README.md) with what it is and is not — one corpus, not a benchmark.)
-- **Personal memory** is bi-temporal (event time vs ingestion time), **supersede-not-overwrite**
-  (corrections don't destroy history), with an abstention gate (an irrelevant query returns
-  nothing, not noise). A background pass consolidates near-duplicates; low-confidence merges wait
-  in a review queue for you.
+- **Personal memory** is bi-temporal (event time vs ingestion time), **supersede-not-overwrite**,
+  and perspective-aware: an observer and an observed entity make the point of view explicit.
+  Evidence edges form an acyclic provenance graph. `memory_context` can select a bounded recall
+  depth from retrieval evidence; `memory_ask` accepts only claims cited to active rows in that
+  exact context and abstains when the grounding check fails.
+- **Derived memory stays human-gated.** The optional Dreamer proposes deductive or inductive
+  conclusions with exact premise IDs. It cannot write them directly; every proposal waits in the
+  same review queue used by consolidation.
 - **Capture/recall** run as Claude Code hooks: session profile injected at start, relevant
   memories injected per prompt, transcripts distilled to memories by a small LLM on a schedule.
 - **Constraint injection** is a hook too: a `PreToolUse` hook (`hooks/arch_invariants.py`) resolves
@@ -211,14 +217,14 @@ See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full system picture
 
 | Path | What |
 |------|------|
-| `hm` | one wrapper over the documented steps: `init` (compose + schema), `ingest` (ingest -> embed -> ANN index, incremental when the scope already exists), `doctor`, `latency` |
-| `sql/` | schema: doc-RAG (`documents/components/constraints/relationships/chunks`) + personal memory (`mem.*`), the multi-user migration, and the role + row-level security that enforce it |
+| `hm` | one wrapper over the documented steps: `init` (compose + ordered schemas/migrations), `ingest` (ingest -> embed -> ANN index, incremental when the scope already exists), `doctor`, `latency` |
+| `sql/` | doc-RAG and personal-memory schemas, ordered entity/perspective/evidence/Dreamer migrations, and the role + row-level security that enforce ownership and visibility |
 | `ingest/` | markdown chunker, embedder (Ollama/TEI), hybrid RRF search, `mem_ops`; incremental re-ingest via `--known-hashes` (unchanged docs keep their embeddings) |
 | `rerank/` | optional cross-encoder reranker service + search orchestrator |
-| `hooks/` | Claude Code hooks: constraint inject (`arch_invariants`), profile inject, per-prompt recall, capture, extract, consolidate, reflect (per-project knowledge pages) |
+| `hooks/` | Claude Code hooks plus model-backed maintenance: constraint/profile/recall injection, capture, extract, consolidate, reflect, review-gated Dreamer, and grounded Dialectic Q&A |
 | `ci/` | `doctor.py` — health check for faults that leave an install answering normally (missing index, partial embeddings, mixed models, wrong scope); `latency.py` — where the time goes (hook, embedder, database, reranker); `freshness.py` — map-staleness / orphan-glob checker (run against a target repo); `check_graph_sql_parity.py` — keeps the Python and Rust copies of the graph query identical |
-| `tests/` | contract tests, all wired into CI: hook I/O, ingest enumeration, incremental ingest, chunk bounds, glob parity, query hygiene, `doctor`, `hm ingest`, the settings file (permissions, allowlist, precedence) and the knob list (every knob must name a reader the file can actually reach) — all DB-free except `test_memory_sql.py`, which asserts the `mem.*` view (supersede, validity window) and the abstention gate against a live pgvector, with no embedder |
-| `mcp-server/` | Rust MCP server exposing project map / constraints / search / memory / `status` tools |
+| `tests/` | contract tests, all wired into CI: hook I/O, ingest behavior, memory perspectives/evidence/context/Dreamer/Dialectic, glob parity, query hygiene, diagnostics, settings and the live SQL boundary |
+| `mcp-server/` | Rust MCP server exposing project map, constraints, doc search, scoped memory, grounded context/Q&A, `project_status`, and install `status` |
 | `console/` | the operator's side: a menu-bar tray and four command-line tools (`stats`, `jobs`, `settings`, `setup`) over any deployment — volumes, scheduled jobs, tunables, and a first-run wizard |
 | `deploy/` | docker-compose (single box) + Kubernetes manifests |
 | `examples/` | an example structural-tier seed for a project |
@@ -234,7 +240,7 @@ edit.
 
 ```bash
 ./hm init                          # writes .env with a generated password, compose up,
-                                   # waits for Postgres, loads the schema
+                                   # waits for Postgres, loads schemas and migrations
 export DATABASE_URL=...            # init prints the exact line
 ./hm ingest /path/to/your/repo myrepo    # ingest -> embed -> ANN index -> doctor
 ```

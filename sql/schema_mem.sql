@@ -19,13 +19,14 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 CREATE TABLE IF NOT EXISTS mem.entities (
     id              BIGSERIAL PRIMARY KEY,
+    author          TEXT NOT NULL,
     namespace       TEXT NOT NULL,              -- user | project | host | technology | ...
     entity_type     TEXT NOT NULL,
     canonical_name  TEXT NOT NULL,
     aliases         TEXT[] NOT NULL DEFAULT '{}',
     attributes      JSONB NOT NULL DEFAULT '{}',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (namespace, entity_type, canonical_name)
+    UNIQUE (author, namespace, entity_type, canonical_name)
 );
 
 CREATE TABLE IF NOT EXISTS mem.memories (
@@ -88,7 +89,7 @@ CREATE TABLE IF NOT EXISTS mem.sources (
 -- merge/supersede when the LLM is confident; below the bar it parks the proposal here for a human.
 CREATE TABLE IF NOT EXISTS mem.review_queue (
     id           BIGSERIAL PRIMARY KEY,
-    action       TEXT NOT NULL,                       -- merge | supersede
+    action       TEXT NOT NULL,                       -- merge | supersede | derive
     member_ids   BIGINT[] NOT NULL,
     proposal     JSONB NOT NULL,
     confidence   REAL NOT NULL,
@@ -141,3 +142,8 @@ CREATE INDEX IF NOT EXISTS mem_memories_hnsw_idx        ON mem.memories
     USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS mem_assertions_subj_pred_idx ON mem.assertions(subject_entity_id, predicate);
 CREATE INDEX IF NOT EXISTS mem_entities_aliases_idx     ON mem.entities USING gin(aliases);
+
+-- Existing stores gain author ownership and perspective endpoints through the migrations.
+-- This comment keeps the directional model visible in a fresh base-schema review as well.
+COMMENT ON TABLE mem.entities IS
+  'Author-owned identity graph. Memory perspectives reuse these nodes as observer and observed endpoints.';

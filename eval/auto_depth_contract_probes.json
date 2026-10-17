@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "probes": [
+    {
+      "name": "derived-conclusion",
+      "query": "stored conclusion",
+      "expected": {
+        "auto_depths": ["medium"],
+        "auto_reasons": ["derived_hits_available"]
+      }
+    },
+    {
+      "name": "derived-reasoning",
+      "query": "why this conclusion",
+      "expected": {
+        "auto_depths": ["high"],
+        "auto_reasons": ["derived_hits_need_direct_premises"]
+      }
+    },
+    {
+      "name": "derived-evidence-audit",
+      "query": "audit evidence chain",
+      "expected": {
+        "auto_depths": ["max"],
+        "auto_reasons": ["derived_hits_with_evidence_request"]
+      }
+    }
+  ]
+}

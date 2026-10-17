@@ -118,6 +118,20 @@ pass:
 | `low-confidence (0.62) → queued for review` | the proposal is waiting in `mem_review.py list`, nothing was changed |
 | `merge write FAILED, keeping originals intact` | the replacement did not land, so the sources were never retired |
 
+## What derived memory refuses to do
+
+- Dreamer candidates cite only the bounded input IDs. Deductive candidates need at least one
+  premise; inductive candidates need at least two. Every candidate waits in the review queue.
+- Approval rechecks active premises, one shared perspective, author ownership, visibility,
+  duplicates, and the resulting audience inside the same transaction. A stale proposal is
+  declined instead of being applied to a changed store.
+- Evidence insertion rejects self-edges and cycles. The cycle check runs as a narrowly scoped
+  definer function so it sees the whole DAG; the write policy still prevents a caller from
+  linking a memory it cannot read.
+- `memory_ask` rejects the entire model reply when one claim has no citations, cites an absent or
+  inactive row, forges an `[M…]` marker, or exceeds the claim bounds. The result is an explicit
+  abstention, never partially grounded prose.
+
 ## What the console tells you about itself
 
 The console is a tool for noticing silence, so silence in the console is the worst bug it can

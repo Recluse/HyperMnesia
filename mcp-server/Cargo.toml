@@ -1,8 +1,8 @@
 [package]
 name = "hypermnesia-mcp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "HyperMnesia MCP server: Tier 0/1 project map + constraints + doc/memory search"
+description = "HyperMnesia MCP server: project knowledge and scoped long-term memory"
 
 [[bin]]
 name = "hypermnesia-mcp"

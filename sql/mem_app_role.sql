@@ -28,9 +28,12 @@ GRANT USAGE ON SCHEMA mem, public TO hm_app;
 
 -- Personal memory: the rows it may touch are decided by the policies below, not by the grant.
 GRANT SELECT, INSERT, UPDATE, DELETE ON mem.memories, mem.assertions, mem.sources,
-                                        mem.entities, mem.review_queue TO hm_app;
+                                        mem.entities, mem.review_queue, mem.derivations,
+                                        mem.dream_runs TO hm_app;
 GRANT SELECT ON mem.project_members TO hm_app;
 GRANT SELECT ON mem.active_memories, mem.all_memories TO hm_app;
+GRANT SELECT ON mem.perspective_graph TO hm_app;
+GRANT SELECT ON mem.peer_cards TO hm_app;
 -- NOT mem.all_active_memories. It is the one relation with no rule on it, for maintenance.
 
 -- The document corpus: read for search, write for the knowledge-page mirror. Conditional,
@@ -58,6 +61,24 @@ DO $$ BEGIN
   EXECUTE 'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO hm_app';
 EXCEPTION WHEN insufficient_privilege OR undefined_object THEN NULL; END $$;
 
+-- Count every active memory the reader actually recalled, including project-shared rows
+-- written by another author. The ordinary UPDATE policy is author-scoped, so this narrow
+-- definer function performs the telemetry update only after rechecking visibility.
+CREATE OR REPLACE FUNCTION mem.touch_memory_access(memory_ids bigint[]) RETURNS bigint
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path=pg_catalog,mem AS $$
+DECLARE touched bigint;
+BEGIN
+  UPDATE mem.memories m
+     SET access_count=m.access_count+1, last_accessed_at=now()
+   WHERE m.id=ANY(memory_ids) AND m.status='active'
+     AND mem.may_read(m.author,m.scope,m.project);
+  GET DIAGNOSTICS touched = ROW_COUNT;
+  RETURN touched;
+END $$;
+REVOKE ALL ON FUNCTION mem.touch_memory_access(bigint[]) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION mem.touch_memory_access(bigint[]) TO hm_app;
+
 -- ── row-level security ───────────────────────────────────────────────────────────────────────
 -- No FORCE: the owner bypasses its own policies, which is how the maintenance door stays open
 -- -- migrations, restores, and the whole-store count a restore check must use. The policies
@@ -65,6 +86,12 @@ EXCEPTION WHEN insufficient_privilege OR undefined_object THEN NULL; END $$;
 -- `ALTER TABLE ... FORCE ROW LEVEL SECURITY` and give maintenance a separate BYPASSRLS login;
 -- do not leave it with neither.
 ALTER TABLE mem.memories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE mem.entities ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS entities_own ON mem.entities;
+CREATE POLICY entities_own ON mem.entities FOR ALL TO hm_app
+  USING (author = current_setting('mem.reader', true))
+  WITH CHECK (author = current_setting('mem.reader', true));
 
 DROP POLICY IF EXISTS mem_read ON mem.memories;
 CREATE POLICY mem_read ON mem.memories FOR SELECT TO hm_app
@@ -97,8 +124,8 @@ CREATE POLICY mem_delete ON mem.memories FOR DELETE TO hm_app
 ALTER TABLE mem.review_queue ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS review_own ON mem.review_queue;
 CREATE POLICY review_own ON mem.review_queue FOR ALL TO hm_app
-  USING (author IS NOT DISTINCT FROM current_setting('mem.reader', true))
-  WITH CHECK (author IS NOT DISTINCT FROM current_setting('mem.reader', true));
+  USING (author = current_setting('mem.reader', true))
+  WITH CHECK (author = current_setting('mem.reader', true));
 
 -- mem.sources holds session ids and verbatim transcript excerpts, keyed by memory_id alone --
 -- readable by number with no check until now. It follows its memory.

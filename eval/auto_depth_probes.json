@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "probes": [
+    {
+      "name": "unknown-topic-abstention",
+      "query": "replace-with-a-query-that-does-not-exist-in-your-store",
+      "routing": "project",
+      "token_budget": 4000,
+      "expected": {
+        "memory_ids": [],
+        "auto_depths": ["minimal"],
+        "auto_reasons": ["no_relevant_hits"],
+        "abstain": true
+      },
+      "gates": {"max_extra_ids": 0, "max_extra_tokens": 256}
+    },
+    {
+      "name": "explicit-support",
+      "query": "replace with a query backed by one explicit memory",
+      "routing": "project",
+      "token_budget": 4000,
+      "expected": {
+        "memory_ids": [],
+        "auto_depths": ["minimal", "low"],
+        "auto_reasons": ["narrow_explicit_lookup", "explicit_support_only"],
+        "abstain": false
+      },
+      "gates": {"match_selected_fixed": true}
+    },
+    {
+      "name": "evidence-chain",
+      "query": "replace with a query backed by a derived memory and its evidence",
+      "routing": "project",
+      "token_budget": 4000,
+      "expected": {
+        "memory_ids": [],
+        "auto_depths": ["high", "max"],
+        "auto_reasons": ["derived_hits_need_direct_premises", "derived_hits_with_evidence_request"],
+        "abstain": false
+      },
+      "gates": {"max_extra_ids": 8, "max_extra_tokens": 2048}
+    }
+  ]
+}

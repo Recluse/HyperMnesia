@@ -116,12 +116,13 @@ before any of those checks if no component is mapped under the scope it was give
 scoped by `repo`, so a mistyped or renamed scope would otherwise report zero of everything and
 pass.
 
-**Personal memory (background):** capture hooks enqueue session transcripts; a scheduled job
-distills them to memories via a pluggable LLM; a daily consolidator merges near-duplicates behind
-a confidence gate + review queue; a weekly reflect pass synthesizes each project's SHARED memories into
-one knowledge page, stored as a memory (`metadata.kind='page'`) that recall can surface as a
-single overview. Recall/profile hooks inject relevant memories into the prompt, scoped to the
-reader — see `MEMORY.md`.
+**Personal memory:** capture hooks enqueue session transcripts; a scheduled job distills them to
+memories via a pluggable LLM; a consolidator merges near-duplicates behind a review gate; and
+reflect builds one project knowledge page from shared rows. Perspective edges state who observed
+whom, evidence edges record why a derived row exists, and materialized peer cards make global
+routing cheap. `memory_context` performs deterministic, budgeted depth selection. The optional
+Dreamer can propose new deductions or patterns, but only review approval can write them. The
+Dialectic takes one bounded context and returns cited claims or an abstention — see `MEMORY.md`.
 
 **Configuration (shared):** the tunables the passes read — thresholds, model names, batch sizes —
 come from one file, `~/.claude/hypermnesia.env`, loaded on import by `hooks/_mem_common.py` and

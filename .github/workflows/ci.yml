@@ -13,11 +13,11 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - name: Syntax check (compile all)
-        run: python -m compileall -q ingest hooks rerank ci
+        run: python -m compileall -q ingest hooks rerank ci eval
       - name: Lint (real errors only -- undefined names, syntax)
         run: |
           pip install --quiet ruff
-          ruff check --select E9,F63,F7,F82 ingest hooks rerank ci
+          ruff check --select E9,F63,F7,F82 ingest hooks rerank ci eval
       - name: GRAPH_SQL parity (hook copy vs Rust source of truth)
         run: python ci/check_graph_sql_parity.py
       - name: Hook I/O contract (hooks are fail-open, so a broken contract is silent)
@@ -48,6 +48,16 @@ jobs:
       # records in a single verdict, which is exactly what it did before this guard existed.
       - name: Consolidator grouping (a chain must not become one group)
         run: python tests/test_consolidate_groups.py
+      - name: Memory perspectives and author-owned entities
+        run: python tests/test_entity_ownership.py && python tests/test_memory_perspectives.py
+      - name: Memory evidence and peer cards
+        run: python tests/test_memory_evidence.py && python tests/test_peer_cards.py
+      - name: Bounded context and automatic depth
+        run: python tests/test_memory_context.py && python tests/test_auto_depth_eval.py
+      - name: Review-gated Dreamer and grounded Dialectic
+        run: python tests/test_dreamer.py && python tests/test_dialectic.py
+      - name: Public model prompts are English
+        run: python tests/test_prompt_language.py
       # Four modules ship an executable self-check and only one of them was run. For each of
       # the three below, that self-check is the ONLY automated coverage its behaviour has:
       # Tier-1 selection (longest-match order, 1-hop propagation, cross-repo isolation),
@@ -126,6 +136,13 @@ jobs:
         run: |
           psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -f sql/schema.sql
           psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -f sql/schema_mem.sql
+          psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -f sql/mem_multiuser.sql
+          psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -v owner=ci -f sql/migrate_entity_ownership.sql
+          psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -f sql/migrate_memory_perspectives.sql
+          psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -f sql/migrate_memory_evidence.sql
+          psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -f sql/migrate_peer_cards.sql
+          psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -f sql/migrate_dreamer.sql
+          psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -f sql/mem_app_role.sql
       - name: Load the example seed + assert Tier-1 resolves
         run: |
           psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -f examples/seed_example.sql

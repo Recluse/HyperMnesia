@@ -33,6 +33,8 @@ Load the schema once Postgres is up:
 ```bash
 kubectl exec -i deploy/postgres -- psql -U hm -d hypermnesia < ../../sql/schema.sql
 kubectl exec -i deploy/postgres -- psql -U hm -d hypermnesia < ../../sql/schema_mem.sql
+# Then apply the ordered personal-memory migrations from docs/INSTALL.md. The entity ownership
+# step needs `-v owner=<your-handle>`; mem_app_role.sql is last.
 ```
 
 If you build a reusable manifest set for your cluster, a PR adding it under `deploy/k8s/<flavor>/`
