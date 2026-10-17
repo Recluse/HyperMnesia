@@ -164,11 +164,14 @@ to serve the stack to another machine, and put something in front of it when you
 
 ## C. Kubernetes
 
-The stack is small; adapt the compose services into your own manifests. **[deploy/k8s/README.md](../deploy/k8s/README.md)**
-describes the shape: a Postgres+pgvector Deployment with a PVC (pin to a node if the PV is
-node-local), a TEI `bge-m3` Deployment, ingest/embed as one-shot Jobs, and the MCP server
-running client-side reaching Postgres via a port-forward or routable Service. Load the schema
-with `kubectl exec ... psql -v ON_ERROR_STOP=1 < sql/schema.sql`.
+Follow the **[Kubernetes runbook](../deploy/k8s/README.md)** for a complete component-by-component
+path: Postgres with a PVC, TEI `bge-m3`, optional reranker and vLLM Deployments, schema loading,
+ingest Jobs, memory CronJobs, local stdio MCP connectivity and NetworkPolicy boundaries. The MCP
+server normally remains beside the client and reaches private cluster services through a routed
+network or loopback port-forwards.
+
+For the reasons behind that split, see [deployment architectures](DEPLOYMENT.md). For individual
+host/container commands, see [running components separately](COMPONENTS.md).
 
 ## D. CPU-only minimal (no GPU, no reranker)
 

@@ -226,14 +226,24 @@ See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full system picture
 | `tests/` | contract tests, all wired into CI: hook I/O, ingest behavior, memory perspectives/evidence/context/Dreamer/Dialectic, glob parity, query hygiene, diagnostics, settings and the live SQL boundary |
 | `mcp-server/` | Rust MCP server exposing project map, constraints, doc search, scoped memory, grounded context/Q&A, `project_status`, and install `status` |
 | `console/` | the operator's side: a menu-bar tray and four command-line tools (`stats`, `jobs`, `settings`, `setup`) over any deployment — volumes, scheduled jobs, tunables, and a first-run wizard |
-| `deploy/` | docker-compose (single box) + Kubernetes manifests |
+| `deploy/` | Docker Compose for one box + the Kubernetes deployment runbook |
 | `examples/` | an example structural-tier seed for a project |
 | `skills/` | `onboard-project` — the six steps to connect a new repo; `just` — answer-only / audit mode (agent-readable skills) |
 
 ## Install
 
-See **[docs/INSTALL.md](docs/INSTALL.md)** for the four deployment options (laptop, single
-server, Kubernetes, CPU-only-minimal) and the hardware / OS / software requirements table.
+Start with **[docs/INSTALL.md](docs/INSTALL.md)** for prerequisites and the first working
+installation. The focused runbooks cover the next choice without making one page carry every
+variant:
+
+- **[deployment architectures](docs/DEPLOYMENT.md)** — local, single-server, split-compute,
+  Kubernetes and CPU-only layouts;
+- **[components](docs/COMPONENTS.md)** — start and verify Postgres, embedding, ingest, reranking,
+  model jobs, MCP, hooks and the console independently;
+- **[LLM backends](docs/LLM_BACKENDS.md)** — Ollama, vLLM, hosted OpenAI-compatible services,
+  CLI adapters and model-sizing guidance;
+- **[Kubernetes](deploy/k8s/README.md)** — Postgres/PVC, TEI, optional reranker and vLLM,
+  Jobs/CronJobs, client connectivity and network boundaries.
 
 TL;DR (single box). This ends at the first thing you can *see*: an invariant arriving before an
 edit.

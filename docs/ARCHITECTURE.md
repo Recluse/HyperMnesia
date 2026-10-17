@@ -5,6 +5,10 @@ architectural map, and personal memory. It deliberately does **not** index code 
 job belongs to a live language-server layer it sits next to. This page describes the whole
 picture and how the pieces divide the work.
 
+This is the logical architecture. For placement and operational tradeoffs, continue with
+[deployment architectures](DEPLOYMENT.md); for one-process-at-a-time commands, use
+[running components separately](COMPONENTS.md).
+
 ## The three layers
 
 ```mermaid

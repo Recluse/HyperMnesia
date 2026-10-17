@@ -106,7 +106,9 @@ the permissions it demands.
 `mem_extract.py`, `mem_consolidate.py`, `mem_reflect.py`, and `mem_dream.py` are NOT hooks — run
 them out of band so they never block a session. The Dreamer has a PID lock and records each run;
 it still cannot write a derived memory until `mem_review.py approve` revalidates the proposal.
-They need `HM_LLM*` (see `_llm.py`: OpenAI-compatible endpoint, Ollama, or a CLI).
+They need `HM_LLM*` (see `_llm.py`: OpenAI-compatible endpoint, Ollama, or a CLI). The
+[LLM backend guide](../docs/LLM_BACKENDS.md) includes vLLM, model sizing, security boundaries and
+Kubernetes placement.
 
 cron:
 ```cron
