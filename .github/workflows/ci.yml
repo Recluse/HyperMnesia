@@ -58,6 +58,14 @@ jobs:
         run: python tests/test_dreamer.py && python tests/test_dialectic.py
       - name: Public model prompts are English
         run: python tests/test_prompt_language.py
+      # Reserved metadata decides which layer a memory is cited from. A caller that can set it
+      # can pass an unreviewed write off as an approved Dreamer conclusion.
+      - name: Reserved write fields and merge perspective
+        run: python tests/test_write_trust.py
+      - name: Maintenance locks (atomic, stale after reboot PID reuse)
+        run: python tests/test_maintenance_locks.py
+      - name: Knowledge pages (sibling tag, chunking, publish SQL)
+        run: python tests/test_mem_pages.py
       # Four modules ship an executable self-check and only one of them was run. For each of
       # the three below, that self-check is the ONLY automated coverage its behaviour has:
       # Tier-1 selection (longest-match order, 1-hop propagation, cross-repo isolation),

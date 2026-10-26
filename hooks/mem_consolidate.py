@@ -12,13 +12,15 @@ canonical failure). Run daily from cron or a user-level scheduler.
    losers marked superseded via mem_ops mark. Profile cache invalidated.
 Lock-serialized, small blast radius: touches only groups the LLM ruled on.
 """
-import json, math, os, sys, time
+import json, math, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _mem_common import mem_ops, psql, defang
+from _mem_common import mem_ops, psql, defang, acquire_lock, release_lock, profile_cache_path
 from _llm import complete
 
 LOCK = os.path.expanduser("~/.claude/mem-consolidate.lock")
-PROFILE_CACHE = os.path.expanduser("~/.claude/hypermnesia-profile-cache.txt")  # keep in sync with mem_profile.py
+# The same per-identity path mem_profile.py writes. A literal here went stale when the cache
+# became per-identity, and the invalidation below then deleted a file nothing reads.
+PROFILE_CACHE = profile_cache_path()
 # Cosine ceiling for "close enough to be the same fact". 0.35 was "same topic", not "same
 # fact" -- unrelated queries start around 0.52 on bge-m3, so a third of that span is still
 # broadly topical. Measured on a 528-memory store: at 0.35 the candidate graph is one connected
@@ -146,16 +148,10 @@ def candidate_groups(pairs, max_size=None):
 
 def main():
     dry = "--dry-run" in sys.argv
-    if os.path.exists(LOCK):                         # stale-lock safe (killed run -> 2h)
-        if time.time() - os.path.getmtime(LOCK) < 7200:
-            print("another consolidate run holds the lock; exiting")
-            return
-        print("stale lock (>2h) -- removing")
-        try:
-            os.remove(LOCK)
-        except OSError:
-            pass
-    open(LOCK, "w").close()
+    # Atomic PID lock (exists-then-create let two launches both enter); see acquire_lock.
+    if not acquire_lock(LOCK):
+        print("another consolidate run holds the lock; exiting")
+        return
     try:
         raw = psql(GROUPS_SQL, timeout=30)
         if raw is None:
@@ -276,7 +272,7 @@ def main():
                   f"they were NOT reviewed, not 'kept'")
         print("done" + (" (dry-run)" if dry else ""))
     finally:
-        os.remove(LOCK)
+        release_lock(LOCK)
 
 
 if __name__ == "__main__":

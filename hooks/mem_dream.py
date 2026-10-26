@@ -151,6 +151,14 @@ def main():
                         queued += 1
                         print(f"    {result.strip()}: {candidate['reasoning_level']} "
                               f"from {evidence}", flush=True)
+                lost = len(candidates) - queued
+                if lost:
+                    # A succeeded run is never repeated for the same input fingerprint, so
+                    # recording one here would drop the unqueued candidates for good. Failed
+                    # runs are retried; review_add skips a derive already pending, so the ones
+                    # that did get queued are not duplicated by the retry.
+                    raise RuntimeError(f"{lost} of {len(candidates)} candidate(s) could not "
+                                       f"be queued for review")
                 mem_ops("dream_finish", {"id": run_id, "status": "succeeded",
                         "candidate_count": queued}, timeout=30)
                 print(f"  {label}: dream #{run_id} succeeded, {queued} candidate(s)", flush=True)

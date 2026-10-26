@@ -521,11 +521,11 @@ the file is what is in force.
 | `HM_DB_TIMEOUT_SECS` | `30` | MCP server: ceiling on one `psql` call |
 | `HM_SEARCH_TIMEOUT_SECS` | `60` | MCP server: ceiling on one search |
 | `HM_MEMOPS_TIMEOUT_SECS` | `60` | MCP server: ceiling on one memory operation |
-| `HM_DIALECTIC_TIMEOUT_SECS` | `420` | MCP server: ceiling on grounded `memory_ask`, including the configured LLM call |
+| `HM_DIALECTIC_TIMEOUT_SECS` | `MEM_DIALECTIC_TIMEOUT` + 120 | MCP server: kill deadline for grounded `memory_ask`. It is derived from `MEM_DIALECTIC_TIMEOUT` (environment or settings file) plus a 120-second margin, so the Python side always times out first and reaps its own children; this variable can only raise it |
 | `HM_STATUS_TIMEOUT_SECS` | `120` | MCP server: ceiling on `status` (every check inside is itself bounded) |
 | `HM_GRAPH_TTL_SECS` | `300` | how long the MCP server may serve a cached component map before re-reading it |
 | `HM_DOC_MAX_CHARS` | `60000` | `get_document` cap; past it the text is cut and the cut is announced |
-| `HM_REPO` | cwd basename | which ingested scope this workspace is — an **exact**, case-sensitive match. Unset, the MCP server guesses it from the directory name and strips anything outside `[A-Za-z0-9._-]`; in both cases the scoped tools (`get_project_map`, `get_document`, `search_docs`) open their answer with a `(!) SCOPE:` line saying so |
+| `HM_REPO` | cwd basename | which ingested scope this workspace is — an **exact**, case-sensitive match. Unset, the MCP server guesses it from the directory name. A name with anything outside `[A-Za-z0-9._-]`, or `ALL` in any case, is refused rather than rewritten, and the session is scoped to nothing (`UNSCOPED-set-HM_REPO`). When the name was guessed or refused, the scoped tools (`get_project_map`, `get_document`, `search_docs`) open their answer with a `(!) SCOPE:` line saying so |
 | `HM_FTS_LANG` | `english` | the Postgres text-search configuration for the memory query; change it and the two search legs must agree |
 | `MEM_EMBED_MAX_CHARS` | `12000` | how much of a memory's text is embedded (`ingest/mem_ops.py`) |
 | `EMBED_QUERY_MAX_CHARS` / `EMBED_QUERY_TIMEOUT` | `12000` / `20` s | caps on embedding one query (`ingest/_common.py`) |
@@ -555,7 +555,7 @@ it listed as refused rather than applied.
 | `MEM_DREAM_MAX_MEMORIES` | `24` | `hooks/mem_dream.py` | console / settings file | maximum explicit premises shown for one perspective |
 | `MEM_DREAM_MAX_GROUPS` | `2` | `hooks/mem_dream.py` | console / settings file | perspective groups processed per run |
 | `MEM_DREAM_MAX_CANDIDATES` | `4` | `hooks/mem_dream.py` | console / settings file | candidates accepted from one model reply before human review |
-| `MEM_DIALECTIC_TIMEOUT` | `300` | `hooks/mem_dialectic.py` | console / settings file | LLM timeout inside grounded `memory_ask`, clamped to 30..600 seconds |
+| `MEM_DIALECTIC_TIMEOUT` | `300` | `hooks/mem_dialectic.py`, MCP server | console / settings file | wall-clock limit for one grounded `memory_ask` run (context build and LLM call together), clamped to 30..600 seconds. On expiry the run kills its backend's whole process group |
 | `HM_LLM_MODEL` | backend-dependent | `hooks/_llm.py` | settings | the model every LLM step asks. There is no per-pass model knob: `MEM_CONSOLIDATE_MODEL` and `MEM_EXTRACT_MODEL` were documented for a while and read by nothing — `tests/test_settings_knobs.py` exists because of them |
 
 ### The shared settings file

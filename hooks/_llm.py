@@ -7,7 +7,7 @@ Backends (auto-selected, or force with HM_LLM_BACKEND = openai | ollama | cli):
   * cli    : HM_LLM_CMD -- a command; the prompt is appended as an arg, the text goes on stdin,
              the final message is read from stdout (e.g. `codex exec ... -` style tools)
 """
-import json, os, subprocess, urllib.request
+import json, os, signal, subprocess, urllib.request
 
 # The shared settings file, applied before the constants below are computed. Its callers happen
 # to import _mem_common first today, which applies it -- but "happens to, in this import order"
@@ -48,15 +48,33 @@ def _http(url, payload, headers, timeout):
         return json.loads(r.read())
 
 
+def _cli(argv, user_text, timeout):
+    """Run a CLI backend in its own process group and kill the WHOLE group on any exit path.
+
+    subprocess.run(timeout=) kills only the direct child. CLI agents (`codex exec` and the like)
+    start helpers of their own, and those survived the timeout as orphans still holding the
+    model call -- or, when our caller's deadline fired first, outlived this process entirely.
+    """
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        out, _ = proc.communicate(input=user_text.encode(), timeout=timeout)
+    except BaseException:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
+        raise
+    return out.decode("utf-8", "replace") if proc.returncode == 0 else ""
+
+
 def complete(system_prompt, user_text, timeout=600):
     """Return the model's text response (or '' on failure -- callers are fail-open)."""
     b = _backend()
     try:
         if b == "cli":
-            argv = CMD.split() + [system_prompt]
-            p = subprocess.run(argv, input=user_text.encode(),
-                               capture_output=True, timeout=timeout)
-            return p.stdout.decode("utf-8", "replace") if p.returncode == 0 else ""
+            return _cli(CMD.split() + [system_prompt], user_text, timeout)
         msgs = [{"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text}]
         if b == "openai":

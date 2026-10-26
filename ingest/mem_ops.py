@@ -28,6 +28,14 @@ from _redact import scrub
 FTS_LANG = os.environ.get("HM_FTS_LANG", "english")
 if not re.fullmatch(r"[a-z_]+", FTS_LANG):   # it is interpolated into SQL literals
     FTS_LANG = "english"
+# The text-search configurations a stock PostgreSQL ships, plus a deployment's own HM_FTS_LANG
+# (a custom configuration is legitimate there). Anything else passed per call is refused.
+TS_CONFIGS = frozenset((
+    "simple", "arabic", "armenian", "basque", "catalan", "danish", "dutch", "english",
+    "finnish", "french", "german", "greek", "hindi", "hungarian", "indonesian", "irish",
+    "italian", "lithuanian", "nepali", "norwegian", "portuguese", "romanian", "russian",
+    "serbian", "spanish", "swedish", "tamil", "turkish", "yiddish", FTS_LANG,
+))
 
 
 # The write path reuses the QUERY embedder, whose 6000-character cut exists because a query is
@@ -223,12 +231,34 @@ def _write_derivations(cur, derived_id, author, items):
                      _unit(item.get("confidence", 1.0), 1.0), scrub(item.get("note"))))
 
 
+# Metadata keys that classify a row or record how the store itself produced it. A row with
+# reasoning_level set lands in the derived layer and is cited by memory_ask as a reviewed
+# conclusion; kind='page' hides it from context and from the novelty gate. Only in-process
+# callers that ARE that machinery (Dreamer approval, merges, pages) may set them, and they say
+# so with _trusted_metadata -- a key no external payload can carry, because main() strips it.
+RESERVED_METADATA = frozenset(("kind", "reasoning_level", "dream_run_id", "merged_from",
+                               "merged_perspectives", "superseded_by"))
+
+
+def _caller_metadata(p):
+    meta = p.get("metadata") or {}
+    if not isinstance(meta, dict):
+        return {}
+    if p.get("_trusted_metadata") is True:
+        return meta
+    return {k: v for k, v in meta.items() if k not in RESERVED_METADATA}
+
+
 def do_write(cur, p, supersedes_id=None):
     # Redact structured secrets BEFORE persist/embed. Single chokepoint for every write path
     # (hook extract, memory_write, supersede, consolidation merge).
     author = require_author(p.get("_identity"))
     content = scrub(p["content"])
     title = scrub(p.get("title"))
+    # Embed first: it is an HTTP call to the embedder, and below this line the transaction takes
+    # row locks (the supersede target FOR UPDATE, the author's self-entity upsert) that would
+    # otherwise be held for as long as the embedder takes to answer.
+    vector = embed(content)
     observer_spec = p.get("observer")
     observed_spec = p.get("observed")
     subject_spec = p.get("subject")
@@ -311,7 +341,7 @@ def do_write(cur, p, supersedes_id=None):
          _unit(p.get("importance", 0.5), 0.5), _unit(p.get("confidence", 0.8), 0.8), subj_id,
          observer_id, observed_id,
          project, p.get("valid_from"), p.get("valid_to"), p.get("event_time"),
-         supersedes_id, json.dumps(_scrub_deep(p.get("metadata", {}))), embed(content),
+         supersedes_id, json.dumps(_scrub_deep(_caller_metadata(p))), vector,
          EMBED_MODEL, author, scope))
     mid = cur.fetchone()[0]
     if supersedes_id:
@@ -375,7 +405,10 @@ SELECT m.id, m.memory_type::text, m.status::text, m.importance, m.confidence,
        m.project, m.content,
        (COALESCE(1.0/(60+s.rank),0) + COALESCE(1.0/(60+l.rank),0)
         + 0.002*m.importance
-        + CASE WHEN m.created_at > now()-interval '30 days' THEN 0.001 ELSE 0 END) AS score
+        + CASE WHEN m.created_at > now()-interval '30 days' THEN 0.001 ELSE 0 END) AS score,
+       -- The row's real layer. Context assembly labels search hits with it; without this
+       -- column a Dreamer conclusion found by search was presented as an explicit fact.
+       coalesce(m.metadata->>'reasoning_level','explicit') AS reasoning_level
 FROM pool m
 LEFT JOIN semantic s ON s.id = m.id
 LEFT JOIN lexical  l ON l.id = m.id
@@ -411,20 +444,31 @@ _COMPOUND = re.compile(r"[\w\-]+(?:[./][\w\-]+)+", flags=re.U)
 _WORD = re.compile(r"[\w\-]+", flags=re.U)
 
 
-def _no_neg(q):
-    """Strip token-edge dashes so websearch syntax cannot turn a flag into broad negation."""
-    toks = [token.strip("-") for token in _WORD.findall(q or "")]
-    toks = [token for token in toks if token]
-    return " ".join(toks) if toks else "zzz-no-lexemes-zzz"
-
-
-def _simple_query(q):
+def _tokens(q):
+    """[(token, is_compound)] over the query, compound tokens (a.b, a/b/c) kept whole."""
     q, out, pos = q or "", [], 0
     for m in _COMPOUND.finditer(q):
         out += [(t, False) for t in _WORD.findall(q[pos:m.start()])]
         out.append((m.group(0), True))
         pos = m.end()
     out += [(t, False) for t in _WORD.findall(q[pos:])]
+    return out
+
+
+def _no_neg(q):
+    """Strip token-edge dashes so websearch syntax cannot turn a flag into broad negation.
+
+    Compounds stay whole, as in ingest/search.py: Postgres stores `example.com` or `search.py`
+    as ONE lexeme, and splitting the query at the dot made the stemmed leg look for `exampl`
+    and `com` -- matching neither the stored compound nor anything else worth finding.
+    """
+    toks = [token.strip("-") for token, _ in _tokens(q)]
+    toks = [token for token in toks if token]
+    return " ".join(toks) if toks else "zzz-no-lexemes-zzz"
+
+
+def _simple_query(q):
+    out = _tokens(q)
     toks = [t if comp else t.strip("-") for t, comp in out
             if comp or (len(t) > 2 and t.lower() not in _STOP)]
     toks = [t for t in toks if t]
@@ -518,7 +562,9 @@ def do_evidence(cur, p):
                        ORDER BY created_at,id),'[]'::jsonb)
                    FROM (SELECT * FROM mem.derivations d WHERE {clause}
                          ORDER BY created_at,id LIMIT %s) visible""", params)
-    return {"version": 1, "edges": cur.fetchone()[0]}
+    # `note` is free text written by whoever recorded the edge; it reaches a model exactly like
+    # memory content does, so it gets the same sanitisation as every other context surface.
+    return {"version": 1, "edges": _context_metadata(cur.fetchone()[0])}
 
 
 def do_peer_card(cur, p):
@@ -680,20 +726,28 @@ def _context_metadata(value):
 
 
 def _context_row(r, sources=None, reasoning_level=None, evidence_for=None, evidence_depth=None,
-                 evidence_paths=None, perspective=None):
+                 evidence_paths=None, perspective=None, contradicts=None,
+                 contradicted_by=None):
     content = context_safe(r[9])
     clipped = len(content) > CONTEXT_ITEM_CHARS
     out = {
         "id": r[0], "type": r[1], "status": r[2], "importance": float(r[3]),
         "created_at": r[5], "project": r[8],
         "content": content[:CONTEXT_ITEM_CHARS], "content_truncated": clipped,
-        "reasoning_level": reasoning_level or (r[11] if len(r) > 11 else "explicit"),
+        # Every producer (SEARCH_SQL, _CONTEXT_SELECT, the evidence walk) selects the level as
+        # column 11. A length-based default here is what let 11-column search rows pass a
+        # derived conclusion off as explicit.
+        "reasoning_level": reasoning_level or r[11],
         "sources": sources or [],
     }
     if evidence_for:
         out["evidence_for"] = sorted(set(evidence_for))
         out["evidence_depth"] = evidence_depth
         out["evidence_paths"] = evidence_paths or []
+    if contradicts:
+        out["contradicts"] = sorted(set(contradicts))
+    if contradicted_by:
+        out["contradicted_by"] = sorted(set(contradicted_by))
     if perspective:
         out["perspective"] = perspective
     return out
@@ -710,7 +764,10 @@ def pack_context(sections, token_budget, scope):
               "depth": scope.get("depth", "low"),
               "token_budget": budget, "estimated_tokens": 0,
               "truncated": False, "scope": scope, "sections": []}
-    base = {**result, "estimated_tokens": budget, "truncated": True}
+    # Reserve the LONGEST form of the two fields filled in last: the final estimate never
+    # exceeds the budget (so has at most its digits), and `false` is one character longer than
+    # `true`. Reserving `true` let a result that fitted entirely come out one token over.
+    base = {**result, "estimated_tokens": budget, "truncated": False}
     if estimate_tokens(json.dumps(base, ensure_ascii=False, separators=(",", ":"))) > budget:
         raise SystemExit("token_budget is too small for the requested scope metadata")
     output = {name: [] for name, _ in sections}
@@ -730,7 +787,7 @@ def pack_context(sections, token_budget, scope):
                                   for n, vals in output.items() if vals or n == name]
             # Reserve the largest metadata representation up front. Filling in the final
             # estimate/truncation fields must never push an allegedly bounded result over budget.
-            candidate = {**result, "estimated_tokens": budget, "truncated": True,
+            candidate = {**result, "estimated_tokens": budget, "truncated": False,
                          "sections": candidate_sections}
             used = estimate_tokens(json.dumps(candidate, ensure_ascii=False, separators=(",", ":")))
             if used <= budget:
@@ -762,37 +819,42 @@ WHERE (m.metadata->>'kind') IS DISTINCT FROM 'page' AND {layer} AND {where}
 ORDER BY m.importance DESC, m.created_at DESC, m.id DESC LIMIT %s"""
 
 
-def _context_levels(cur, ids):
-    if not ids:
-        return {}
-    cur.execute("""SELECT id,coalesce(metadata->>'reasoning_level','explicit')
-                     FROM mem.active_memories WHERE id=ANY(%s)""", (ids,))
-    return dict(cur.fetchall())
-
-
 def _context_evidence(cur, derived_ids, max_hops, limit):
     """Visible active premises for conclusions, with bounded cycle-safe ancestry traversal."""
     if not derived_ids or max_hops < 1:
         return []
-    cur.execute("""WITH RECURSIVE walk(memory_id,root_id,depth,path) AS (
-                     SELECT d.evidence_memory_id,d.derived_memory_id,1,
+    # The edge relation travels with the walk. A `contradicts` edge points at a memory that
+    # argues AGAINST its target; reporting it under evidence_for made it a cited premise of the
+    # conclusion it disputes. Such edges are kept (the disagreement is worth showing) but end
+    # the walk -- the contradicting memory's own premises are not premises of the root -- and
+    # come back separately as the ids each row contradicts.
+    cur.execute("""WITH RECURSIVE walk(memory_id,root_id,target_id,relation,depth,path) AS (
+                     SELECT d.evidence_memory_id,d.derived_memory_id,d.derived_memory_id,
+                            d.relation::text,1,
                             ARRAY[d.derived_memory_id,d.evidence_memory_id]
                        FROM mem.derivations d WHERE d.derived_memory_id=ANY(%s)
                      UNION ALL
-                     SELECT d.evidence_memory_id,w.root_id,w.depth+1,
+                     SELECT d.evidence_memory_id,w.root_id,d.derived_memory_id,
+                            d.relation::text,w.depth+1,
                             w.path||d.evidence_memory_id
                        FROM walk w JOIN mem.derivations d ON d.derived_memory_id=w.memory_id
-                      WHERE w.depth < %s AND NOT d.evidence_memory_id=ANY(w.path)
+                      WHERE w.depth < %s AND w.relation <> 'contradicts'
+                        AND NOT d.evidence_memory_id=ANY(w.path)
                    ), ranked AS (
-                     SELECT memory_id,min(depth) depth,array_agg(DISTINCT root_id) roots,
-                            jsonb_agg(DISTINCT to_jsonb(path)) paths
+                     SELECT memory_id,min(depth) depth,
+                            array_agg(DISTINCT root_id)
+                              FILTER (WHERE relation <> 'contradicts') roots,
+                            jsonb_agg(DISTINCT to_jsonb(path))
+                              FILTER (WHERE relation <> 'contradicts') paths,
+                            array_agg(DISTINCT target_id)
+                              FILTER (WHERE relation = 'contradicts') contradicts
                        FROM walk GROUP BY memory_id ORDER BY min(depth),memory_id LIMIT %s
                    )
                    SELECT m.id,m.memory_type::text,m.status::text,m.importance,m.confidence,
                           m.created_at::date::text,m.valid_from::date::text,
                           m.valid_to::date::text,m.project,m.content,0.0,
                           coalesce(m.metadata->>'reasoning_level','explicit'),
-                          r.depth,r.roots,r.paths
+                          r.depth,r.roots,r.paths,r.contradicts
                      FROM ranked r JOIN mem.all_memories m ON m.id=r.memory_id
                     WHERE (m.metadata->>'kind') IS DISTINCT FROM 'page'
                     ORDER BY r.depth,m.importance DESC,m.created_at DESC,m.id DESC""",
@@ -931,7 +993,7 @@ def do_context(cur, p):
     searched_rows = do_search(cur, {**p, "query": query, "project": project,
                                     "k": min(80, pre_limit * 2)},
                               track_access=False) if query else []
-    levels = _context_levels(cur, [r[0] for r in searched_rows])
+    levels = {r[0]: r[11] for r in searched_rows}
     if requested_depth == "auto":
         depth, selection_reason, selection_signals = _auto_depth(
             query, routing, searched_rows, levels)
@@ -1002,13 +1064,18 @@ def do_context(cur, p):
     all_ids = list({r[0] for r in all_rows})
     sources = _context_sources(cur, all_ids)
     perspectives, _ = _context_perspectives(cur, all_ids)
-    evidence_meta = {r[0]: (r[13], r[12], r[14]) for r in evidence_rows}
+    evidence_meta = {r[0]: (r[13], r[12], r[14], r[15]) for r in evidence_rows}
+    contradicted_by = {}
+    for r in evidence_rows:
+        for target in r[15] or []:
+            contradicted_by.setdefault(target, []).append(r[0])
 
     def context_item(row, level=None):
-        roots, hops, paths = evidence_meta.get(row[0], (None, None, None))
+        roots, hops, paths, contradicts = evidence_meta.get(row[0], (None, None, None, None))
         return _context_row(row, sources.get(row[0]), level,
                             evidence_for=roots, evidence_depth=hops, evidence_paths=paths,
-                            perspective=perspectives.get(row[0]))
+                            perspective=perspectives.get(row[0]), contradicts=contradicts,
+                            contradicted_by=contradicted_by.get(row[0]))
 
     base_sections = [
         ("global", [context_item(r) for r in global_rows]),
@@ -1117,7 +1184,7 @@ def do_page_upsert(cur, p):
     # the project and is mirrored into the unscoped document corpus, so "private page" is not a
     # state this should be able to reach by accident in either direction.
     payload = {**p, "project": proj, "type": "semantic", "scope": "project",
-               "metadata": {**(p.get("metadata") or {}), "kind": "page"},
+               "metadata": {**_caller_metadata(p), "kind": "page"}, "_trusted_metadata": True,
                "importance": p.get("importance", 0.6), "confidence": p.get("confidence", 0.7)}
     # The newest becomes the supersede TARGET, so the chain stays walkable from the new page.
     mid = do_write(cur, payload, supersedes_id=prior[0] if prior else None)
@@ -1205,12 +1272,19 @@ def do_page_publish(cur, p):
     doc_id = cur.fetchone()[0]
     cur.execute("DELETE FROM chunks WHERE document_id=%s", (doc_id,))
     chunks = _page_chunks(content)
+    # The configuration goes in as a bound ::regconfig parameter, and only after it matched a
+    # known one. This used to be an f-string glued to a plain one, so the literal text
+    # '{lang}' reached Postgres and every publish failed on a configuration nobody has.
+    lang = p.get("lang") or FTS_LANG
+    if lang not in TS_CONFIGS:
+        raise SystemExit(f"page_publish: unknown text-search configuration {lang!r}")
     for i, (head, text) in enumerate(chunks):
         cur.execute(
-            f"INSERT INTO chunks (document_id,heading_path,ordinal,content,token_count,fts,"
+            "INSERT INTO chunks (document_id,heading_path,ordinal,content,token_count,fts,"
             "embedding,embedding_model) VALUES (%s,%s,%s,%s,%s,"
-            "to_tsvector('{lang}',%s)||to_tsvector('simple',%s),%s::vector,%s)",
-            (doc_id, head, i, text, len(text) // 4, text, text, embed(text), EMBED_MODEL))
+            "to_tsvector(%s::regconfig,%s)||to_tsvector('simple',%s),%s::vector,%s)",
+            (doc_id, head, i, text, len(text) // 4, lang, text, text, embed(text),
+             EMBED_MODEL))
     return {"repo": repo, "path": path, "document_id": doc_id, "chunks": len(chunks)}
 
 
@@ -1244,7 +1318,7 @@ def do_stale_list(cur, p):
 
 
 def fmt_row(r):
-    mid, mtype, status, imp, conf, created, vfrom, vto, project, content, _ = r
+    mid, mtype, status, imp, conf, created, vfrom, vto, project, content, _ = r[:11]
     flags = f"{mtype} imp={imp:.1f}"
     if status != "active":
         flags += f" [{status}]"
@@ -1273,6 +1347,12 @@ def _group_project(cur, member_ids):
 
 def _group_perspective(cur, member_ids):
     """The one observer/observed pair shared by all premises, including entity specs."""
+    pairs = _member_perspectives(cur, member_ids)
+    return pairs[0] if len(pairs) == 1 else None
+
+
+def _member_perspectives(cur, member_ids):
+    """Every distinct observer/observed pair among the members, as entity specs."""
     cur.execute("""SELECT DISTINCT m.observer_entity_id,m.observed_entity_id,
                           oo.namespace,oo.entity_type,oo.canonical_name,oo.aliases,
                           od.namespace,od.entity_type,od.canonical_name,od.aliases
@@ -1280,12 +1360,9 @@ def _group_perspective(cur, member_ids):
                      JOIN mem.entities oo ON oo.author=m.author AND oo.id=m.observer_entity_id
                      JOIN mem.entities od ON od.author=m.author AND od.id=m.observed_entity_id
                     WHERE m.id=ANY(%s)""", (member_ids,))
-    rows = cur.fetchall()
-    if len(rows) != 1:
-        return None
-    r = rows[0]
-    return ({"namespace": r[2], "entity_type": r[3], "name": r[4], "aliases": r[5]},
-            {"namespace": r[6], "entity_type": r[7], "name": r[8], "aliases": r[9]})
+    return [({"namespace": r[2], "entity_type": r[3], "name": r[4], "aliases": r[5]},
+             {"namespace": r[6], "entity_type": r[7], "name": r[8], "aliases": r[9]})
+            for r in cur.fetchall()]
 
 
 def apply_proposal(cur, action, member_ids, proposal, who=None):
@@ -1350,6 +1427,7 @@ def apply_proposal(cur, action, member_ids, proposal, who=None):
             "observer": observer, "observed": observed,
             "metadata": {"kind": "dream", "reasoning_level": level,
                          "dream_run_id": proposal.get("dream_run_id")},
+            "_trusted_metadata": True,
             "evidence": [{"memory_id": m, "relation": "inferred_from",
                           "confidence": confidence, "note": f"dreamer {level} premise"}
                          for m in unique_members],
@@ -1365,11 +1443,24 @@ def apply_proposal(cur, action, member_ids, proposal, who=None):
         return (f"not applied: {member_ids} are shared with different projects, so the merged "
                 f"memory would have no audience of its own. Merge within one project.")
     if action == "merge" and proposal.get("content"):
+        # The merged row keeps the members' perspective when they share one. Without it the
+        # write defaulted to the author observing themself, and the peer card of whoever the
+        # members were about lost those rows from its counts. Members that disagree get the
+        # default, with what each one said recorded rather than silently dropped.
+        pairs = _member_perspectives(cur, member_ids)
+        metadata = {"merged_from": list(member_ids)}
+        perspective = {}
+        if len(pairs) == 1:
+            perspective = {"observer": pairs[0][0], "observed": pairs[0][1]}
+        elif pairs:
+            metadata["merged_perspectives"] = [{"observer": o["name"], "observed": d["name"]}
+                                               for o, d in pairs]
         mid = do_write(cur, {
             "type": proposal.get("type", "semantic"),
             "content": proposal["content"],
             "importance": min(0.7, max(0.0, float(proposal.get("importance", 0.6)))),
-            "metadata": {"merged_from": list(member_ids)},
+            **perspective,
+            "metadata": metadata, "_trusted_metadata": True,
             "evidence": [{"memory_id": m, "relation": "summarizes",
                           "note": "consolidation source"} for m in member_ids],
             # The merged row keeps the group's author and audience rather than taking the
@@ -1405,6 +1496,10 @@ def apply_proposal(cur, action, member_ids, proposal, who=None):
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     p = json.loads(sys.stdin.read() or "{}")
+    # `_trusted*` keys mark in-process callers (see RESERVED_METADATA). Whatever arrives on
+    # stdin is external by definition -- an MCP client, a hook, a person -- so none survive.
+    if isinstance(p, dict):
+        p = {k: v for k, v in p.items() if not str(k).startswith("_trusted")}
     conn = connect()
     cur = conn.cursor()
     # Before ANY statement: every read surface below filters on this, and a connection that

@@ -256,10 +256,25 @@ final `hm doctor` after all shards finish.
 ## 8. Scheduled memory jobs
 
 Consolidation, reflection and Dreamer can be separate CronJobs. Use
-`concurrencyPolicy: Forbid`, a bounded deadline and the scoped application role. A worker needs:
+`concurrencyPolicy: Forbid`, a bounded deadline and the scoped application role.
+
+`sql/mem_app_role.sql` creates `hm_app` with no password. Set one once, and keep it in its own
+secret:
+
+```bash
+HM_APP_PASSWORD=$(openssl rand -hex 24)
+printf "ALTER ROLE hm_app PASSWORD '%s';\n" "$HM_APP_PASSWORD" |
+  kubectl -n hypermnesia exec -i deploy/postgres -- \
+    psql -U hm -d hypermnesia -v ON_ERROR_STOP=1
+kubectl -n hypermnesia create secret generic hm-app-auth \
+  --from-literal=DATABASE_URL="postgresql://hm_app:$HM_APP_PASSWORD@postgres:5432/hypermnesia"
+```
+
+A worker needs:
 
 ```text
-DATABASE_URL=postgresql://hm_app:...@postgres:5432/hypermnesia
+DATABASE_URL=postgresql://hm_app:...@postgres:5432/hypermnesia   # from hm-app-auth
+MEM_AUTHOR=<the identity whose memories this job maintains>
 EMBED_BACKEND=tei
 TEI_URL=http://tei
 HM_LLM_BACKEND=openai
@@ -267,6 +282,13 @@ HM_LLM_URL=http://vllm:8000/v1
 HM_LLM_MODEL=Qwen/Qwen2.5-7B-Instruct
 HM_LLM_KEY=<secret>
 ```
+
+`MEM_AUTHOR` is not optional here. Under `hm_app` the row-level policies show a connection with
+no identity only what is shared with projects it belongs to, which for a job is usually nothing,
+and writes are refused. Consolidation, reflection and Dreamer then run, find nothing and exit
+successfully. Use the same name the clients write as (`MEM_AUTHOR` in their settings file), and
+run one set of jobs per author on a shared store. The identity, membership and role model is
+described in [Two people, one store](../../docs/INSTALL.md#two-people-one-store).
 
 Run one of `python3 hooks/mem_consolidate.py`, `mem_reflect.py`, or `mem_dream.py`. Do not add
 automatic review approval: Dreamer proposals must remain human-gated.

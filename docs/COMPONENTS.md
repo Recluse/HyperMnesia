@@ -107,9 +107,13 @@ Install the only non-standard Python dependency used by the core scripts, then i
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install psycopg2-binary
+export HM_PYTHON="$PWD/.venv/bin/python"
 
 ./hm ingest /path/to/repository repository-scope
 ```
+
+`hm` runs its Python steps with `$HM_PYTHON` (default `python3`), so the export is what makes
+them use the venv's `psycopg2`. Without it they run under the system interpreter.
 
 `hm ingest` enumerates, hashes and chunks the markdown, writes the scope, embeds only missing
 chunks, builds the HNSW index after the first bulk load, and runs diagnostics. Use `--walk` for a

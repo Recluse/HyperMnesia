@@ -108,7 +108,7 @@ pub const KNOBS: &[Knob] = &[
            what: "maximum candidates accepted from one Dreamer model reply before review",
            kind: Kind::Int },
     Knob { key: "MEM_DIALECTIC_TIMEOUT", default: "300", read_by: "hooks/mem_dialectic.py",
-           what: "LLM timeout for grounded memory_ask responses, clamped to 30..600 seconds",
+           what: "wall-clock limit for one grounded memory_ask run (context + LLM), clamped to 30..600 seconds",
            kind: Kind::Int },
     Knob { key: "EMBED_BATCH", default: "16", read_by: "ingest/embed_chunks.py",
            what: "how many chunks go to the embedder at once during a bulk embed",

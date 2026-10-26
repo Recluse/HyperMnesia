@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Dreamer provenance, feedback-loop and review-gate contracts."""
+import json
 import os
+import re
 import sys
 import importlib.util
 import types
@@ -30,6 +32,11 @@ assert "equivalent active memory already exists" in mem_ops
 assert 'p["action"] not in ("merge", "supersede", "derive")' in mem_ops
 assert "CREATE TABLE IF NOT EXISTS mem.dream_runs" in migration
 assert "CREATE POLICY dream_runs_own" in migration
+# The run log is an audit trail: neither file may let the app role delete from it.
+role = open(os.path.join(ROOT, "sql/mem_app_role.sql"), encoding="utf-8").read()
+for grant in re.findall(r"GRANT\s[^;]*?mem\.dream_runs[^;]*;", migration + role, re.S):
+    assert "DELETE" not in grant, grant
+assert "REVOKE DELETE ON mem.dream_runs FROM hm_app" in role
 
 sys.modules.setdefault("psycopg2", types.SimpleNamespace())
 spec = importlib.util.spec_from_file_location("dream_mem_ops", os.path.join(ROOT, "ingest/mem_ops.py"))
@@ -96,4 +103,47 @@ assert result.endswith("-> [#99]")
 assert written["scope"] == "project" and written["project"] == "sample-project"
 assert written["observer"]["name"] == "alice"
 assert [e["memory_id"] for e in written["evidence"]] == [1, 2]
+
+# A run whose candidates did not all reach the review queue must not be recorded as succeeded:
+# dream_start skips an input fingerprint that already succeeded, so the lost candidates would
+# never be proposed again. Failed runs are retried.
+full = {"__name__": "mem_dream_main", "__file__": os.path.join(ROOT, "hooks/x.py")}
+exec(compile(src, "mem_dream", "exec"), full)
+group = {"observer": {"id": 10, "name": "alice"}, "observed": {"id": 11, "name": "repo"},
+         "memories": [{"id": i, "type": "semantic", "project": "p", "scope": "project",
+                       "content": f"premise {i}"} for i in (1, 2, 3)]}
+second = {**valid, "content": "Another sufficiently long grounded conclusion.",
+          "evidence_ids": [1, 2]}
+
+
+def run_dream(review_results):
+    calls, results = [], list(review_results)
+
+    def fake_mem_ops(cmd, payload, timeout=10):
+        calls.append((cmd, payload))
+        if cmd == "dream_inputs":
+            return json.dumps({"groups": [group]})
+        if cmd == "dream_start":
+            return json.dumps({"started": True, "id": 5})
+        if cmd == "review_add":
+            return results.pop(0)
+        return "ok"
+
+    full.update(mem_ops=fake_mem_ops, acquire_lock=lambda path: True,
+                release_lock=lambda path: None,
+                generate=lambda g: [{**valid, "evidence_ids": [3]}, dict(second)])
+    saved_argv = sys.argv
+    sys.argv = ["mem_dream.py"]
+    try:
+        full["main"]()
+    finally:
+        sys.argv = saved_argv
+    return [p for c, p in calls if c == "dream_finish"]
+
+
+finished = run_dream(["review [#1] queued", None])
+assert len(finished) == 1 and finished[0]["status"] == "failed", finished
+assert finished[0]["candidate_count"] == 1 and "1 of 2" in finished[0]["error"], finished
+finished = run_dream(["review [#1] queued", "review [#2] already pending (derive duplicate)"])
+assert finished == [{"id": 5, "status": "succeeded", "candidate_count": 2}], finished
 print("dreamer contract passed")

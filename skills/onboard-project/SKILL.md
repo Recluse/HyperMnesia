@@ -33,13 +33,14 @@ schemas, and prints the `DATABASE_URL` / `EMBED_BACKEND` lines to export.
 
 Pick the repo tag now and use it everywhere — it is the scoping key for the whole tier and is
 matched as an **exact string, case included**. Ingest rejects a tag outside `[A-Za-z0-9._-]`;
-the hook and the MCP server strip every other character from `HM_REPO` (or from the cwd
-basename, when `HM_REPO` is unset) but never change its case. So ingest under the tag you will
+the hook strips every other character from `HM_REPO` (or from the cwd basename, when
+`HM_REPO` is unset), and the MCP server refuses such a name, and `ALL`, outright and scopes the
+session to nothing. Neither ever changes the case. So ingest under the tag you will
 set as `HM_REPO`, and set `HM_REPO` in both places that resolve — the hook env (step 5) and the
 MCP server env (step 4). A repo at `~/code/MyRepo` ingested as `myrepo` resolves only with
 `HM_REPO=myrepo` set; without it the fallback is the directory basename `MyRepo`, which matches
 nothing, forever, quietly. Both sides now say so: the MCP server prefixes its answer with a
-`(!) SCOPE:` line when it guessed the name from the directory or had to rewrite it, and the hook
+`(!) SCOPE:` line when it guessed the name from the directory or had to refuse it, and the hook
 announces once per episode that nothing is mapped under the scope, listing the scopes that exist.
 The server's note appears on `get_project_map`, `get_document` and `search_docs` — the three
 whose answers the scope decides. `get_constraints` and `locate` do not carry it, so a wrong

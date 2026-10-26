@@ -17,16 +17,15 @@ Run out of band (cron/systemd/launchd), NOT from a blocking hook. Needs HM_LLM* 
 import json
 import os
 import sys
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _mem_common import mem_ops  # noqa: E402
+from _mem_common import mem_ops, acquire_lock, release_lock, profile_cache_path  # noqa: E402
 from _llm import complete        # noqa: E402
 
 MIN_MEMS = int(os.environ.get("MEM_REFLECT_MIN", "5"))   # skip projects with fewer active memories
 MAX_MEMS = int(os.environ.get("MEM_REFLECT_MAX", "80"))  # cap what we feed the LLM
 LOCK = os.path.expanduser("~/.claude/mem-reflect.lock")
-PROFILE_CACHE = os.path.expanduser("~/.claude/hypermnesia-profile-cache.txt")  # keep in sync with mem_profile.py
+PROFILE_CACHE = profile_cache_path()  # the per-identity file mem_profile.py actually writes
 
 PROMPT = """You maintain a long-term-memory "page" for an AI coding agent about ONE project. Below \
 are its active memory records (type + text). Write a concise, well-organized overview a teammate \
@@ -63,33 +62,11 @@ def main():
     dry = "--dry-run" in sys.argv
     only = sys.argv[sys.argv.index("--project") + 1] if "--project" in sys.argv else None
 
-    # The lock records the PID, so a run that was KILLED (its finally never ran) does not block
-    # the next one for two hours while looking exactly like a run in progress. Age alone was the
-    # only test before, and a stale lock is silent: the scheduled pass prints "another run holds
-    # the lock" and does nothing.
-    if os.path.exists(LOCK):
-        try:
-            holder = int(open(LOCK, encoding="utf-8").read().strip() or 0)
-        except (OSError, ValueError):
-            holder = 0
-        alive = False
-        if holder:
-            try:
-                os.kill(holder, 0)          # signal 0: liveness test, sends nothing
-                alive = True
-            except OSError:
-                alive = False
-        if alive and time.time() - os.path.getmtime(LOCK) < 7200:
-            print(f"another reflect run (pid {holder}) holds the lock; exiting", flush=True)
-            return
-        if not alive:
-            print(f"clearing a stale lock (pid {holder or '?'} is gone)", flush=True)
-        try:
-            os.remove(LOCK)
-        except OSError:
-            pass
-    with open(LOCK, "w", encoding="utf-8") as fh:
-        fh.write(str(os.getpid()))
+    # Atomic PID lock: two launches cannot both enter (exists-then-create let them), a killed
+    # owner is recovered, and so is a lock whose recorded PID was reused after a reboot.
+    if not acquire_lock(LOCK):
+        print("another reflect run holds the lock; exiting", flush=True)
+        return
     try:
         if only:
             targets = [{"project": only}]
@@ -115,7 +92,7 @@ def main():
             except OSError:
                 pass
     finally:
-        os.remove(LOCK)
+        release_lock(LOCK)
 
 
 if __name__ == "__main__":

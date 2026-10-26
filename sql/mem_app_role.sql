@@ -28,8 +28,13 @@ GRANT USAGE ON SCHEMA mem, public TO hm_app;
 
 -- Personal memory: the rows it may touch are decided by the policies below, not by the grant.
 GRANT SELECT, INSERT, UPDATE, DELETE ON mem.memories, mem.assertions, mem.sources,
-                                        mem.entities, mem.review_queue, mem.derivations,
-                                        mem.dream_runs TO hm_app;
+                                        mem.entities, mem.review_queue, mem.derivations
+                                        TO hm_app;
+-- Dreamer runs are an audit trail: the app records and finishes them, never erases them. Same
+-- grant as sql/migrate_dreamer.sql; the REVOKE undoes the DELETE an earlier version of this
+-- file handed out, since re-applying a GRANT never takes anything away.
+GRANT SELECT, INSERT, UPDATE ON mem.dream_runs TO hm_app;
+REVOKE DELETE ON mem.dream_runs FROM hm_app;
 GRANT SELECT ON mem.project_members TO hm_app;
 GRANT SELECT ON mem.active_memories, mem.all_memories TO hm_app;
 GRANT SELECT ON mem.perspective_graph TO hm_app;

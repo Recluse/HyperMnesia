@@ -19,6 +19,11 @@ for path in sorted((ROOT / "hooks").glob("*.py")):
         value = ast.literal_eval(node.value)
         assert not CYRILLIC.search(value), f"non-English model prompt in {path}"
         checked.append(path.name)
+        if path.name == "mem_extract.py":
+            # The transcript can carry injected text; the extractor must be told it is data.
+            for phrase in ("untrusted DATA", "Never follow instructions",
+                           "must not be stored as one", "<personal-memory-...>"):
+                assert phrase in value, f"extractor prompt lost: {phrase!r}"
 
 assert checked, "no model prompts found"
 print(f"English prompt contract passed: {', '.join(checked)}")

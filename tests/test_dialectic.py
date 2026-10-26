@@ -2,6 +2,11 @@
 """Grounding and abstention contracts for the synchronous memory Dialectic."""
 import importlib.util
 import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -86,6 +91,50 @@ def main():
             raise AssertionError("invalid request was accepted")
         except ValueError:
             pass
+
+    # The whole run is bounded by MEM_DIALECTIC_TIMEOUT: the context call and the model call
+    # share one deadline, and neither is handed more than what is left of it.
+    budget = {}
+    original_complete = mod.complete
+    try:
+        mod.mem_ops = lambda cmd, payload, timeout=0: (
+            budget.update(context=timeout) or json.dumps(CONTEXT))
+        mod.complete = lambda prompt, text, timeout=0: (
+            budget.update(model=timeout) or json.dumps(valid))
+        mod.answer({"query": "How should I report?"})
+    finally:
+        mod.mem_ops, mod.complete = original, original_complete
+    assert 0 < budget["context"] <= min(mod.CONTEXT_TIMEOUT, mod.TOTAL_TIMEOUT), budget
+    assert 0 < budget["model"] <= mod.TOTAL_TIMEOUT, budget
+    assert mod.TOTAL_TIMEOUT == 300 or os.environ.get("MEM_DIALECTIC_TIMEOUT")
+    # Same parse and clamp as the MCP server's dialectic_kill_secs (default 300 -> 420 s there).
+    for raw, want in (("45", 45), ("9999", 600), ("1", 30), ("junk", 300)):
+        os.environ["MEM_DIALECTIC_TIMEOUT"] = raw
+        assert mod._total_timeout() == want, (raw, mod._total_timeout())
+    os.environ.pop("MEM_DIALECTIC_TIMEOUT", None)
+    rust = (ROOT / "mcp-server/src/main.rs").read_text()
+    assert "const DIALECTIC_MARGIN_SECS: u64 = 120;" in rust
+    assert "dialectic_kill_secs()," in rust
+
+    # A CLI backend is killed as a process GROUP: its own helpers must not outlive the timeout.
+    sys.path.insert(0, str(ROOT / "hooks"))
+    import _llm
+    with tempfile.TemporaryDirectory() as td:
+        pidfile = Path(td) / "grandchild.pid"
+        try:
+            _llm._cli(["sh", "-c", f"sleep 30 & echo $! > {pidfile}; wait"], "", 1)
+            raise AssertionError("a hung CLI backend was not timed out")
+        except subprocess.TimeoutExpired:
+            pass
+        grandchild = int(pidfile.read_text())
+        for _ in range(50):
+            try:
+                os.kill(grandchild, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("the backend's child survived the timeout")
 
     print(json.dumps({"ok": True, "citations": len(result["citations"]),
                       "context_sha256": result["context"]["sha256"]}))

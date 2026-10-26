@@ -75,8 +75,15 @@ export HM_LLM_BACKEND=openai
 export HM_LLM_URL=http://127.0.0.1:8000/v1
 export HM_LLM_KEY="$VLLM_API_KEY"
 export HM_LLM_MODEL=Qwen/Qwen2.5-7B-Instruct
-python3 hooks/mem_dream.py --dry-run
+python3 -c 'import sys; sys.path.insert(0, "hooks"); from _llm import complete
+r = complete("Reply with the single word: ok", "ping", timeout=60)
+print(repr(r)); sys.exit(0 if r.strip() else 1)'
 ```
+
+Run it from the repository root. It sends one request through the same `hooks/_llm.py` call every
+memory job uses, prints the reply and exits non-zero when the reply is empty, which is how a
+wrong URL, key or model name shows up there. `mem_dream.py --dry-run` is not a substitute: it
+lists the perspective groups it would send and never calls the model.
 
 Check the same request shape before scheduling work:
 
@@ -191,7 +198,9 @@ Those checks limit blast radius; they do not replace model evaluation.
 
 Before using a model on the full schedule:
 
-1. run extract, consolidate and Dreamer with `--dry-run` against representative local inputs;
+1. run extract and reflect with `--dry-run`, and consolidate with `--dry-run` and
+   `MEM_CONSOLIDATE_DRY_VERDICTS=1`, against representative local inputs. Each of these calls
+   the model and writes nothing; Dreamer's `--dry-run` only lists its inputs;
 2. run the repository tests for memory context, Dreamer and Dialectic;
 3. run the checked-in auto-depth evaluation probes;
 4. inspect JSON failure rate, abstention rate, latency and review acceptance rate;

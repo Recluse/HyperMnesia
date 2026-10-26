@@ -151,27 +151,64 @@ def fence(kind, header, body, max_body=None):
 
 
 def acquire_lock(path, stale_after=7200):
-    """Atomically acquire a PID lock and recover it only after its process is gone."""
+    """Atomically acquire a PID lock. True if this process now holds it.
+
+    A lock younger than `stale_after` seconds is held while its PID is alive, or while it has
+    no PID yet (the owner is between O_EXCL and the write). An OLDER lock is stale whatever its
+    PID says: after a reboot the recorded number is routinely reused by an unrelated live
+    process, and trusting it would block the job until someone deletes the file by hand. No
+    maintenance job legitimately runs for two hours.
+
+    Recovery renames the stale file to a unique name instead of unlinking it: two waiters that
+    both judged it stale would otherwise each unlink -- the second one deleting the lock the
+    first had just re-created -- and both would run. rename() of one source succeeds for one of
+    them only; the other sees FileNotFoundError and goes round again.
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     while True:
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
             try:
+                st = os.stat(path)
+            except OSError:
+                continue                     # vanished between open and stat: try again
+            age = time.time() - st.st_mtime
+            try:
                 with open(path, encoding="utf-8") as fh:
                     holder = int(fh.read().strip() or 0)
-                age = time.time() - os.path.getmtime(path)
             except (OSError, ValueError):
-                holder, age = 0, 0
+                holder = 0
+            if age < stale_after:
+                if not holder:
+                    return False
+                try:
+                    os.kill(holder, 0)
+                    return False
+                except PermissionError:
+                    return False             # alive, just not ours to signal
+                except OSError:
+                    pass                     # no such process: stale
+            moved = f"{path}.stale.{os.getpid()}.{time.time_ns()}"
             try:
-                alive = holder > 0 and (os.kill(holder, 0) is None)
-            except OSError:
-                alive = False
-            if alive or (not holder and age < stale_after):
-                return False
-            try:
-                os.unlink(path)
+                os.rename(path, moved)
             except FileNotFoundError:
+                continue                     # somebody else recovered it first
+            except OSError:
+                return False                 # cannot recover it at all: do not spin
+            try:
+                if os.stat(moved).st_ino != st.st_ino:
+                    # Between our stat and our rename another waiter recovered the stale file
+                    # and took a fresh lock, and we just moved THAT one. Put it back (link
+                    # fails if a third process already holds the name) and yield to it.
+                    try:
+                        os.link(moved, path)
+                    except OSError:
+                        pass
+                    os.unlink(moved)
+                    return False
+                os.unlink(moved)
+            except OSError:
                 pass
             continue
         with os.fdopen(fd, "w", encoding="ascii") as fh:

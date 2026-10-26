@@ -10,14 +10,33 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _mem_common import defang, mem_ops
 from _llm import complete
 
 DEPTHS = ("auto", "minimal", "low", "medium", "high", "max")
-MODEL_TIMEOUT = max(30, min(600, int(os.environ.get("MEM_DIALECTIC_TIMEOUT", "300"))))
+
+
+def _total_timeout():
+    """Seconds the WHOLE run may take (context build + model), clamped to 30..600.
+
+    The MCP server derives its own kill deadline from this same setting plus a fixed margin
+    (mcp-server/src/main.rs, dialectic_kill_secs), so this process always gives up first and
+    reaps its children. Killed from outside instead, a CLI backend's helpers were orphaned.
+    """
+    try:
+        value = int(str(os.environ.get("MEM_DIALECTIC_TIMEOUT", "300")).strip())
+    except ValueError:
+        value = 300
+    return max(30, min(600, value))
+
+
+TOTAL_TIMEOUT = _total_timeout()
+CONTEXT_TIMEOUT = 75
 MAX_CLAIMS = 8
 MAX_CLAIM_CHARS = 900
 MODEL_CITATION = re.compile(r"\[M\d+\]", re.I)
@@ -132,15 +151,25 @@ def build_result(query, depth, context, claims, reason=None):
     }
 
 
-def generate(query, context):
+class DialecticTimeout(BaseException):
+    """Raised by the run deadline. A BaseException so no fail-open `except Exception` on the
+    way down swallows it; subprocess.run and _llm's CLI runner kill their children on it."""
+
+
+def generate(query, context, timeout=None):
     payload = {"query": query, "context": context}
-    raw = complete(PROMPT, json.dumps(payload, ensure_ascii=False), timeout=MODEL_TIMEOUT)
+    raw = complete(PROMPT, json.dumps(payload, ensure_ascii=False),
+                   timeout=timeout or TOTAL_TIMEOUT)
     if not raw:
         raise RuntimeError("Dialectic model returned no usable response")
     return _parse_json(raw)
 
 
-def answer(payload, generator=generate):
+def answer(payload, generator=None):
+    deadline = time.monotonic() + TOTAL_TIMEOUT
+    remaining = lambda: max(1.0, deadline - time.monotonic())  # noqa: E731
+    if generator is None:
+        generator = lambda q, c: generate(q, c, timeout=remaining())  # noqa: E731
     query = payload.get("query")
     if not isinstance(query, str) or not query.strip() or len(query) > 6000:
         raise ValueError("query must be a non-empty string up to 6000 characters")
@@ -161,7 +190,7 @@ def answer(payload, generator=generate):
                "project": payload.get("project")}
     if payload.get("session_id") is not None:
         request["session_id"] = payload["session_id"]
-    raw = mem_ops("context", request, timeout=75)
+    raw = mem_ops("context", request, timeout=min(CONTEXT_TIMEOUT, remaining()))
     if raw is None:
         raise RuntimeError("memory context unavailable")
     context = json.loads(raw)
@@ -175,10 +204,21 @@ def answer(payload, generator=generate):
     return build_result(query, depth, context, claims, reason)
 
 
+def _on_deadline(signum, frame):
+    raise DialecticTimeout(f"memory_ask exceeded MEM_DIALECTIC_TIMEOUT ({TOTAL_TIMEOUT}s)")
+
+
 def main():
+    # Backstop for the per-step timeouts above: an HTTP backend's socket timeout is per read,
+    # not per call, so only a wall-clock alarm actually bounds the run.
+    signal.signal(signal.SIGALRM, _on_deadline)
+    signal.alarm(TOTAL_TIMEOUT)
     try:
         payload = json.loads(sys.stdin.read() or "{}")
         print(json.dumps(answer(payload), ensure_ascii=False, separators=(",", ":")))
+    except DialecticTimeout as exc:
+        print(f"memory dialectic failed: {exc}", file=sys.stderr)
+        raise SystemExit(1)
     except Exception as exc:
         print(f"memory dialectic failed: {exc}", file=sys.stderr)
         raise SystemExit(1)

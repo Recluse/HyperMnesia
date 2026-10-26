@@ -73,6 +73,11 @@ check("a leading dash cannot become a negated lexeme there either",
 check("nor through the compound/stopword path", "-O2" not in m_simple("why did -O2 break"))
 check("compounds survive whole in memory search too", m_simple("example.com") == "example.com")
 check("a dotted filename survives", m_simple("search.py") == "search.py")
+for q in ("example.com", "foo-bar.baz", "docs/operations/deploy-rules.md", "v1.2.3"):
+    check(f"{q!r} is not split on the stemmed leg either",
+          m_no_neg(q) == q and m_no_neg(q) == _no_neg(q))
+check("a leading dash on a compound is still neutralised",
+      m_no_neg("-example.com") == "example.com")
 check("stopwords are still dropped", m_simple("the on of a") == "zzz-no-lexemes-zzz")
 check("an all-punctuation query matches nothing rather than everything",
       m_no_neg("---") == "zzz-no-lexemes-zzz")

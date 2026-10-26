@@ -14,6 +14,7 @@ point -- it isolates the SQL and the view from the model.
     DATABASE_URL=postgresql://... python3 tests/test_memory_sql.py
 """
 import os
+import shutil
 import subprocess
 import sys
 
@@ -118,5 +119,33 @@ def main():
     return 1 if failures else 0
 
 
+def unavailable():
+    """Why this run cannot reach a database, or None.
+
+    Without one the test is SKIPPED (exit 0) rather than failed: it needs a live store on
+    purpose, and a red result on a laptop without Postgres says nothing about the SQL. Under CI
+    (CI is set, as GitHub Actions does) the same condition is a failure -- the workflow starts a
+    database for exactly this step, and a skip there would hide a broken service as green.
+    """
+    if not shutil.which("psql"):
+        return "psql is not on PATH"
+    if not os.environ.get("DATABASE_URL"):
+        return "DATABASE_URL is not set"
+    try:
+        p = subprocess.run(["psql", DATABASE_URL, "-tAX", "-c", "SELECT 1"],
+                           capture_output=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"psql could not run ({exc})"
+    if p.returncode != 0:
+        return f"the database did not answer: {p.stderr.decode(errors='replace').strip()}"
+    return None
+
+
 if __name__ == "__main__":
+    reason = unavailable()
+    if reason:
+        if os.environ.get("CI"):
+            sys.exit(f"FAIL: {reason} -- CI provides a database for this test")
+        print(f"SKIP: {reason}; this test needs a live database (set DATABASE_URL)")
+        sys.exit(0)
     sys.exit(main())
