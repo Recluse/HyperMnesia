@@ -26,6 +26,13 @@ git-ignored or otherwise untracked. Without it such a directory ingests as zero 
 which a full ingest turns into "delete everything stored for this repo"; that case now exits
 non-zero instead.
 
+CONSTRAINT LINKS: a changed document is deleted and re-inserted, which clears every
+constraints.source_doc_id pointing at it (ON DELETE SET NULL). The re-link is done by the
+database, not here: sql/migrate_constraint_sources.sql adds an AFTER INSERT trigger on documents
+that points every constraint naming that (source_repo, source_path) at the new row, so every
+ingest path -- this script, a CI job, a hand-written load -- keeps the link without knowing about
+it. The recorded source_hash is left alone; ci/freshness.py compares it with the file.
+
 Env: HM_FTS_LANG (default 'english') -- the Postgres text-search config for stemming; 'simple'
 is always added alongside so exact tokens (code identifiers, IDs) match regardless of language.
 """
@@ -429,7 +436,8 @@ def main():
                         + ",\n  ".join(sqlstr(p) for p in doomed) + ");\n")
         else:
             # Per-repo idempotent reingest: drop only THIS repo's docs (chunks cascade);
-            # never touch components/constraints/relationships or other repos.
+            # never touch components/relationships or other repos. Constraints lose their row-id
+            # link here and get it back from the documents trigger as the rows are re-inserted.
             f.write(f"DELETE FROM documents WHERE repo = {sqlstr(repo)};\n")
         for body in bodies:
             f.write(body)

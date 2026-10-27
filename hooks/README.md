@@ -21,7 +21,13 @@ to ask. All are **fail-open** — they never block a tool call — but none is f
 `arch_invariants.py` is what makes constraint delivery *deterministic and unprompted*: before an
 edit, it resolves the file path to its component (Tier 1) and injects the applicable `must`
 invariants as `additionalContext` — the architectural-memory counterpart to `mem_recall`. It reads
-`DATABASE_URL` and `HM_REPO` (or the cwd basename), and shells `psql`. If the store cannot be
+`DATABASE_URL` and `HM_REPO` (or the repo root's folder name), and shells `psql`. Paths are made
+relative to the repo root — `CLAUDE_PROJECT_DIR` if the host sets it, else the git top level of
+the session's cwd, else the cwd — so a session that has `cd`'d into `src/` still matches
+`src/**` globs. A file outside that root (another checkout, `../x`, a `C:/...` path) gets none of
+the repo's rules, and the hook says which root it resolved against. Every matching component applies (Tier 1 is additive; see
+[ARCHITECTURE.md](../docs/ARCHITECTURE.md)), and the selection is the same as the
+`get_constraints` tool's, checked against one shared fixture. If the store cannot be
 reached, or the graph will not parse, or `HM_REPO` names a scope no component was ingested
 under, it says so once and exits 0 — the edit is never blocked, but the agent is not left to
 read the silence as "no rules apply". The scope case is worth stating plainly: the match is an
@@ -49,8 +55,8 @@ env (`DATABASE_URL`, `EMBED_BACKEND`, and `HM_LLM*` for the schedule jobs). Exam
 }
 ```
 
-Set `HM_REPO` in the hook env (or rely on the cwd basename) so the constraint hook scopes to the
-right repo, matching the MCP server.
+Set `HM_REPO` in the hook env (or rely on the repo root's folder name) so the constraint hook
+scopes to the right repo, matching the MCP server.
 
 ## Other clients (e.g. Codex CLI)
 

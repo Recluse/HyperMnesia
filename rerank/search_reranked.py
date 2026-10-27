@@ -11,7 +11,8 @@ machine (search connects to the DB directly), so there is no network dependency 
 DB, the embedder, and the local reranker.
 
 Interface (same as search.py MCP mode):  search_reranked.py <k> [repo]  with query on stdin.
-Env: HM_RERANK_URL (http://127.0.0.1:8091), RERANK_POOL (30); + search.py's env (DATABASE_URL, ...).
+Env: HM_RERANK_URL (http://127.0.0.1:8091), RERANK_POOL (30); + search.py's env (DATABASE_URL,
+     HM_DOC_MAXDIST, ...).
 """
 import json, os, subprocess, sys, urllib.request
 
@@ -22,14 +23,17 @@ POOL = int(os.environ.get("RERANK_POOL", "30"))
 
 
 def get_candidates(query, k, repo, timeout=60):
-    p = subprocess.run([sys.executable, SEARCH, "--json", str(POOL), repo or "ALL"],
+    # k is passed so search.py can log how many results this caller will actually show.
+    p = subprocess.run([sys.executable, SEARCH, "--json", str(POOL), repo or "ALL", str(k)],
                        input=(query + "\n").encode(), capture_output=True, timeout=timeout)
     if p.returncode != 0:
         raise RuntimeError(p.stderr.decode()[-400:])
     payload = json.loads(p.stdout.decode() or "{}")
-    # (candidates, degraded): "degraded" is non-empty when the query could not be embedded, i.e.
-    # the pool is lexical-only. Passing it up keeps a silent outage from reading as a thin corpus.
-    return payload.get("candidates", []), payload.get("degraded", "")
+    # (candidates, degraded, unembedded): "degraded" is non-empty when the query could not be
+    # embedded, i.e. the pool is lexical-only; "unembedded" counts chunks in scope with no vector.
+    # Passing both up keeps a silent outage from reading as a thin corpus.
+    return (payload.get("candidates", []), payload.get("degraded", ""),
+            payload.get("unembedded", 0))
 
 
 def rerank_scores(query, docs, timeout=20):
@@ -63,7 +67,7 @@ def main():
     if not query:
         print("(no query)")
         return
-    cands, degraded = get_candidates(query, k, repo)
+    cands, degraded, unembedded = get_candidates(query, k, repo)
     order = cands
     rerank_failed = ""
     if cands:
@@ -94,6 +98,9 @@ def main():
     if degraded:
         print(f"!! EMBEDDER UNREACHABLE ({degraded}) -- this search was LEXICAL-ONLY: ranking is "
               f"degraded, and few or no results does NOT mean the corpus lacks the topic")
+    if unembedded:
+        print(f"!! {unembedded} chunk(s) in this scope have no embedding yet -- they are found by "
+              f"exact words only (lexical leg). Run ingest/embed_chunks.py (./hm ingest does).")
     if rerank_failed:
         print(f"!! RERANKER UNAVAILABLE ({rerank_failed}) -- these results are in plain RRF "
               f"order, NOT reranked: ranking is worse than this deployment normally gives")

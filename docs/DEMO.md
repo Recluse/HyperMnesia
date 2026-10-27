@@ -8,6 +8,7 @@ You need a store with the schema loaded (`./hm init`) and `DATABASE_URL` exporte
 ## 1. Load the example map (10 seconds)
 
 ```bash
+./hm migrate      # the seed names its sources by path: needs sql/migrate_constraint_sources.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/seed_example.sql
 ```
 
@@ -55,11 +56,11 @@ API sees the rules of what it depends on.
 
 A third thing is *supposed* to happen and does not here. Each constraint line can end with
 `[src: <scope>:<path>]` naming the document that states the rule, so when that document changes
-you can find the rules it invalidated. The fixture sets `source_doc_id` by looking the document
-up at `myapp:docs/architecture.md`, and this demo ingests no documents at all — the lookup
-matches nothing, stores NULL, and the attribution is simply absent from every line above. Ingest
-a document at that path under scope `myapp` and re-run the seed (it is idempotent) and the
-`[src: ...]` suffix appears.
+you can find the rules it invalidated. The fixture names its source as `myapp:docs/architecture.md`
+(`source_repo`/`source_path`), and this demo ingests no documents at all — so there is no document
+row to link, and the attribution is absent from every line above. Ingest a document at that path
+under scope `myapp` and the ingest links it by name (no need to re-run the seed); the `[src: ...]`
+suffix appears, and `ci/freshness.py` starts flagging the rule whenever that document changes.
 
 Three other lines can appear in that block, none of them with this fixture:
 
@@ -72,9 +73,10 @@ Three other lines can appear in that block, none of them with this fixture:
 - `(!) STALE MAP` — the server could not re-read the map and is answering from a cached copy,
   with the error and the copy's age.
 
-The scope, however, is *not* announced by this tool: run it with `HM_REPO` unset or naming a
-scope nothing was seeded under and every path comes back FLAGGED with `(none)` for constraints,
-which looks exactly like an unmapped file. Keep the export above in the same shell.
+Run it with `HM_REPO` unset or naming a scope nothing was seeded under and the answer opens with
+the same `(!) SCOPE` line the hook prints — nothing is mapped under that scope, here are the ones
+that are — instead of a FLAGGED path and `(none)` that would read like an unmapped file. Keep the
+export above in the same shell.
 
 ## 3. Now stop asking
 

@@ -86,7 +86,12 @@ figure without a document and chunk count cannot be read at all, let alone compa
 set, runs with and without injection, and control of everything else that differs between them.
 Nothing here does that, so no number about it appears anywhere in this repo.
 
-The one retrieval-quality figure that does appear — the reranker moving recall@1 by +0.16 — comes
-from a small private evaluation set, and is quoted as what it is: a result on one corpus, not a
-benchmark. `mem_probes.py` above is asserted properties rather than a score for the same reason:
-properties survive being run on a different corpus, and a score does not.
+**Document-retrieval quality.** This repo ships no doc-retrieval eval, so no recall figure for
+Tier 2 can be reproduced from it. The one that circulated — the cross-encoder reranker moving
+recall@1 by +0.16 — came from a private set of 58 queries on one corpus, the same set the
+reranker settings were tuned on, and was measured when the reranker received the first 512
+characters of each chunk; it now receives up to 3000 (`ingest/search.py`, `candidates`). At
+n=58 a single proportion carries a 95% interval of up to roughly ±0.13, and tuning on the test set
+biases the gain upward. Read it as an anecdote about one corpus under an older configuration,
+not as a property of this code. `mem_probes.py` above is asserted properties rather than a score
+for the same reason: properties survive being run on a different corpus, and a score does not.

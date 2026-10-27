@@ -1,0 +1,1015 @@
+{
+ "_comment": "Shared Tier-1 contract: consumed by tests/test_tier1_parity.py (hooks/_arch.py) and by the tier1_fixture_parity unit test in mcp-server/src/main.rs. Change both implementations together. Cases with an 'fs' block are built under a fresh temporary directory first ('{tmp}' is its resolved path; symlink targets are relative to the link). 'case_sensitive_fs' cases are skipped where the filesystem folds case.",
+ "graph": {
+  "components": [
+   {
+    "slug": "myapp-root",
+    "name": "myapp-root",
+    "repo": "myapp",
+    "parent": null,
+    "responsibility": "myapp-root component",
+    "key_paths": [],
+    "priority": 10
+   },
+   {
+    "slug": "api",
+    "name": "api",
+    "repo": "myapp",
+    "parent": "myapp-root",
+    "responsibility": "api component",
+    "key_paths": [
+     "src/api/**",
+     "src/routes/**"
+    ],
+    "priority": 30
+   },
+   {
+    "slug": "api-routes",
+    "name": "api-routes",
+    "repo": "myapp",
+    "parent": "myapp-root",
+    "responsibility": "api-routes component",
+    "key_paths": [
+     "src/api/routes.py"
+    ],
+    "priority": 0
+   },
+   {
+    "slug": "src-all",
+    "name": "src-all",
+    "repo": "myapp",
+    "parent": "myapp-root",
+    "responsibility": "src-all component",
+    "key_paths": [
+     "src/**"
+    ],
+    "priority": 50
+   },
+   {
+    "slug": "db",
+    "name": "db",
+    "repo": "myapp",
+    "parent": "myapp-root",
+    "responsibility": "db component",
+    "key_paths": [
+     "src/db/**"
+    ],
+    "priority": 30
+   },
+   {
+    "slug": "migrations",
+    "name": "migrations",
+    "repo": "myapp",
+    "parent": "myapp-root",
+    "responsibility": "migrations component",
+    "key_paths": [
+     "**/migrations/*.sql"
+    ],
+    "priority": 0
+   },
+   {
+    "slug": "ci",
+    "name": "ci",
+    "repo": "myapp",
+    "parent": "myapp-root",
+    "responsibility": "ci component",
+    "key_paths": [
+     ".gitlab-ci.yml",
+     ".github/**"
+    ],
+    "priority": 0
+   },
+   {
+    "slug": "docs",
+    "name": "docs",
+    "repo": "myapp",
+    "parent": "myapp-root",
+    "responsibility": "docs component",
+    "key_paths": [
+     "docs/**"
+    ],
+    "priority": 15
+   },
+   {
+    "slug": "api",
+    "name": "api",
+    "repo": "other",
+    "parent": null,
+    "responsibility": "api component",
+    "key_paths": [
+     "src/api/**"
+    ],
+    "priority": 0
+   },
+   {
+    "slug": "docs",
+    "name": "docs",
+    "repo": "other",
+    "parent": null,
+    "responsibility": "docs component",
+    "key_paths": [
+     "docs/**"
+    ],
+    "priority": 0
+   },
+   {
+    "slug": "cache",
+    "name": "cache",
+    "repo": "other",
+    "parent": null,
+    "responsibility": "cache component",
+    "key_paths": [
+     "src/cache/**"
+    ],
+    "priority": 0
+   }
+  ],
+  "relationships": [
+   {
+    "src": "api",
+    "dst": "db",
+    "kind": "depends_on",
+    "repo": "myapp",
+    "dst_repo": "myapp"
+   },
+   {
+    "src": "api",
+    "dst": "cache",
+    "kind": "depends_on",
+    "repo": "myapp",
+    "dst_repo": "other"
+   },
+   {
+    "src": "api",
+    "dst": "docs",
+    "kind": "depends_on",
+    "repo": "other",
+    "dst_repo": "other"
+   }
+  ],
+  "constraints": [
+   {
+    "kind": "invariant",
+    "scope": "global",
+    "repo": "myapp",
+    "component": null,
+    "component_repo": null,
+    "title": "Global must",
+    "statement": "Global must statement.",
+    "severity": "must",
+    "source": null
+   },
+   {
+    "kind": "invariant",
+    "scope": "component",
+    "repo": "myapp",
+    "component": "api",
+    "component_repo": "myapp",
+    "title": "API must",
+    "statement": "API must statement.",
+    "severity": "must",
+    "source": null
+   },
+   {
+    "kind": "invariant",
+    "scope": "component",
+    "repo": "myapp",
+    "component": "api",
+    "component_repo": "myapp",
+    "title": "API should",
+    "statement": "API should statement.",
+    "severity": "should",
+    "source": null
+   },
+   {
+    "kind": "invariant",
+    "scope": "component",
+    "repo": "myapp",
+    "component": "api-routes",
+    "component_repo": "myapp",
+    "title": "Routes must",
+    "statement": "Routes must statement.",
+    "severity": "must",
+    "source": null
+   },
+   {
+    "kind": "invariant",
+    "scope": "component",
+    "repo": "myapp",
+    "component": "src-all",
+    "component_repo": "myapp",
+    "title": "Src should",
+    "statement": "Src should statement.",
+    "severity": "should",
+    "source": null
+   },
+   {
+    "kind": "invariant",
+    "scope": "component",
+    "repo": "myapp",
+    "component": "db",
+    "component_repo": "myapp",
+    "title": "DB must",
+    "statement": "DB must statement.",
+    "severity": "must",
+    "source": null
+   },
+   {
+    "kind": "invariant",
+    "scope": "component",
+    "repo": "myapp",
+    "component": "migrations",
+    "component_repo": "myapp",
+    "title": "Migrations must",
+    "statement": "Migrations must statement.",
+    "severity": "must",
+    "source": null
+   },
+   {
+    "kind": "invariant",
+    "scope": "component",
+    "repo": "myapp",
+    "component": "docs",
+    "component_repo": "myapp",
+    "title": "Docs info",
+    "statement": "Docs info statement.",
+    "severity": "info",
+    "source": null
+   },
+   {
+    "kind": "invariant",
+    "scope": "component",
+    "repo": "myapp",
+    "component": "ci",
+    "component_repo": "myapp",
+    "title": "CI must",
+    "statement": "CI must statement.",
+    "severity": "must",
+    "source": null
+   },
+   {
+    "kind": "invariant",
+    "scope": "repo",
+    "repo": "myapp",
+    "component": null,
+    "component_repo": null,
+    "title": "Repo-scoped rule",
+    "statement": "Repo-scoped rule statement.",
+    "severity": "must",
+    "source": null
+   },
+   {
+    "kind": "invariant",
+    "scope": "component",
+    "repo": "myapp",
+    "component": null,
+    "component_repo": null,
+    "title": "Detached rule",
+    "statement": "Detached rule statement.",
+    "severity": "must",
+    "source": null
+   },
+   {
+    "kind": "invariant",
+    "scope": "component",
+    "repo": "myapp",
+    "component": "cache",
+    "component_repo": "other",
+    "title": "Foreign rule",
+    "statement": "Foreign rule statement.",
+    "severity": "must",
+    "source": null
+   },
+   {
+    "kind": "invariant",
+    "scope": "component",
+    "repo": "myapp",
+    "component": "myapp-root",
+    "component_repo": "myapp",
+    "title": "Root rule",
+    "statement": "Root rule statement.",
+    "severity": "must",
+    "source": null
+   },
+   {
+    "kind": "invariant",
+    "scope": "component",
+    "repo": "other",
+    "component": "api",
+    "component_repo": "other",
+    "title": "Other API must",
+    "statement": "Other API must statement.",
+    "severity": "must",
+    "source": null
+   },
+   {
+    "kind": "invariant",
+    "scope": "component",
+    "repo": "other",
+    "component": "docs",
+    "component_repo": "other",
+    "title": "Other docs must",
+    "statement": "Other docs must statement.",
+    "severity": "must",
+    "source": null
+   }
+  ]
+ },
+ "cases": [
+  {
+   "name": "overlapping globs are additive, ordered by specificity; other repo's same-slug edge does not leak",
+   "repo": "myapp",
+   "root": "/w/myapp",
+   "paths": [
+    "src/api/routes.py"
+   ],
+   "expect": {
+    "touched": [
+     [
+      "src/api/routes.py",
+      [
+       "api-routes",
+       "api",
+       "src-all"
+      ]
+     ]
+    ],
+    "unmatched": [],
+    "direct": [
+     "api",
+     "api-routes",
+     "src-all"
+    ],
+    "graph_only": [
+     "db"
+    ],
+    "constraints": [
+     [
+      "Global must",
+      "global"
+     ],
+     [
+      "API must",
+      "direct"
+     ],
+     [
+      "Routes must",
+      "direct"
+     ],
+     [
+      "DB must",
+      "graph"
+     ],
+     [
+      "API should",
+      "direct"
+     ],
+     [
+      "Src should",
+      "direct"
+     ]
+    ],
+    "undeliverable": [
+     "Repo-scoped rule",
+     "Detached rule",
+     "Foreign rule"
+    ],
+    "scope_note": null,
+    "outside": []
+   }
+  },
+  {
+   "name": "literal characters outrank priority: **/migrations/*.sql before src/**",
+   "repo": "myapp",
+   "root": "/w/myapp",
+   "paths": [
+    "src/db/migrations/0001_init.sql"
+   ],
+   "expect": {
+    "touched": [
+     [
+      "src/db/migrations/0001_init.sql",
+      [
+       "migrations",
+       "db",
+       "src-all"
+      ]
+     ]
+    ],
+    "unmatched": [],
+    "direct": [
+     "db",
+     "migrations",
+     "src-all"
+    ],
+    "graph_only": [
+     "api"
+    ],
+    "constraints": [
+     [
+      "Global must",
+      "global"
+     ],
+     [
+      "DB must",
+      "direct"
+     ],
+     [
+      "Migrations must",
+      "direct"
+     ],
+     [
+      "API must",
+      "graph"
+     ],
+     [
+      "Src should",
+      "direct"
+     ],
+     [
+      "API should",
+      "graph"
+     ]
+    ],
+    "undeliverable": [
+     "Repo-scoped rule",
+     "Detached rule",
+     "Foreign rule"
+    ],
+    "scope_note": null,
+    "outside": []
+   }
+  },
+  {
+   "name": "absolute path under the root is made repo-relative",
+   "repo": "myapp",
+   "root": "/w/myapp/",
+   "paths": [
+    "/w/myapp/src/api/handlers/x.py"
+   ],
+   "expect": {
+    "touched": [
+     [
+      "src/api/handlers/x.py",
+      [
+       "api",
+       "src-all"
+      ]
+     ]
+    ],
+    "unmatched": [],
+    "direct": [
+     "api",
+     "src-all"
+    ],
+    "graph_only": [
+     "db"
+    ],
+    "constraints": [
+     [
+      "Global must",
+      "global"
+     ],
+     [
+      "API must",
+      "direct"
+     ],
+     [
+      "DB must",
+      "graph"
+     ],
+     [
+      "API should",
+      "direct"
+     ],
+     [
+      "Src should",
+      "direct"
+     ]
+    ],
+    "undeliverable": [
+     "Repo-scoped rule",
+     "Detached rule",
+     "Foreign rule"
+    ],
+    "scope_note": null,
+    "outside": []
+   }
+  },
+  {
+   "name": "root containment is case-sensitive: /W/MyApp is not /w/myapp unless it is the same directory on disk",
+   "repo": "myapp",
+   "root": "/w/myapp",
+   "paths": [
+    "/W/MyApp/docs/guide.md"
+   ],
+   "expect": {
+    "touched": [],
+    "unmatched": [],
+    "outside": [
+     "/W/MyApp/docs/guide.md"
+    ],
+    "direct": [],
+    "graph_only": [],
+    "constraints": [],
+    "undeliverable": [
+     "Repo-scoped rule",
+     "Detached rule",
+     "Foreign rule"
+    ],
+    "scope_note": null
+   }
+  },
+  {
+   "name": "absolute path outside the root is OUTSIDE: no component, and no globals when nothing is inside",
+   "repo": "myapp",
+   "root": "/w/myapp",
+   "paths": [
+    "/elsewhere/file.py",
+    "/w/myapp"
+   ],
+   "expect": {
+    "touched": [],
+    "unmatched": [],
+    "direct": [],
+    "graph_only": [],
+    "constraints": [],
+    "undeliverable": [
+     "Repo-scoped rule",
+     "Detached rule",
+     "Foreign rule"
+    ],
+    "scope_note": null,
+    "outside": [
+     "/elsewhere/file.py"
+    ]
+   }
+  },
+  {
+   "name": "dot paths: dot-files keep their dot, ./ and .. segments are normalised",
+   "repo": "myapp",
+   "root": "/w/myapp",
+   "paths": [
+    ".gitlab-ci.yml",
+    "./.github/workflows/ci.yml",
+    "./src/./api/../db/x.py",
+    "src\\routes\\r.py"
+   ],
+   "expect": {
+    "touched": [
+     [
+      ".gitlab-ci.yml",
+      [
+       "ci"
+      ]
+     ],
+     [
+      ".github/workflows/ci.yml",
+      [
+       "ci"
+      ]
+     ],
+     [
+      "src/db/x.py",
+      [
+       "db",
+       "src-all"
+      ]
+     ],
+     [
+      "src/routes/r.py",
+      [
+       "api",
+       "src-all"
+      ]
+     ]
+    ],
+    "unmatched": [],
+    "direct": [
+     "api",
+     "ci",
+     "db",
+     "src-all"
+    ],
+    "graph_only": [],
+    "constraints": [
+     [
+      "Global must",
+      "global"
+     ],
+     [
+      "API must",
+      "direct"
+     ],
+     [
+      "CI must",
+      "direct"
+     ],
+     [
+      "DB must",
+      "direct"
+     ],
+     [
+      "API should",
+      "direct"
+     ],
+     [
+      "Src should",
+      "direct"
+     ]
+    ],
+    "undeliverable": [
+     "Repo-scoped rule",
+     "Detached rule",
+     "Foreign rule"
+    ],
+    "scope_note": null,
+    "outside": []
+   }
+  },
+  {
+   "name": "no root: relative paths are taken as repo-relative",
+   "repo": "myapp",
+   "root": "",
+   "paths": [
+    "src/routes/a.py"
+   ],
+   "expect": {
+    "touched": [
+     [
+      "src/routes/a.py",
+      [
+       "api",
+       "src-all"
+      ]
+     ]
+    ],
+    "unmatched": [],
+    "direct": [
+     "api",
+     "src-all"
+    ],
+    "graph_only": [
+     "db"
+    ],
+    "constraints": [
+     [
+      "Global must",
+      "global"
+     ],
+     [
+      "API must",
+      "direct"
+     ],
+     [
+      "DB must",
+      "graph"
+     ],
+     [
+      "API should",
+      "direct"
+     ],
+     [
+      "Src should",
+      "direct"
+     ]
+    ],
+    "undeliverable": [
+     "Repo-scoped rule",
+     "Detached rule",
+     "Foreign rule"
+    ],
+    "scope_note": null,
+    "outside": []
+   }
+  },
+  {
+   "name": "cross-repo: same slugs in another repo resolve against that repo's map and edges only",
+   "repo": "other",
+   "root": "/w/other",
+   "paths": [
+    "/w/other/src/api/x.py"
+   ],
+   "expect": {
+    "touched": [
+     [
+      "src/api/x.py",
+      [
+       "api"
+      ]
+     ]
+    ],
+    "unmatched": [],
+    "direct": [
+     "api"
+    ],
+    "graph_only": [
+     "docs"
+    ],
+    "constraints": [
+     [
+      "Other API must",
+      "direct"
+     ],
+     [
+      "Other docs must",
+      "graph"
+     ]
+    ],
+    "undeliverable": [],
+    "scope_note": null,
+    "outside": []
+   }
+  },
+  {
+   "name": "unmapped scope: the (!) SCOPE note names the scopes that exist",
+   "repo": "ghost",
+   "root": "/w/ghost",
+   "paths": [
+    "src/api/x.py"
+   ],
+   "expect": {
+    "touched": [],
+    "unmatched": [
+     "src/api/x.py"
+    ],
+    "direct": [],
+    "graph_only": [],
+    "constraints": [],
+    "undeliverable": [],
+    "scope_note": "(!) SCOPE: nothing is mapped under the scope 'ghost', so no constraint can ever resolve here. Ingested scopes: myapp, other. Set HM_REPO to the right one, or seed a map for this repo.",
+    "outside": []
+   }
+  },
+  {
+   "name": "a relative path escaping the root (../) is outside; globals still apply to the path inside",
+   "repo": "myapp",
+   "root": "/w/myapp",
+   "paths": [
+    "../b/file.py",
+    "/w/b/src/api/x.py",
+    "docs/a.md"
+   ],
+   "expect": {
+    "touched": [
+     [
+      "docs/a.md",
+      [
+       "docs"
+      ]
+     ]
+    ],
+    "unmatched": [],
+    "outside": [
+     "/w/b/file.py",
+     "/w/b/src/api/x.py"
+    ],
+    "direct": [
+     "docs"
+    ],
+    "graph_only": [],
+    "constraints": [
+     [
+      "Global must",
+      "global"
+     ],
+     [
+      "Docs info",
+      "direct"
+     ]
+    ],
+    "undeliverable": [
+     "Repo-scoped rule",
+     "Detached rule",
+     "Foreign rule"
+    ],
+    "scope_note": null
+   }
+  },
+  {
+   "name": "a sibling directory sharing the root's prefix is outside",
+   "repo": "myapp",
+   "root": "/w/myapp",
+   "paths": [
+    "/w/myapp2/src/api/x.py"
+   ],
+   "expect": {
+    "touched": [],
+    "unmatched": [],
+    "outside": [
+     "/w/myapp2/src/api/x.py"
+    ],
+    "direct": [],
+    "graph_only": [],
+    "constraints": [],
+    "undeliverable": [
+     "Repo-scoped rule",
+     "Detached rule",
+     "Foreign rule"
+    ],
+    "scope_note": null
+   }
+  },
+  {
+   "name": "drive-qualified paths are absolute: contained by a drive root, outside a POSIX one",
+   "repo": "myapp",
+   "root": "c:\\work\\myapp",
+   "paths": [
+    "C:\\work\\myapp\\src\\db\\x.py",
+    "C:/work/other/x.py"
+   ],
+   "expect": {
+    "touched": [
+     [
+      "src/db/x.py",
+      [
+       "db",
+       "src-all"
+      ]
+     ]
+    ],
+    "unmatched": [],
+    "outside": [
+     "C:/work/other/x.py"
+    ],
+    "direct": [
+     "db",
+     "src-all"
+    ],
+    "graph_only": [
+     "api"
+    ],
+    "constraints": [
+     [
+      "Global must",
+      "global"
+     ],
+     [
+      "DB must",
+      "direct"
+     ],
+     [
+      "API must",
+      "graph"
+     ],
+     [
+      "Src should",
+      "direct"
+     ],
+     [
+      "API should",
+      "graph"
+     ]
+    ],
+    "undeliverable": [
+     "Repo-scoped rule",
+     "Detached rule",
+     "Foreign rule"
+    ],
+    "scope_note": null
+   }
+  },
+  {
+   "name": "a drive-qualified path against a POSIX root is outside, never joined as relative",
+   "repo": "myapp",
+   "root": "/w/myapp",
+   "paths": [
+    "C:/w/myapp/src/api/x.py"
+   ],
+   "expect": {
+    "touched": [],
+    "unmatched": [],
+    "outside": [
+     "C:/w/myapp/src/api/x.py"
+    ],
+    "direct": [],
+    "graph_only": [],
+    "constraints": [],
+    "undeliverable": [
+     "Repo-scoped rule",
+     "Detached rule",
+     "Foreign rule"
+    ],
+    "scope_note": null
+   }
+  },
+  {
+   "name": "symlinks resolve physically: alias/.. is the link target's parent; a new file under a linked dir; a symlinked root",
+   "fs": {
+    "dirs": [
+     "repo/src/db",
+     "repo/src/api",
+     "vendor/pkg"
+    ],
+    "symlinks": [
+     [
+      "repo/src/api/link",
+      "../../../vendor/pkg"
+     ],
+     [
+      "repo/src/alias",
+      "db"
+     ],
+     [
+      "rootlink",
+      "repo"
+     ]
+    ]
+   },
+   "repo": "myapp",
+   "root": "{tmp}/rootlink",
+   "paths": [
+    "{tmp}/repo/src/api/link/../x.py",
+    "{tmp}/repo/src/alias/models.py",
+    "src/api/new_file.py"
+   ],
+   "expect": {
+    "touched": [
+     [
+      "src/db/models.py",
+      [
+       "db",
+       "src-all"
+      ]
+     ],
+     [
+      "src/api/new_file.py",
+      [
+       "api",
+       "src-all"
+      ]
+     ]
+    ],
+    "unmatched": [],
+    "outside": [
+     "{tmp}/vendor/x.py"
+    ],
+    "direct": [
+     "api",
+     "db",
+     "src-all"
+    ],
+    "graph_only": [],
+    "constraints": [
+     [
+      "Global must",
+      "global"
+     ],
+     [
+      "API must",
+      "direct"
+     ],
+     [
+      "DB must",
+      "direct"
+     ],
+     [
+      "API should",
+      "direct"
+     ],
+     [
+      "Src should",
+      "direct"
+     ]
+    ],
+    "undeliverable": [
+     "Repo-scoped rule",
+     "Detached rule",
+     "Foreign rule"
+    ],
+    "scope_note": null
+   }
+  },
+  {
+   "name": "two existing directories differing only in case are two repos on a case-sensitive filesystem",
+   "fs": {
+    "dirs": [
+     "myapp/src/api",
+     "MyApp/src/api"
+    ]
+   },
+   "case_sensitive_fs": true,
+   "repo": "myapp",
+   "root": "{tmp}/myapp",
+   "paths": [
+    "{tmp}/MyApp/src/api/x.py"
+   ],
+   "expect": {
+    "touched": [],
+    "unmatched": [],
+    "outside": [
+     "{tmp}/MyApp/src/api/x.py"
+    ],
+    "direct": [],
+    "graph_only": [],
+    "constraints": [],
+    "undeliverable": [
+     "Repo-scoped rule",
+     "Detached rule",
+     "Foreign rule"
+    ],
+    "scope_note": null
+   }
+  }
+ ]
+}
