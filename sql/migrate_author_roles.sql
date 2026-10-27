@@ -46,14 +46,39 @@ CREATE OR REPLACE FUNCTION mem.author_login_problem(r name) RETURNS text
 LANGUAGE sql STABLE
 SET search_path = pg_catalog, pg_temp AS $$
   SELECT CASE
+    WHEN pg_catalog.current_setting('server_version_num')::int < 160000
+      THEN 'PostgreSQL before 16 cannot grant hm_app without also letting the login SET ROLE '
+           'to it -- and change its password'
+    WHEN pg_catalog.to_regrole('hm_app') IS NOT NULL AND r <> 'hm_app'
+         AND mem.can_become(r, 'hm_app'::regrole)
+      THEN 'it can SET ROLE hm_app, and then change hm_app''s password'
     WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_roles g
                   WHERE (g.rolsuper OR g.rolbypassrls) AND mem.can_become(r, g.oid))
       THEN 'it can become a superuser or BYPASSRLS role'
+    -- Conservative from here on: ANY membership counts, inherited, SET-able, through a chain
+    -- of either, or only WITH ADMIN OPTION (which lets it grant itself the rest). A grant that
+    -- is inert today is one GRANT away from not being, and nothing re-checks it in between
+    -- except this function.
     WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_class c
-                  WHERE c.oid = 'mem.memories'::regclass
-                    AND (pg_catalog.pg_has_role(r, c.relowner, 'USAGE')
-                         OR mem.can_become(r, c.relowner)))
-      THEN 'it can use the role that owns the memory tables'
+                  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                  WHERE n.nspname = 'mem' AND pg_catalog.pg_has_role(r, c.relowner, 'MEMBER'))
+      OR EXISTS (SELECT 1 FROM pg_catalog.pg_proc f
+                  JOIN pg_catalog.pg_namespace n ON n.oid = f.pronamespace
+                  WHERE n.nspname = 'mem' AND pg_catalog.pg_has_role(r, f.proowner, 'MEMBER'))
+      OR EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n
+                  WHERE n.nspname = 'mem' AND pg_catalog.pg_has_role(r, n.nspowner, 'MEMBER'))
+      THEN 'it is, or can act as, the owner of a table, view or function in schema mem'
+    WHEN pg_catalog.has_schema_privilege(r, 'mem', 'CREATE')
+      THEN 'it can create objects in schema mem, where the definer functions resolve names'
+    WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_database d
+                  WHERE d.datname = pg_catalog.current_database()
+                    AND pg_catalog.pg_has_role(r, d.datdba, 'MEMBER'))
+      THEN 'it owns this database (and with it schema public)'
+    WHEN EXISTS (SELECT 1 FROM unnest(ARRAY['mem.author_roles', 'mem.project_members']) t(tbl)
+                  WHERE pg_catalog.to_regclass(t.tbl) IS NOT NULL
+                    AND pg_catalog.has_table_privilege(r, t.tbl,
+                          'SELECT, INSERT, UPDATE, DELETE, TRUNCATE'))
+      THEN 'it has privileges on the author map or the project membership table'
     WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_roles g
                   WHERE g.rolname IN ('pg_read_all_data', 'pg_write_all_data')
                     AND pg_catalog.pg_has_role(r, g.oid, 'MEMBER'))
@@ -67,6 +92,20 @@ SET search_path = pg_catalog, pg_temp AS $$
   END;
 $$;
 GRANT EXECUTE ON FUNCTION mem.author_login_problem(name) TO PUBLIC;
+
+-- Author logins mapped before the grant carried SET FALSE can SET ROLE hm_app and change its
+-- password. Re-granting with the new options updates the existing membership (PostgreSQL 16+).
+DO $$
+DECLARE r name;
+BEGIN
+  IF current_setting('server_version_num')::int >= 160000 AND to_regrole('hm_app') IS NOT NULL
+     AND to_regclass('mem.author_roles') IS NOT NULL THEN
+    FOR r IN SELECT ar.role FROM mem.author_roles ar
+              WHERE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ar.role) LOOP
+      EXECUTE format('GRANT hm_app TO %I WITH INHERIT TRUE, SET FALSE', r);
+    END LOOP;
+  END IF;
+END $$;
 
 -- The caller's OWN mapping, and nothing else. `mode` is
 --   enforced   -- this login is mapped; `author` is fixed by the database;
@@ -132,7 +171,15 @@ BEGIN
     END IF;
     EXECUTE format('ALTER ROLE %I LOGIN INHERIT', r);
   END IF;
-  EXECUTE format('GRANT hm_app TO %I', r);
+  IF current_setting('server_version_num')::int < 160000 THEN
+    RAISE EXCEPTION 'per-author logins need PostgreSQL 16 or later: before 16 a member of '
+                    'hm_app can always SET ROLE hm_app and change its password, so the login '
+                    'would not be bound to its author';
+  END IF;
+  -- INHERIT TRUE, SET FALSE: the login gets hm_app's privileges, so the policies written for
+  -- hm_app bind it, but it can never BECOME hm_app -- which would let it set hm_app's password
+  -- (a role may change its own) and log in as the shared login, naming itself anybody.
+  EXECUTE format('GRANT hm_app TO %I WITH INHERIT TRUE, SET FALSE', r);
   INSERT INTO mem.author_roles(role, author) VALUES (r, p_author)
     ON CONFLICT (role) DO NOTHING;
   RETURN r;

@@ -675,13 +675,21 @@ Use it for one person, or for people who would share their memory with each othe
 `./hm author add` prints how to set the password (`\password` in psql, so it never touches a
 file or your history) and what the person puts in their own settings: `DATABASE_URL` with their
 login, and `MEM_AUTHOR` set to the same name — a write under any other name is refused. The login
-inherits `hm_app`'s privileges, so the same policies bind it; what changes is that `mem.reader()`
-returns the mapped author whatever the session sets. Only `hm_app` itself (and roles that
+inherits `hm_app`'s privileges, so the same policies bind it, but its membership carries no `SET`
+option: it can never become `hm_app`, which would let it set `hm_app`'s password (a role may
+change its own) and come back as the shared login. That separation exists from PostgreSQL 16 on,
+so per-author logins need 16 or later; `./hm author add` refuses on an older server. What
+changes is that `mem.reader()` returns the mapped author whatever the session sets. Only `hm_app` itself (and roles that
 bypass row-level security anyway) may name themselves through the setting: any other login
 without a mapping reads nothing — one whose mapping was removed, even mid-session after a
 `SET ROLE hm_app`, and one that reaches `hm_app` through a group. `./hm author add` refuses to
 adopt a role that can reach a superuser, a `BYPASSRLS` role or the table owner by any membership,
-including a `SET`-only one; do not grant such a role to an author login afterwards either. `mem.author_roles` and `mem.project_members` are readable by the owner only: an
+including a `SET`-only one; do not grant such a role to an author login afterwards either.
+`mem.whoami()` and `./hm doctor` re-check it on every call and report the login `bypassable`
+when it has since been given any of: a membership (of any kind) in the owner of something in
+schema `mem`, `CREATE` on `mem`, ownership of the database, a privilege on the author map, a
+SET-able `hm_app`, `CREATEROLE`, or the predefined all-data roles. The check is deliberately
+conservative: an inert grant counts too, because it is one `GRANT` away from not being one. `mem.author_roles` and `mem.project_members` are readable by the owner only: an
 application login learns its own mapping (`mem.whoami()`) and its own projects
 (`mem.reader_projects()`), never the list of who else uses the store.
 

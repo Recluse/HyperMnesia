@@ -196,8 +196,15 @@ REVOKE ALL ON FUNCTION mem.reader_projects() FROM PUBLIC;
 CREATE OR REPLACE FUNCTION mem.may_read_as(m_author text, m_scope mem.memory_scope,
                                            m_project text, r_author text, r_projects text[])
 RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
-  SELECT m_author = r_author
-      OR (m_scope = 'project' AND m_project IS NOT NULL AND m_project = ANY (r_projects));
+  -- Every operator is schema-qualified. This body is inlined, and an inlined SQL function is
+  -- parsed with the CALLER's search_path: an unqualified `=` let anyone who can create an
+  -- operator in a schema on their path (public, before PostgreSQL 15: everybody) define
+  -- memory_scope = memory_scope as `true` and read every private row tagged with a project of
+  -- theirs. A SET search_path clause would also close that, and would stop the inlining.
+  SELECT m_author OPERATOR(pg_catalog.=) r_author
+      OR (m_scope OPERATOR(pg_catalog.=) 'project'::mem.memory_scope
+          AND m_project IS NOT NULL
+          AND m_project OPERATOR(pg_catalog.=) ANY (r_projects));
 $$;
 
 CREATE OR REPLACE FUNCTION mem.may_read(m_author text, m_scope mem.memory_scope, m_project text)
@@ -210,7 +217,8 @@ $$;
 -- people's sessions from outside their project.
 CREATE OR REPLACE FUNCTION mem.may_publish(m_project text)
 RETURNS boolean LANGUAGE sql STABLE AS $$
-  SELECT m_project IS NOT NULL AND m_project = ANY (mem.reader_projects());
+  SELECT m_project IS NOT NULL
+     AND m_project OPERATOR(pg_catalog.=) ANY (mem.reader_projects());   -- see may_read_as
 $$;
 
 -- On a shared login, `mem.reader` is a session setting each connection sets to the identity it

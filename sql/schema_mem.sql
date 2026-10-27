@@ -127,7 +127,7 @@ BEGIN
             || to_tsvector('simple',  coalesce(NEW.title,'') || ' ' || NEW.content);
     NEW.updated_at := now();
     RETURN NEW;
-END $$ LANGUAGE plpgsql;
+END $$ LANGUAGE plpgsql SET search_path = pg_catalog, mem, pg_temp;
 
 DROP TRIGGER IF EXISTS memories_fts ON mem.memories;
 CREATE TRIGGER memories_fts BEFORE INSERT OR UPDATE OF content, title

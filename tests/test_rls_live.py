@@ -117,8 +117,11 @@ class Fixture:
           GRANT hm_app TO {self.role_g};
           CREATE ROLE {self.role_y} LOGIN INHERIT PASSWORD '{self.pw[self.role_y]}';
           GRANT {self.role_g} TO {self.role_y};
-          SELECT mem.add_author_role('{self.a}', '{self.role_r}');
-          ALTER ROLE {self.role_r} PASSWORD '{self.pw[self.role_r]}';
+          -- mapped by hand, with a SET-able hm_app membership: the shape of a login made before
+          -- add_author_role stopped granting SET (or by someone doing it themselves)
+          CREATE ROLE {self.role_r} LOGIN INHERIT PASSWORD '{self.pw[self.role_r]}';
+          GRANT hm_app TO {self.role_r};
+          INSERT INTO mem.author_roles (role, author) VALUES ('{self.role_r}', '{self.a}');
           CREATE ROLE {self.role_t} LOGIN INHERIT PASSWORD '{self.pw[self.role_t]}';
           GRANT hm_app TO {self.role_t};
           CREATE ROLE {self.role_n} LOGIN INHERIT PASSWORD '{self.pw[self.role_n]}';
@@ -267,9 +270,13 @@ def per_author(fx):
     check("login A claiming a non-member's name still sees A's project", seen == A, str(seen))
     seen = visible(fx, fx.url_a, prefix=f"SET mem.reader = '{fx.b}'; ")
     check("setting mem.reader inside the session changes nothing", seen == A, str(seen))
-    seen = visible(fx, fx.url_a, prefix=f"SET ROLE hm_app; SET mem.reader = '{fx.b}'; ")
-    check("nor does SET ROLE hm_app -- identity follows the authenticated login",
-          seen == A, str(seen))
+    ok, err = refused(fx.url_a, "SET ROLE hm_app;", None, "permission denied")
+    check("an author login cannot SET ROLE hm_app (its membership has no SET option)", ok, err)
+    ok, err = refused(fx.url_a, "ALTER ROLE hm_app PASSWORD 'stolen';", None, "permission denied")
+    check("so it cannot change hm_app's password and log in as the shared login", ok, err)
+    check("an author login that could is reported bypassable",
+          scalar(fx.url_r, "SELECT mode FROM mem.whoami();") == "bypassable",
+          scalar(fx.url_r, "SELECT mode FROM mem.whoami();"))
     seen = visible(fx, fx.url_b, fx.a)
     check("login B claiming to be A reads as B", seen == B, str(seen))
     check("whoami reports enforced mode and ignores the claimed name",
@@ -301,6 +308,22 @@ def per_author(fx):
         seen = visible(fx, fx.url_i, fx.b)
         check("inheriting a BYPASSRLS role it cannot become does not buy the filter mode",
               seen == set(), str(seen))
+
+    print("== per-author login: a caller-defined operator cannot rewrite the rule ==")
+    must(OWNER_URL, f"GRANT CREATE ON SCHEMA public TO {fx.role_a};")
+    try:
+        inject = ("SET search_path = public, pg_catalog; "
+                  f"CREATE FUNCTION public.rlst_eq_{fx.tag}(mem.memory_scope, mem.memory_scope) "
+                  "RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT true'; "
+                  "CREATE OPERATOR public.= (LEFTARG = mem.memory_scope, RIGHTARG = "
+                  f"mem.memory_scope, FUNCTION = public.rlst_eq_{fx.tag}); ")
+        seen = visible(fx, fx.url_a, prefix=inject)
+        check("memory_scope = memory_scope defined as true in public reveals nothing more",
+              seen <= {"a_priv", "a_proj", "b_proj"} and "b_priv" not in seen, str(seen))
+    finally:
+        must(OWNER_URL, f"DROP OPERATOR IF EXISTS public.= (mem.memory_scope, mem.memory_scope); "
+                        f"DROP FUNCTION IF EXISTS public.rlst_eq_{fx.tag}(mem.memory_scope, "
+                        f"mem.memory_scope); REVOKE CREATE ON SCHEMA public FROM {fx.role_a};")
 
     print("== per-author login: another author's provenance ==")
     src = (f"SELECT (SELECT count(*) FROM mem.sources WHERE memory_id = {fx.ids['b_proj']}) "
@@ -443,6 +466,17 @@ def admin_helpers(fx):
           mode == "bypassable", mode)
     check("and 'enforced' again once it is revoked",
           scalar(fx.url_a, "SELECT mode FROM mem.whoami();") == "enforced")
+    for grant, revoke, what in (
+            (f"GRANT CREATE ON SCHEMA mem TO {fx.role_a}",
+             f"REVOKE CREATE ON SCHEMA mem FROM {fx.role_a}", "CREATE on schema mem"),
+            (f"GRANT SELECT ON mem.author_roles TO {fx.role_a}",
+             f"REVOKE SELECT ON mem.author_roles FROM {fx.role_a}", "a privilege on the author map"),
+            (f"ALTER TABLE mem.sources OWNER TO {fx.role_a}",
+             f"ALTER TABLE mem.sources OWNER TO \"{owner}\"", "ownership of mem.sources")):
+        must(OWNER_URL, grant + ";")
+        mode = scalar(fx.url_a, "SELECT mode FROM mem.whoami();")
+        must(OWNER_URL, revoke + ";")
+        check(f"{what} granted afterwards makes the login 'bypassable'", mode == "bypassable", mode)
     ok, err = refused(OWNER_URL, f"SELECT mem.add_author_role('{fx.c}', '{fx.role_a}');", None,
                       "already mapped")
     check("a login cannot be remapped to a second author", ok, err)

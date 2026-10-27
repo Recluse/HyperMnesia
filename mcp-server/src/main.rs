@@ -961,7 +961,8 @@ fn env_file_value(key: &str) -> Option<String> {
         }
     }
     let text = std::fs::read_to_string(&path).ok()?;
-    for line in text.lines() {
+    // Python reads the file with universal newlines: \n, \r\n and a lone \r all end a line.
+    for line in text.split(['\n', '\r']) {
         let line = line.trim_matches(py_space);
         if line.starts_with('#') { continue; }
         // Split on the FIRST '=', then trim. `strip_prefix("KEY=")` misses `KEY = value`,
@@ -1018,7 +1019,9 @@ fn mem_author() -> Option<String> {
                    see only what is shared with its projects, and memory writes are refused.");
         return None;
     }
-    let v = env_file_value("MEM_AUTHOR")?;
+    // Trimmed again after the quotes come off, as identity() does on the Python side:
+    // MEM_AUTHOR=" alice " is alice there.
+    let v = env_file_value("MEM_AUTHOR")?.trim_matches(py_space).to_string();
     if ok(&v) { return Some(v); }
     eprintln!("hypermnesia-mcp: MEM_AUTHOR {v:?} in the settings file is not a plain name -- no \
                identity for this session.");
@@ -1574,7 +1577,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hm-envtest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("hypermnesia.env");
-        std::fs::write(&file, "MEM_AUTHOR=\nMEM_AUTHOR = alice\nMEM_DIALECTIC_TIMEOUT=45\n").unwrap();
+        std::fs::write(&file, "MEM_AUTHOR=\r\nMEM_AUTHOR = \" alice \"\rMEM_DIALECTIC_TIMEOUT=45\n").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::env::set_var("HYPERMNESIA_ENV_FILE", &file);

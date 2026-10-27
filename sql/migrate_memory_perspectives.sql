@@ -50,7 +50,7 @@ UPDATE mem.memories
  WHERE subject_entity_id IS NULL AND observed_entity_id IS NOT NULL;
 
 CREATE OR REPLACE FUNCTION mem.sync_memory_perspective() RETURNS trigger
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql SET search_path = pg_catalog, mem, pg_temp AS $$
 DECLARE self_id bigint;
 BEGIN
   IF NEW.author IS NULL THEN
