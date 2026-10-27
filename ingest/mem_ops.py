@@ -303,7 +303,7 @@ def _check_event_window(cur, p):
                          f"instant and would never be recalled.")
 
 
-def do_write(cur, p, supersedes_id=None):
+def do_write(cur, p, supersedes_id=None, lock_first=()):
     # Redact structured secrets BEFORE persist/embed. Single chokepoint for every write path
     # (hook extract, memory_write, supersede, consolidation merge).
     author = require_author(p.get("_identity"))
@@ -325,6 +325,14 @@ def do_write(cur, p, supersedes_id=None):
     supersedes_id = supersedes_id or p.get("supersedes_id")
     mtype = p.get("type")
     inherited_project = inherited_scope = None
+    if lock_first:
+        # Rows the caller retires at this write's created_at (do_page_upsert's extra pages):
+        # locked here, after the embedder has answered and before the insert takes the instant,
+        # so they are not held for an HTTP call -- recall touches pages' access counters and
+        # would queue behind it. A keyword argument, never a payload key: nothing on stdin can
+        # ask mem_ops to lock rows. Ascending ids, one lock order for every caller.
+        cur.execute("SELECT id FROM mem.memories WHERE id = ANY(%s) ORDER BY id "
+                    "FOR NO KEY UPDATE", (sorted(lock_first),))
     if supersedes_id:
         # Lock the target row (NO KEY UPDATE: its key never changes, and a stronger lock
         # would block foreign-key checks against it) so two concurrent supersedes of the same
@@ -1374,13 +1382,6 @@ def do_page_upsert(cur, p):
                      AND author = %s
                    ORDER BY id DESC""", (proj, (p.get("_identity") or "").strip() or None))
     prior = [r[0] for r in cur.fetchall()]
-    # Every prior page locked BEFORE the new page is written: they all retire at its created_at
-    # (below), and that instant must fall after any reactivation of theirs -- the supersede
-    # target alone was locked, by do_write, so an extra page reactivated meanwhile got an
-    # earlier retirement than its own comeback. Ascending ids: one lock order for every caller.
-    if prior:
-        cur.execute("SELECT id FROM mem.memories WHERE id = ANY(%s) ORDER BY id "
-                    "FOR NO KEY UPDATE", (prior,))
     # Explicitly project-scoped, never inherited from a default: a page exists to be read by
     # the project and is mirrored into the unscoped document corpus, so "private page" is not a
     # state this should be able to reach by accident in either direction.
@@ -1388,7 +1389,12 @@ def do_page_upsert(cur, p):
                "metadata": {**_caller_metadata(p), "kind": "page"}, "_trusted_metadata": True,
                "importance": p.get("importance", 0.6), "confidence": p.get("confidence", 0.7)}
     # The newest becomes the supersede TARGET, so the chain stays walkable from the new page.
-    mid = do_write(cur, payload, supersedes_id=prior[0] if prior else None)
+    # Every prior page is locked before the new page is written (lock_first): they all retire
+    # at its created_at, and that instant must fall after any reactivation of theirs. The
+    # supersede target alone used to be locked, so an extra page reactivated meanwhile got a
+    # retirement dated before its own comeback.
+    mid = do_write(cur, payload, supersedes_id=prior[0] if prior else None,
+                   lock_first=prior[1:])
     # Any others are retired the same way do_write retires a supersede target: status plus
     # retired_at (belief time), so they leave active recall but stay readable as history. The
     # event window (valid_to) is not touched: a page being rebuilt says nothing about when the
