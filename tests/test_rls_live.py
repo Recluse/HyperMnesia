@@ -82,7 +82,14 @@ class Fixture:
         self.a, self.b, self.c = f"rlsa{t}", f"rlsb{t}", f"rlsc{t}"
         self.p = f"rlsp{t}"
         self.role_a, self.role_b, self.role_x = f"hm_rlst_a{t}", f"hm_rlst_b{t}", f"hm_rlst_x{t}"
-        self.pw = {r: secrets.token_hex(12) for r in (self.role_a, self.role_b, self.role_x)}
+        # g: a group holding hm_app; y: a login that reaches hm_app only through g;
+        # r: an author login revoked in the middle of a session; s: a login that can SET ROLE
+        # to the table owner without inheriting it.
+        self.role_g, self.role_y = f"hm_rlst_g{t}", f"hm_rlst_y{t}"
+        self.role_r, self.role_s = f"hm_rlst_r{t}", f"hm_rlst_s{t}"
+        self.pw = {r: secrets.token_hex(12)
+                   for r in (self.role_a, self.role_b, self.role_x, self.role_y, self.role_r,
+                             self.role_s)}
         self.ids = {}
 
     def setup(self):
@@ -97,6 +104,13 @@ class Fixture:
           -- a member of hm_app with NO mapping: must read nothing, not fall back to the setting
           CREATE ROLE {self.role_x} LOGIN INHERIT PASSWORD '{self.pw[self.role_x]}';
           GRANT hm_app TO {self.role_x};
+          -- the same, one group removed: membership through a group must not reopen the setting
+          CREATE ROLE {self.role_g} NOLOGIN;
+          GRANT hm_app TO {self.role_g};
+          CREATE ROLE {self.role_y} LOGIN INHERIT PASSWORD '{self.pw[self.role_y]}';
+          GRANT {self.role_g} TO {self.role_y};
+          SELECT mem.add_author_role('{self.a}', '{self.role_r}');
+          ALTER ROLE {self.role_r} PASSWORD '{self.pw[self.role_r]}';
         """)
         rows = must(OWNER_URL, f"""
           INSERT INTO mem.memories (memory_type, content, author, scope, project, metadata)
@@ -109,9 +123,16 @@ class Fixture:
         for line in rows.splitlines():
             name, mid = line.split()
             self.ids[name] = int(mid)
+        must(OWNER_URL, f"""
+          INSERT INTO mem.sources (memory_id, source_type, excerpt)
+               VALUES ({self.ids['b_proj']}, 'manual', 'b_proj source');
+          INSERT INTO mem.assertions (memory_id, predicate, object_text)
+               VALUES ({self.ids['b_proj']}, 'is', 'b_proj assertion');""")
         self.url_a = as_login(OWNER_URL, self.role_a, self.pw[self.role_a])
         self.url_b = as_login(OWNER_URL, self.role_b, self.pw[self.role_b])
         self.url_x = as_login(OWNER_URL, self.role_x, self.pw[self.role_x])
+        self.url_y = as_login(OWNER_URL, self.role_y, self.pw[self.role_y])
+        self.url_r = as_login(OWNER_URL, self.role_r, self.pw[self.role_r])
 
     def teardown(self):
         authors = f"'{self.a}','{self.b}','{self.c}'"
@@ -126,6 +147,11 @@ class Fixture:
           DROP ROLE IF EXISTS {self.role_a};
           DROP ROLE IF EXISTS {self.role_b};
           DROP ROLE IF EXISTS {self.role_x};
+          SELECT mem.remove_author_role('{self.role_r}');
+          DROP ROLE IF EXISTS {self.role_r};
+          DROP ROLE IF EXISTS {self.role_y};
+          DROP ROLE IF EXISTS {self.role_g};
+          DROP ROLE IF EXISTS {self.role_s};
         """)
 
 
@@ -226,6 +252,27 @@ def per_author(fx):
     check("a member of hm_app with no mapping reads nothing, whatever it claims",
           seen == set(), str(seen))
     check("and says so", scalar(fx.url_x, "SELECT mode FROM mem.whoami();", fx.a) == "unmapped")
+    seen = visible(fx, fx.url_y, fx.b)
+    check("a login reaching hm_app only through a group reads nothing, whatever it claims",
+          seen == set(), str(seen))
+    check("and is reported unmapped, not filter",
+          scalar(fx.url_y, "SELECT mode FROM mem.whoami();", fx.b) == "unmapped")
+    revoked_mid_session(fx)
+
+    print("== per-author login: another author's provenance ==")
+    src = (f"SELECT (SELECT count(*) FROM mem.sources WHERE memory_id = {fx.ids['b_proj']}) "
+           f"|| '/' || (SELECT count(*) FROM mem.assertions WHERE memory_id = {fx.ids['b_proj']});")
+    check("login A reads the sources and assertions of B's shared row",
+          scalar(fx.url_a, src) == "1/1", scalar(fx.url_a, src))
+    for t in ("sources", "assertions"):
+        n = scalar(fx.url_a, f"WITH d AS (DELETE FROM mem.{t} WHERE memory_id = "
+                             f"{fx.ids['b_proj']} RETURNING 1) SELECT count(*) FROM d;")
+        check(f"but cannot delete its {t}", n == "0", n)
+        n = scalar(fx.url_a, f"WITH u AS (UPDATE mem.{t} SET memory_id = {fx.ids['a_priv']} "
+                             f"WHERE memory_id = {fx.ids['b_proj']} RETURNING 1) "
+                             f"SELECT count(*) FROM u;")
+        check(f"nor move its {t} onto a row of its own", n == "0", n)
+    check("both are still there", scalar(OWNER_URL, src) == "1/1", scalar(OWNER_URL, src))
 
     for rel in ("mem.author_roles", "mem.project_members"):
         ok, err = refused(fx.url_a, f"SELECT count(*) FROM {rel};", None, "permission denied")
@@ -249,6 +296,32 @@ def per_author(fx):
                                 f"LIMIT 1; UPDATE mem.dream_runs SET author = '{fx.b}' "
                                 f"WHERE author = '{fx.a}';", fx.b, "row-level security")
     check("a Dreamer run cannot be moved into B's name", ok, err)
+
+
+def revoked_mid_session(fx):
+    """An author login that ran SET ROLE hm_app keeps hm_app as its current role after the
+    mapping and the membership are removed; it must not fall back to naming itself."""
+    env = dict(os.environ)
+    env.pop("PGOPTIONS", None)
+    p = subprocess.Popen(["psql", fx.url_r, "-X", "-q", "-tA", "-v", "ON_ERROR_STOP=1"],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, env=env)
+    try:
+        p.stdin.write("SET ROLE hm_app; SELECT 'ready';\n")
+        p.stdin.flush()
+        ready = p.stdout.readline().strip()
+        must(OWNER_URL, f"SELECT mem.remove_author_role('{fx.role_r}');")
+        p.stdin.write(f"SET mem.reader = '{fx.b}'; SELECT count(*) FROM mem.memories "
+                      f"WHERE id = {fx.ids['b_priv']}; SELECT coalesce(mode, '') "
+                      f"FROM mem.whoami();\n")
+        out, err = p.communicate(timeout=60)
+    finally:
+        if p.poll() is None:
+            p.kill()
+    lines = out.split()
+    check("a login revoked mid-session (after SET ROLE hm_app) cannot read as B",
+          ready == "ready" and lines[:1] == ["0"], f"ready={ready!r} out={out!r} err={err!r}")
+    check("and is reported unmapped", lines[1:2] == ["unmapped"], repr(out))
 
 
 def definer_functions(fx):
@@ -308,6 +381,11 @@ def admin_helpers(fx):
     ok, err = refused(OWNER_URL, f"SELECT mem.add_author_role('someone', '{owner}');", None,
                       "bypasses row-level security")
     check("a role that bypasses RLS cannot become an author login", ok, err)
+    must(OWNER_URL, f"CREATE ROLE {fx.role_s} LOGIN PASSWORD '{fx.pw[fx.role_s]}'; "
+                    f"GRANT \"{owner}\" TO {fx.role_s} WITH INHERIT FALSE, SET TRUE;")
+    ok, err = refused(OWNER_URL, f"SELECT mem.add_author_role('{fx.c}', '{fx.role_s}');", None,
+                      "bypasses row-level security")
+    check("nor a role that can only SET ROLE to the owner (no inherited privileges)", ok, err)
     ok, err = refused(OWNER_URL, f"SELECT mem.add_author_role('{fx.c}', '{fx.role_a}');", None,
                       "already mapped")
     check("a login cannot be remapped to a second author", ok, err)
@@ -353,6 +431,22 @@ def migrations():
     code, out = hm("migrate")
     check("after which the store is current again", code == 0 and "nothing to apply" in out,
           out[-300:])
+    with tempfile.TemporaryDirectory() as tmp:
+        # A run that dies after re-applying an earlier file and before the grant file: the
+        # retry must still owe the grant file, not find every checksum current.
+        sql = os.path.join(tmp, "sql")
+        shutil.copytree(os.path.join(ROOT, "sql"), sql)
+        with open(os.path.join(sql, "mem_app_role.sql"), "a", encoding="utf-8") as f:
+            f.write("\nSELECT 1/0;  -- the run is interrupted here\n")
+        code, out = hm("migrate", "--reapply", "migrate_peer_cards.sql",
+                       env_extra={"HM_SQL_DIR": sql})
+        check("a run interrupted in the grant file fails", code != 0
+              and "applying sql/migrate_peer_cards.sql" in out, out[-400:])
+    code, out = hm("migrate")
+    check("and the next run re-applies the grant file instead of reporting nothing to do",
+          code == 0 and "applying sql/mem_app_role.sql" in out, out[-400:])
+    code, out = hm("migrate")
+    check("after which nothing is owed", code == 0 and "nothing to apply" in out, out[-300:])
 
 
 def main():

@@ -32,8 +32,10 @@ CREATE INDEX IF NOT EXISTS author_roles_author_idx ON mem.author_roles(author);
 
 -- The caller's OWN mapping, and nothing else. `mode` is
 --   enforced -- this login is mapped; `author` is fixed by the database;
---   filter   -- shared login (or the owner); `author` is whatever mem.reader was set to;
---   unmapped -- a member of hm_app with no mapping; it reads nothing until it is mapped.
+--   filter   -- shared login (or a role that bypasses row-level security anyway); `author` is
+--               whatever mem.reader was set to;
+--   unmapped -- any other login, including one whose mapping was removed: it reads nothing
+--               until it is mapped.
 CREATE OR REPLACE FUNCTION mem.whoami(OUT login name, OUT author text, OUT mode text)
 LANGUAGE plpgsql STABLE SECURITY DEFINER
 SET search_path = pg_catalog, mem AS $$
@@ -42,21 +44,18 @@ BEGIN
   author := mem.reader();
   IF EXISTS (SELECT 1 FROM mem.author_roles ar WHERE ar.role = session_user) THEN
     mode := 'enforced';
-  ELSIF session_user <> 'hm_app' AND EXISTS (
-       SELECT 1 FROM pg_auth_members am
-         JOIN pg_roles grp ON grp.oid = am.roleid
-         JOIN pg_roles usr ON usr.oid = am.member
-        WHERE grp.rolname = 'hm_app' AND usr.rolname = session_user) THEN
-    mode := 'unmapped';
-  ELSE
+  ELSIF mem.trusts_reader_setting(session_user) THEN
     mode := 'filter';
+  ELSE
+    mode := 'unmapped';
   END IF;
 END $$;
 REVOKE ALL ON FUNCTION mem.whoami() FROM PUBLIC;
 
 -- Create (or adopt) a login for an author and map it. Returns the role name. Refuses a role
--- that would bypass row-level security -- a superuser, a BYPASSRLS role, or one that owns the
--- memory table -- because mapping it would announce an enforcement that does not happen.
+-- that would bypass row-level security -- a superuser, a BYPASSRLS role, the memory table's
+-- owner, or a member of any of them -- because mapping it would announce an enforcement that
+-- does not happen.
 CREATE OR REPLACE FUNCTION mem.add_author_role(p_author text, p_role name DEFAULT NULL)
 RETURNS name LANGUAGE plpgsql
 SET search_path = pg_catalog, mem AS $$
@@ -84,8 +83,12 @@ BEGIN
     EXECUTE format('CREATE ROLE %I LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE '
                    'NOREPLICATION NOBYPASSRLS', r);
   ELSE
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r AND (rolsuper OR rolbypassrls))
-       OR pg_has_role(r, tbl_owner, 'USAGE') THEN
+    -- 'MEMBER', not 'USAGE': a membership granted WITH INHERIT FALSE, SET TRUE gives no
+    -- inherited privileges but still lets the login SET ROLE to the owner, or to any
+    -- superuser or BYPASSRLS role it can reach, and skip every policy from there.
+    IF EXISTS (SELECT 1 FROM pg_roles g
+                WHERE (g.rolsuper OR g.rolbypassrls OR g.oid = tbl_owner)
+                  AND pg_has_role(r, g.oid, 'MEMBER')) THEN
       RAISE EXCEPTION 'role % bypasses row-level security (superuser, BYPASSRLS or table '
                       'owner) and cannot be an author login', r;
     END IF;

@@ -676,8 +676,12 @@ Use it for one person, or for people who would share their memory with each othe
 file or your history) and what the person puts in their own settings: `DATABASE_URL` with their
 login, and `MEM_AUTHOR` set to the same name — a write under any other name is refused. The login
 inherits `hm_app`'s privileges, so the same policies bind it; what changes is that `mem.reader()`
-returns the mapped author whatever the session sets. A member of `hm_app` with no mapping reads
-nothing. `mem.author_roles` and `mem.project_members` are readable by the owner only: an
+returns the mapped author whatever the session sets. Only `hm_app` itself (and roles that
+bypass row-level security anyway) may name themselves through the setting: any other login
+without a mapping reads nothing — one whose mapping was removed, even mid-session after a
+`SET ROLE hm_app`, and one that reaches `hm_app` through a group. `./hm author add` refuses to
+adopt a role that can reach a superuser, a `BYPASSRLS` role or the table owner by any membership,
+including a `SET`-only one; do not grant such a role to an author login afterwards either. `mem.author_roles` and `mem.project_members` are readable by the owner only: an
 application login learns its own mapping (`mem.whoami()`) and its own projects
 (`mem.reader_projects()`), never the list of who else uses the store.
 

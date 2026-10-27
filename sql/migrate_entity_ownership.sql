@@ -116,7 +116,7 @@ ALTER TABLE mem.entities ALTER COLUMN author SET NOT NULL;
 ALTER TABLE mem.entities ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS entities_own ON mem.entities;
 CREATE POLICY entities_own ON mem.entities FOR ALL TO hm_app
-  USING (author = current_setting('mem.reader', true))
-  WITH CHECK (author = current_setting('mem.reader', true));
+  USING (author = (SELECT mem.reader()))
+  WITH CHECK (author = (SELECT mem.reader()));
 
 COMMIT;

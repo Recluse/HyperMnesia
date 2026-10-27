@@ -66,6 +66,13 @@ jobs:
         run: python tests/test_maintenance_locks.py
       - name: Knowledge pages (sibling tag, chunking, publish SQL)
         run: python tests/test_mem_pages.py
+      - name: Extraction queue (claims, failures exit non-zero, author gate)
+        run: python tests/test_mem_extract_queue.py
+      - name: Ingest ignore file
+        run: python tests/test_ingest_ignore.py
+      # The fixture is shared with `cargo test`: both resolvers must pick the same components.
+      - name: Tier-1 parity fixture (Python side) and hook root resolution
+        run: python tests/test_tier1_parity.py && python tests/test_arch_hook_root.py
       # Four modules ship an executable self-check and only one of them was run. For each of
       # the three below, that self-check is the ONLY automated coverage its behaviour has:
       # Tier-1 selection (specificity order, 1-hop propagation, cross-repo isolation),
@@ -194,6 +201,12 @@ jobs:
         run: |
           pip install --quiet psycopg2-binary
           python tests/test_memory_lifecycle_live.py
+      # Builds its own scratch databases (the CI owner may CREATE DATABASE) and runs the
+      # lifecycle migration over rows in the shapes the old code wrote.
+      - name: Memory lifecycle migration over legacy rows
+        env:
+          DATABASE_URL: postgresql://hm:hm@localhost:5432/hypermnesia
+        run: python tests/test_memory_lifecycle_migration_live.py
       - name: Tier 1 and constraint sources, live
         env:
           DATABASE_URL: postgresql://hm:hm@localhost:5432/hypermnesia

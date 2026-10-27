@@ -143,6 +143,20 @@ def set_reader(cur, p):
     who = (p.get("_identity") or "").strip() or None
     if who:
         cur.execute("SELECT set_config('mem.reader', %s, false)", (who,))
+        # On a per-author login the database decides who is reading (mem.reader() in
+        # mem_multiuser.sql) and ignores the setting. A mismatch is refused by the write
+        # policies, but reads would just come back empty -- indistinguishable from "nothing
+        # matched" -- so say it here instead. A store without the function predates enforced
+        # identity and has only the setting.
+        cur.execute("SELECT to_regprocedure('mem.reader()') IS NOT NULL")
+        if cur.fetchone()[0]:
+            cur.execute("SELECT mem.reader()")
+            db_who = cur.fetchone()[0]
+            if db_who != who:
+                raise SystemExit(
+                    f"identity mismatch: MEM_AUTHOR is {who!r} but this database login reads "
+                    f"as {db_who!r}. Use the login made for {who!r} (./hm author add), or set "
+                    f"MEM_AUTHOR to the author this login is mapped to.")
     return who
 
 

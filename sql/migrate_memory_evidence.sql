@@ -123,20 +123,20 @@ CREATE POLICY derivations_read ON mem.derivations FOR SELECT TO hm_app
                       AND mem.may_read(m.author,m.scope,m.project)));
 DROP POLICY IF EXISTS derivations_insert ON mem.derivations;
 CREATE POLICY derivations_insert ON mem.derivations FOR INSERT TO hm_app
-  WITH CHECK (author=current_setting('mem.reader',true)
+  WITH CHECK (author=(SELECT mem.reader())
               AND EXISTS (SELECT 1 FROM mem.memories m
                             WHERE m.id=evidence_memory_id
                               AND mem.may_read(m.author,m.scope,m.project))
               AND EXISTS (SELECT 1 FROM mem.memories m
                             WHERE m.id=derived_memory_id
-                              AND m.author=current_setting('mem.reader',true)));
+                              AND m.author=(SELECT mem.reader())));
 DROP POLICY IF EXISTS derivations_update ON mem.derivations;
 CREATE POLICY derivations_update ON mem.derivations FOR UPDATE TO hm_app
-  USING (author=current_setting('mem.reader',true))
-  WITH CHECK (author=current_setting('mem.reader',true));
+  USING (author=(SELECT mem.reader()))
+  WITH CHECK (author=(SELECT mem.reader()));
 DROP POLICY IF EXISTS derivations_delete ON mem.derivations;
 CREATE POLICY derivations_delete ON mem.derivations FOR DELETE TO hm_app
-  USING (author=current_setting('mem.reader',true));
+  USING (author=(SELECT mem.reader()));
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON mem.derivations TO hm_app;
 GRANT USAGE, SELECT ON SEQUENCE mem.derivations_id_seq TO hm_app;

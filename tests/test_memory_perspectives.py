@@ -19,7 +19,7 @@ mcp = (ROOT / "mcp-server/src/main.rs").read_text()
 assert "FOREIGN KEY (author, observer_entity_id)" in migration
 assert "FOREIGN KEY (author, observed_entity_id)" in migration
 assert "NEW.subject_entity_id := NEW.observed_entity_id" in migration
-assert "mem.may_read(m.author, m.scope, m.project)" in migration
+assert "mem.may_read_as(m.author, m.scope, m.project," in migration
 view_sql = migration[migration.index("CREATE OR REPLACE VIEW mem.perspective_graph"):]
 assert "observer.aliases" not in view_sql and "observed.attributes" not in view_sql
 assert "GRANT SELECT ON mem.perspective_graph" in role

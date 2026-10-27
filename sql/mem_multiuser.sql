@@ -97,14 +97,33 @@ COMMENT ON TABLE mem.author_roles IS
 --   1. The authenticated login is listed in mem.author_roles: its author. `session_user`, not
 --      `current_user`: the latter changes inside SECURITY DEFINER functions and after SET ROLE,
 --      the former only by SET SESSION AUTHORIZATION, which needs a superuser.
---   2. The login is a direct member of hm_app but NOT listed (a role whose mapping was removed,
---      or one granted hm_app by hand and never mapped): NULL, which reads nothing. Without this
---      a revoked author role would fall through to rule 3 and choose any name it likes.
---   3. Anything else -- hm_app itself, the maintenance owner: the `mem.reader` session setting.
---      That is the shared-login filter mode, unchanged from before this function existed.
+--   2. The login IS hm_app, or could bypass row-level security anyway (a superuser, a
+--      BYPASSRLS role, or a member -- by any route, inherited or SET-only -- of the role that
+--      owns mem.memories): the `mem.reader` session setting. That is the shared-login filter
+--      mode, unchanged from before this function existed; for the bypassing roles the setting
+--      only narrows what the views show.
+--   3. Anything else: NULL, which reads nothing. That covers a login whose mapping was removed
+--      (also one that ran SET ROLE hm_app before the removal -- its current_user is still
+--      hm_app, its session_user is not), and a login that reaches hm_app through a group
+--      without ever being mapped. Deciding by "is this hm_app" rather than "is this a member of
+--      hm_app" is what keeps an indirect route from reopening the filter mode.
 --
 -- SECURITY DEFINER because rule 1 reads a table the application roles cannot; the search_path
 -- is pinned so the definer context cannot be steered through a caller-created object.
+-- May this login name itself through the `mem.reader` setting? Rule 2 of mem.reader() below,
+-- shared with mem.whoami() so the two can never disagree about a login's mode.
+CREATE OR REPLACE FUNCTION mem.trusts_reader_setting(r name) RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog, mem AS $$
+  SELECT r = 'hm_app'
+      OR EXISTS (SELECT 1 FROM pg_roles g
+                  WHERE (g.rolsuper OR g.rolbypassrls
+                         OR g.oid = (SELECT relowner FROM pg_class
+                                      WHERE oid = 'mem.memories'::regclass))
+                    AND pg_has_role(r, g.oid, 'MEMBER'));
+$$;
+REVOKE ALL ON FUNCTION mem.trusts_reader_setting(name) FROM PUBLIC;
+
 CREATE OR REPLACE FUNCTION mem.reader() RETURNS text
 LANGUAGE plpgsql STABLE SECURITY DEFINER
 SET search_path = pg_catalog, mem AS $$
@@ -114,14 +133,10 @@ BEGIN
   IF FOUND THEN
     RETURN mapped;
   END IF;
-  IF session_user <> 'hm_app' AND EXISTS (
-       SELECT 1 FROM pg_auth_members am
-         JOIN pg_roles grp ON grp.oid = am.roleid
-         JOIN pg_roles usr ON usr.oid = am.member
-        WHERE grp.rolname = 'hm_app' AND usr.rolname = session_user) THEN
-    RETURN NULL;
+  IF mem.trusts_reader_setting(session_user) THEN
+    RETURN current_setting('mem.reader', true);
   END IF;
-  RETURN current_setting('mem.reader', true);
+  RETURN NULL;
 END $$;
 REVOKE ALL ON FUNCTION mem.reader() FROM PUBLIC;
 

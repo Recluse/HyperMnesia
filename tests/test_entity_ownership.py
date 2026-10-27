@@ -17,7 +17,7 @@ for text in (role, migration):
     assert "ALTER TABLE mem.entities ENABLE ROW LEVEL SECURITY" in text
 # mem_app_role.sql re-states the entity policy last, through mem.reader(): the raw setting is the
 # caller's to choose, so on a per-author login it must never be what a policy compares to.
-assert "author = current_setting('mem.reader', true)" in migration
+assert "author = (SELECT mem.reader())" in migration
 assert "author = (SELECT mem.reader())" in role
 assert "current_setting('mem.reader'" not in role.split("-- Any policy on a memory table")[0]
 assert "entity_author_map" in migration

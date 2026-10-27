@@ -212,6 +212,19 @@ def main():
     f, _ = run(edited)
     check("a file changed since it was applied is a warning that names it",
           "schema.sql" in (by_title(f, "changed since applied") or {}).get("detail", ""))
+    with tempfile.TemporaryDirectory() as tmp:
+        # A checkout without a file the store never had: ./hm migrate refuses it, and the
+        # doctor must not quietly leave it out of the count.
+        for name in sums:
+            if name != "migrate_dreamer.sql":
+                with open(os.path.join(tmp, name), "wb") as out:
+                    out.write(open(os.path.join(ROOT, "sql", name), "rb").read())
+        f, code = run(gap, env_extra={"HM_SQL_DIR": tmp})
+        absent = by_title(f, "neither applied nor in this checkout")
+        check("a migration absent from the checkout AND the store is a failure that names it",
+              (absent or {}).get("level") == "fail"
+              and "migrate_dreamer.sql" in absent.get("detail", "")
+              and not by_title(f, "migration(s) current"), str(f)[:400])
     untracked = dict(HEALTHY)
     untracked["to_regclass('public.hm_schema_migrations')"] = [["f"]]
     f, _ = run(untracked)
@@ -239,6 +252,12 @@ def main():
     f, _ = run(app, env_extra={"MEM_AUTHOR": "bob"})
     check("MEM_AUTHOR disagreeing with the mapped author is a failure",
           (by_title(f, "disagrees") or {}).get("level") == "fail")
+    off = dict(app)
+    off["NOT c.relrowsecurity"] = [["memories"]]
+    f, _ = run(off, env_extra={"MEM_AUTHOR": "alice"})
+    check("row-level security switched off on a memory table is a failure, not 'enforced'",
+          (by_title(f, "switched off") or {}).get("level") == "fail"
+          and not by_title(f, "Identity enforced"), str([x["title"] for x in f]))
     app["FROM mem.whoami()"] = [["hm_ghost", "", "unmapped"]]
     f, _ = run(app)
     check("an unmapped member of hm_app is a failure",
@@ -291,6 +310,12 @@ def main():
     ext["channel = 'extractor'"] = [["600"]]
     f, _ = run(ext, env_extra={"MEM_AUTHOR": "alice"}, queue=0)
     check("a fresh one is current", (by_title(f, "Extraction is current") or {}).get("level") == "ok")
+    f, code = run(ext, env_extra={"MEM_AUTHOR": "alice", "HM_EXTRACT_MAX_AGE_HOURS": "three"},
+                  queue=0)
+    check("a malformed age limit is reported, and the rest of the report still arrives",
+          (by_title(f, "not a positive number") or {}).get("level") == "warn"
+          and by_title(f, "Extraction is current") and by_title(f, "Postgres reachable"),
+          str([x["title"] for x in f]))
     f, _ = run(HEALTHY, queue=3)
     check("a queue with no identity to write it is flagged",
           (by_title(f, "wait for extraction") or {}).get("level") == "warn")

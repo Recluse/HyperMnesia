@@ -163,26 +163,43 @@ CREATE POLICY review_own ON mem.review_queue FOR ALL TO hm_app
   WITH CHECK (author = (SELECT mem.reader()));
 
 -- mem.sources holds session ids and verbatim transcript excerpts, keyed by memory_id alone --
--- readable by number with no check until now. It follows its memory.
-ALTER TABLE mem.sources ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS sources_follow_memory ON mem.sources;
-CREATE POLICY sources_follow_memory ON mem.sources FOR ALL TO hm_app
-  USING (EXISTS (SELECT 1 FROM mem.memories m
-                  WHERE m.id = memory_id AND mem.may_read_as(m.author, m.scope, m.project,
-                        (SELECT mem.reader()), (SELECT mem.reader_projects()))))
-  WITH CHECK (EXISTS (SELECT 1 FROM mem.memories m
-                       WHERE m.id = memory_id
-                         AND m.author = (SELECT mem.reader())));
-
-ALTER TABLE mem.assertions ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS assertions_follow_memory ON mem.assertions;
-CREATE POLICY assertions_follow_memory ON mem.assertions FOR ALL TO hm_app
-  USING (EXISTS (SELECT 1 FROM mem.memories m
-                  WHERE m.id = memory_id AND mem.may_read_as(m.author, m.scope, m.project,
-                        (SELECT mem.reader()), (SELECT mem.reader_projects()))))
-  WITH CHECK (EXISTS (SELECT 1 FROM mem.memories m
-                       WHERE m.id = memory_id
-                         AND m.author = (SELECT mem.reader())));
+-- readable by number with no check until now. It follows its memory: readable wherever the
+-- memory is, changed only on a memory you wrote. Not one FOR ALL policy: its USING clause is
+-- also DELETE's, so "readable" would let every project member delete the provenance and
+-- assertions of everybody's shared rows (WITH CHECK is never evaluated for DELETE).
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['sources', 'assertions'] LOOP
+    EXECUTE format('ALTER TABLE mem.%I ENABLE ROW LEVEL SECURITY', t);
+    EXECUTE format('DROP POLICY IF EXISTS %I ON mem.%I',
+                   CASE t WHEN 'sources' THEN 'sources_follow_memory'
+                          ELSE 'assertions_follow_memory' END, t);
+    EXECUTE format('DROP POLICY IF EXISTS %I ON mem.%I', t || '_read', t);
+    EXECUTE format('DROP POLICY IF EXISTS %I ON mem.%I', t || '_insert', t);
+    EXECUTE format('DROP POLICY IF EXISTS %I ON mem.%I', t || '_update', t);
+    EXECUTE format('DROP POLICY IF EXISTS %I ON mem.%I', t || '_delete', t);
+    EXECUTE format($p$CREATE POLICY %I ON mem.%I FOR SELECT TO hm_app
+      USING (EXISTS (SELECT 1 FROM mem.memories m
+                      WHERE m.id = memory_id AND mem.may_read_as(m.author, m.scope, m.project,
+                            (SELECT mem.reader()), (SELECT mem.reader_projects()))))$p$,
+                   t || '_read', t);
+    EXECUTE format($p$CREATE POLICY %I ON mem.%I FOR INSERT TO hm_app
+      WITH CHECK (EXISTS (SELECT 1 FROM mem.memories m
+                           WHERE m.id = memory_id AND m.author = (SELECT mem.reader())))$p$,
+                   t || '_insert', t);
+    EXECUTE format($p$CREATE POLICY %I ON mem.%I FOR UPDATE TO hm_app
+      USING (EXISTS (SELECT 1 FROM mem.memories m
+                      WHERE m.id = memory_id AND m.author = (SELECT mem.reader())))
+      WITH CHECK (EXISTS (SELECT 1 FROM mem.memories m
+                           WHERE m.id = memory_id AND m.author = (SELECT mem.reader())))$p$,
+                   t || '_update', t);
+    EXECUTE format($p$CREATE POLICY %I ON mem.%I FOR DELETE TO hm_app
+      USING (EXISTS (SELECT 1 FROM mem.memories m
+                      WHERE m.id = memory_id AND m.author = (SELECT mem.reader())))$p$,
+                   t || '_delete', t);
+  END LOOP;
+END $$;
 
 -- Evidence edges (sql/migrate_memory_evidence.sql): readable when both ends are, written in
 -- your own name from evidence you can read onto a derived memory you own.

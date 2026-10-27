@@ -115,7 +115,11 @@ SELECT m.id AS memory_id, m.author, m.memory_type, m.status, m.project, m.create
   FROM mem.memories m
   JOIN mem.entities observer ON observer.id=m.observer_entity_id
   JOIN mem.entities observed ON observed.id=m.observed_entity_id
- WHERE mem.may_read(m.author, m.scope, m.project);
+ -- The identity is looked up once per query, not once per row (see may_read_as in
+ -- mem_multiuser.sql); mem.reader() reads session_user, so the owner-run view still
+ -- answers for the caller.
+ WHERE mem.may_read_as(m.author, m.scope, m.project,
+                       (SELECT mem.reader()), (SELECT mem.reader_projects()));
 
 COMMENT ON VIEW mem.perspective_graph IS
   'Minimal observer -> observed identities for memories visible to mem.reader; aliases and entity attributes are intentionally omitted.';

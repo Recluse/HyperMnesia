@@ -91,7 +91,7 @@ mem_app_role.sql"
 REPEATABLE="mem_app_role.sql"
 
 # Tolerated when absent, with a note. Every other missing file is an error.
-MAY_BE_ABSENT="migrate_memory_lifecycle.sql migrate_constraint_sources.sql"
+MAY_BE_ABSENT=""
 
 SQL_DIR=${HM_SQL_DIR:-$ROOT/sql}
 
@@ -220,6 +220,7 @@ cmd_migrate() {
     # Pass 2: apply. hm_schema_migrations does not exist until migrate_schema_version.sql has
     # run, so the files applied before it are recorded as soon as it has.
     recordable=$has
+    owed=""
     unrecorded=""
     applied=0
     current=0
@@ -237,6 +238,18 @@ cmd_migrate() {
            && { ! in_list "$f" "$REPEATABLE" || [ "$applied" -eq 0 ]; }; then
             current=$((current + 1))
             continue
+        fi
+        # Anything applied before the grant file can (re)install a policy or a table it has not
+        # restated yet, and until it runs again the store is not in the shape it certifies.
+        # Forget its record FIRST: a run interrupted between this file and the grant file then
+        # still owes it, instead of finding every checksum current and applying nothing.
+        if [ "$recordable" = t ] && ! in_list "$f" "$REPEATABLE" && [ -z "$owed" ]; then
+            for r in $REPEATABLE; do
+                mpsql -tAX -q -v ON_ERROR_STOP=1 \
+                    -c "DELETE FROM public.hm_schema_migrations WHERE name = '$r'" >/dev/null \
+                    || die "could not mark sql/$r as owed -- nothing was applied"
+            done
+            owed=t
         fi
         printf -- '-- applying sql/%s\n' "$f"
         # From stdin, so the same call works against the compose container, which sees the

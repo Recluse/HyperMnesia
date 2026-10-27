@@ -32,8 +32,8 @@ CREATE INDEX IF NOT EXISTS dream_runs_author_started_idx
 ALTER TABLE mem.dream_runs ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS dream_runs_own ON mem.dream_runs;
 CREATE POLICY dream_runs_own ON mem.dream_runs FOR ALL TO hm_app
-  USING (author=current_setting('mem.reader',true))
-  WITH CHECK (author=current_setting('mem.reader',true));
+  USING (author=(SELECT mem.reader()))
+  WITH CHECK (author=(SELECT mem.reader()));
 
 GRANT SELECT,INSERT,UPDATE ON mem.dream_runs TO hm_app;
 GRANT USAGE,SELECT ON SEQUENCE mem.dream_runs_id_seq TO hm_app;

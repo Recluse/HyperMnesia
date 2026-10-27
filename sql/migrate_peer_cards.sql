@@ -115,7 +115,7 @@ FROM (SELECT author,observer_entity_id peer FROM mem.memories
 ALTER TABLE mem.peer_cards ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS peer_cards_own ON mem.peer_cards;
 CREATE POLICY peer_cards_own ON mem.peer_cards FOR SELECT TO hm_app
-  USING (author=current_setting('mem.reader',true));
+  USING (author=(SELECT mem.reader()));
 
 GRANT SELECT ON mem.peer_cards TO hm_app;
 REVOKE ALL ON FUNCTION mem.refresh_peer_card(text,bigint) FROM PUBLIC;

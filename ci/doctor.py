@@ -276,10 +276,15 @@ def check_migrations(out):
                            "Re-run ./hm migrate so sql/mem_app_role.sql grants SELECT on it."))
         return
     recorded = {r[0]: r[1] for r in rows}
-    missing, changed = [], []
+    missing, changed, absent = [], [], []
     for name in order:
-        path = os.path.join(ROOT, "sql", name)
+        # The same directory ./hm migrate reads (HM_SQL_DIR overrides it there too).
+        path = os.path.join(os.environ.get("HM_SQL_DIR") or os.path.join(ROOT, "sql"), name)
         if not os.path.isfile(path):
+            # ./hm migrate refuses an incomplete checkout; skipping the file here instead
+            # would let an unapplied migration drop out of the report altogether.
+            if name not in recorded:
+                absent.append(name)
             continue
         with open(path, "rb") as fh:
             digest = hashlib.sha256(fh.read()).hexdigest()
@@ -287,6 +292,10 @@ def check_migrations(out):
             missing.append(name)
         elif recorded[name] != digest:
             changed.append(name)
+    if absent:
+        out.append(finding(FAIL, f"{len(absent)} migration(s) neither applied nor in this checkout",
+                           ", ".join(absent),
+                           "Update this checkout (sql/ is incomplete), then ./hm migrate"))
     if missing:
         out.append(finding(FAIL, f"{len(missing)} migration(s) not applied",
                            ", ".join(missing),
@@ -296,7 +305,7 @@ def check_migrations(out):
                            ", ".join(changed),
                            "./hm migrate --status, then ./hm migrate --reapply <file> after "
                            "reading the change"))
-    if not missing and not changed:
+    if not missing and not changed and not absent:
         out.append(finding(OK, f"All {len(recorded)} recorded migration(s) current"))
 
 
@@ -305,7 +314,7 @@ def check_identity(out):
     # the table owner, a superuser or a BYPASSRLS role skips every policy: it answers every
     # query, correctly, with everybody's rows.
     rows, err = q("SELECT r.rolname, r.rolsuper, r.rolbypassrls, "
-                  "coalesce(pg_has_role(current_user, c.relowner, 'USAGE'), false) "
+                  "coalesce(pg_has_role(current_user, c.relowner, 'MEMBER'), false) "
                   "FROM pg_roles r LEFT JOIN pg_class c ON c.oid = to_regclass('mem.memories') "
                   "WHERE r.rolname = current_user")
     if err or not rows or len(rows[0]) < 4:
@@ -321,6 +330,18 @@ def check_identity(out):
                            "Fine for migrations and restores. The application must connect as "
                            "hm_app or a per-author login (docs/INSTALL.md, \"Two people, one "
                            "store\"); keep this one in HM_ADMIN_URL."))
+        return
+    # The trust modes below describe what the policies do; with row-level security switched off
+    # on a table there are no policies to speak of, for any login but its owner.
+    rows, err = q("SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                  "WHERE n.nspname = 'mem' AND c.relkind = 'r' AND NOT c.relrowsecurity "
+                  "AND c.relname = ANY (ARRAY['memories','entities','assertions','sources',"
+                  "'review_queue','derivations','dream_runs','peer_cards']) ORDER BY 1")
+    if not err and rows and rows[0] and rows[0][0]:
+        out.append(finding(FAIL, "Row-level security is switched off",
+                           "on mem." + ", mem.".join(r[0] for r in rows) +
+                           " -- every login that can read these tables reads every row",
+                           "./hm migrate --reapply mem_app_role.sql  (as the table owner)"))
         return
     rows, err = q("SELECT login, coalesce(author, ''), mode FROM mem.whoami()")
     if err or not rows or len(rows[0]) < 3:
@@ -338,7 +359,7 @@ def check_identity(out):
                                f"login {login} is author {author!r}; mem.reader is ignored"))
     elif mode == "unmapped":
         out.append(finding(FAIL, "This login has no author mapping",
-                           f"{login} is a member of hm_app but not in mem.author_roles: it reads "
+                           f"{login} is not hm_app and not in mem.author_roles: it reads "
                            f"nothing and every write is refused",
                            "./hm author add <author> <login>, as the table owner"))
     else:
@@ -402,7 +423,15 @@ def check_extraction(out):
     if err or not rows or not rows[0][0].lstrip("-").isdigit():
         return
     age = int(rows[0][0])
-    limit_h = float(os.environ.get("HM_EXTRACT_MAX_AGE_HOURS", "72") or 72)
+    raw = os.environ.get("HM_EXTRACT_MAX_AGE_HOURS", "") or "72"
+    try:
+        limit_h = float(raw)
+        if not limit_h > 0:
+            raise ValueError
+    except ValueError:
+        out.append(finding(WARN, "HM_EXTRACT_MAX_AGE_HOURS is not a positive number",
+                           f"got {raw!r}; judging extraction age against 72 h"))
+        limit_h = 72.0
     queued = "" if depth is None else f"; {depth} transcript(s) queued"
     if age < 0:
         out.append(finding(WARN if depth else OK, "No extracted memories yet",
