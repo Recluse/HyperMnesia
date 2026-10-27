@@ -630,6 +630,38 @@ def main():
         check("a supersede verdict with an older winner retires its loser after it began",
               res["applied"] and span and span[0][0] is True, f"{res['message']} {span}")
 
+        # Two rebuilds of a page that does not exist yet: nothing to row-lock, so only the
+        # advisory lock keeps them from leaving two active pages.
+        pa_conn, pa = connect("alice")
+        pb_conn, pb = connect("alice")
+        page_proj = f"{TAG}-pages"
+        owner_sql("INSERT INTO mem.project_members (author, project) VALUES ('alice', %s) "
+                  "ON CONFLICT DO NOTHING", (page_proj,))
+        m.do_page_upsert(pa, {"_identity": "alice", "project": page_proj,
+                              "content": "page one: first rebuild"})     # uncommitted
+        def run_b():
+            m.do_page_upsert(pb, {"_identity": "alice", "project": page_proj,
+                                  "content": "page one: second rebuild"})
+            pb_conn.commit()
+        tb = threading.Thread(target=run_b)
+        tb.start()
+        waited = False
+        for _ in range(100):
+            w8 = owner_sql("SELECT wait_event_type FROM pg_stat_activity WHERE pid=%s",
+                           (pb_conn.get_backend_pid(),))
+            if w8 and w8[0][0] == "Lock":
+                waited = True
+                break
+            time.sleep(0.05)
+        pa_conn.commit()
+        tb.join(30)
+        live = owner_sql("SELECT count(*) FROM mem.memories WHERE project=%s AND status='active' "
+                         "AND metadata->>'kind'='page'", (page_proj,))[0][0]
+        check("a second first-rebuild waits for the first", waited)
+        check("and two rebuilds of a new page leave exactly one active page", live == 1, str(live))
+        for c in (pa_conn, pb_conn):
+            c.close()
+
         print("\n== the pinned profile holds explicit rows only ==")
         q1 = write(ac, alice, type="semantic", content="printer jams on thick paper")
         q2 = write(ac, alice, type="semantic", content="printer jams when the tray is full")

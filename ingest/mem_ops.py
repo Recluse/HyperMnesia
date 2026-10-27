@@ -1377,6 +1377,12 @@ def do_page_upsert(cur, p):
     rename: it held two.
     """
     proj = canon_project(cur, p.get("project"))
+    # One rebuild at a time per author and project. Row locks cannot serialize the FIRST page --
+    # with no prior page there is nothing to lock, and two rebuilds would each insert one and
+    # leave both active. A transaction-scoped advisory lock covers that case, and every rebuild
+    # after it; it blocks only other rebuilds of the same page, never a recall.
+    cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"hypermnesia:page:{(p.get('_identity') or '').strip()}:{proj}",))
     cur.execute("""SELECT id FROM mem.active_memories
                    WHERE (metadata->>'kind')='page' AND project IS NOT DISTINCT FROM %s
                      AND author = %s

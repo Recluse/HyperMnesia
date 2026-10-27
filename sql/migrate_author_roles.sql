@@ -68,8 +68,11 @@ SET search_path = pg_catalog, pg_temp AS $$
       OR EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n
                   WHERE n.nspname = 'mem' AND pg_catalog.pg_has_role(r, n.nspowner, 'MEMBER'))
       THEN 'it is, or can act as, the owner of a table, view or function in schema mem'
-    WHEN pg_catalog.has_schema_privilege(r, 'mem', 'CREATE')
-      THEN 'it can create objects in schema mem, where the definer functions resolve names'
+    WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_roles g
+                  WHERE pg_catalog.pg_has_role(r, g.oid, 'MEMBER')
+                    AND pg_catalog.has_schema_privilege(g.oid, 'mem', 'CREATE'))
+      THEN 'it can create objects in schema mem (itself or through a role it can become), '
+           'where the definer functions resolve names'
     WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_database d
                   WHERE d.datname = pg_catalog.current_database()
                     AND pg_catalog.pg_has_role(r, d.datdba, 'MEMBER'))
@@ -85,8 +88,13 @@ SET search_path = pg_catalog, pg_temp AS $$
            SELECT 1 FROM pg_catalog.pg_roles g
              JOIN pg_catalog.pg_class c ON true
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            -- MAINTAIN (VACUUM, ANALYZE, REINDEX, REFRESH, LOCK...) exists from PostgreSQL
+            -- 17; naming it on 16 is an error, so it joins the list only where it exists.
             CROSS JOIN unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE','TRUNCATE',
-                                    'REFERENCES','TRIGGER']) pr(p)
+                                    'REFERENCES','TRIGGER']
+                              || CASE WHEN pg_catalog.current_setting('server_version_num')::int
+                                           >= 170000 THEN ARRAY['MAINTAIN']
+                                      ELSE ARRAY[]::text[] END) pr(p)
             WHERE pg_catalog.pg_has_role(r, g.oid, 'MEMBER') AND g.rolname <> 'hm_app'
               AND n.nspname = 'mem' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
               AND pg_catalog.has_table_privilege(g.oid, c.oid, pr.p)

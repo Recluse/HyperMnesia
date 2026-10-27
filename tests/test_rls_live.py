@@ -494,7 +494,11 @@ def admin_helpers(fx):
              f"GRANT SELECT ON mem.all_active_memories TO rlst_audit_{fx.tag}; "
              f"GRANT rlst_audit_{fx.tag} TO {fx.role_a} WITH INHERIT FALSE, SET TRUE",
              f"DROP OWNED BY rlst_audit_{fx.tag}; DROP ROLE rlst_audit_{fx.tag}",
-             "a SET-only role holding SELECT on the maintenance view")):
+             "a SET-only role holding SELECT on the maintenance view"),
+            (f"CREATE ROLE rlst_mk_{fx.tag}; GRANT USAGE, CREATE ON SCHEMA mem TO rlst_mk_{fx.tag}; "
+             f"GRANT rlst_mk_{fx.tag} TO {fx.role_a} WITH INHERIT FALSE, SET TRUE",
+             f"DROP OWNED BY rlst_mk_{fx.tag}; DROP ROLE rlst_mk_{fx.tag}",
+             "a SET-only role holding CREATE on schema mem")):
         must(OWNER_URL, grant + ";")
         mode = scalar(fx.url_a, "SELECT mode FROM mem.whoami();")
         must(OWNER_URL, revoke + ";")
