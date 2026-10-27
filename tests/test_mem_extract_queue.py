@@ -17,21 +17,26 @@ Only a genuine read failure may return None, because only that one can succeed l
 
     python3 tests/test_mem_extract_queue.py
 """
+import contextlib
+import io
+import json
 import os
 import sys
 import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks"))
+import mem_extract  # noqa: E402
 from mem_extract import transcript_text  # noqa: E402
 
 failures = []
 ran = 0
 
 
-def check(name, cond):
+def check(name, cond, detail=""):
     global ran
     ran += 1
-    print(f"  {'ok  ' if cond else 'FAIL'} {name}")
+    print(f"  {'ok  ' if cond else 'FAIL'} {name}" + (f"  -- {detail}" if detail and not cond
+                                                     else ""))
     if not cond:
         failures.append(name)
 
@@ -76,6 +81,111 @@ def main():
                 check("an unreadable file is unreadable", transcript_text(locked) is None)
             finally:
                 os.chmod(locked, 0o600)
+
+    print("\n== injected memory never reaches the extractor ==")
+    from _mem_common import fence
+    strip = mem_extract.strip_memory_blocks
+    with tempfile.TemporaryDirectory() as tmp:
+        fenced = os.path.join(tmp, "fenced.jsonl")
+        recalled = fence("recall", "Possibly relevant memories:", "[#7] (preference) prefers zed")
+        with open(fenced, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"message": {"role": "user",
+                                            "content": recalled + " please rebuild the index"}})
+                    + "\n")
+            # A fence cut off by the end of its turn: removed to the end of THAT turn only.
+            f.write(json.dumps({"message": {"role": "assistant", "content": [
+                {"type": "text", "text": "ok <personal-memory-profile nonce=c0ffee>pinned"}]}})
+                    + "\n")
+            f.write(json.dumps({"message": {"role": "user", "content": "next turn survives"}})
+                    + "\n")
+        text = transcript_text(fenced)
+        check("a real fence() block is removed before extraction",
+              "prefers zed" not in text and "personal-memory" not in text, text)
+        check("a truncated fence is removed to the end of its turn, not beyond",
+              "pinned" not in text and "ok" in text and "next turn survives" in text, text)
+        check("the surrounding conversation survives", "please rebuild the index" in text, text)
+    nested = ("<personal-memory-recall nonce=aa11><personal-memory-x nonce=bb22>inner"
+              "</personal-memory-x nonce=bb22>SECRET</personal-memory-recall nonce=aa11> after")
+    check("a nested block goes as a whole: nothing of the outer one is left behind",
+          strip(nested).split() == ["after"], strip(nested))
+    bare_nested = ("<personal-memory-recall><personal-memory-x>inner</personal-memory-x>"
+                   "SECRET</personal-memory-recall>")
+    check("tags without a nonce are not our fence and are left as written",
+          strip(bare_nested) == bare_nested, strip(bare_nested))
+    mention = "Explain the literal tag <personal-memory-recall> and preserve this normal request."
+    check("mentioning the tag does not eat the rest of the message",
+          strip(mention) == mention, strip(mention))
+    reused = ("<personal-memory-recall nonce=aa11><personal-memory-recall nonce=aa11>x"
+              "</personal-memory-recall nonce=aa11>LEAK</personal-memory-recall nonce=aa11> tail")
+    check("nested fences reusing one kind and nonce go whole: nothing between closes leaks",
+          strip(reused).split() == ["tail"], strip(reused))
+    import time
+    for name, flood in (("unclosed openings", "<personal-memory-recall nonce=abcd> " * 20000),
+                        ("unpaired closes", "x </personal-memory-recall nonce=abcd> " * 20000),
+                        ("open/close pairs", "<personal-memory-x nonce=ab12>y"
+                                             "</personal-memory-x nonce=ab12> " * 20000)):
+        started = time.perf_counter()
+        strip(flood)
+        took = time.perf_counter() - started
+        check(f"linear on 20,000 {name} (under 0.5 s)", took < 0.5, f"{took:.2f} s")
+    other_close = ("<personal-memory-recall nonce=aa11>a</personal-memory-recall nonce=bb22>"
+                   " tail")
+    check("a close with another nonce does not end the block (treated as truncated)",
+          strip(other_close).strip() == "", strip(other_close))
+
+    print("\n== a failed duplicate check is a failure, not 'not a duplicate' ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        tp = os.path.join(tmp, "t.jsonl")
+        with open(tp, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"message": {"role": "user", "content": "x" * 800}}) + "\n")
+        queue, done = os.path.join(tmp, "q.jsonl"), os.path.join(tmp, "done")
+        with open(queue, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"transcript_path": tp}) + "\n")
+
+        def run(search_answer, write_answer='{"id": 5}', author="alice"):
+            calls = []
+
+            def fake_mem_ops(cmd, payload, timeout=10):
+                calls.append((cmd, payload))
+                if cmd == "search":
+                    return search_answer
+                if cmd == "nearest":
+                    return "{}"
+                return write_answer
+            saved = {k: getattr(mem_extract, k) for k in
+                     ("mem_ops", "QUEUE", "DONE", "LOCK", "extract", "identity")}
+            mem_extract.mem_ops = fake_mem_ops
+            mem_extract.QUEUE, mem_extract.DONE = queue, done
+            mem_extract.LOCK = os.path.join(tmp, "lock")
+            mem_extract.extract = lambda text: [{"type": "semantic", "content": "a new fact"}]
+            mem_extract.identity = lambda: author
+            argv, sys.argv = sys.argv, ["mem_extract.py"]
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    code = mem_extract.main()
+            finally:
+                sys.argv = argv
+                for k, v in saved.items():
+                    setattr(mem_extract, k, v)
+            return code, calls
+
+        code, calls = run(None)
+        check("a search error skips the item and exits non-zero",
+              code == 1 and not any(c == "write" for c, _ in calls), str((code, calls)))
+        check("and the transcript is NOT marked done", not os.path.exists(done))
+        probe = dict(calls)["search"]
+        check("the probe does not count as recall, and asks for JSON",
+              probe.get("track_access") is False and probe.get("format") == "json", str(probe))
+        code, calls = run("[]", write_answer=None)
+        check("a failed write exits non-zero", code == 1 and not os.path.exists(done))
+        code, calls = run("[]")
+        check("a clean run exits 0 and marks the transcript done",
+              code == 0 and os.path.exists(done), str(code))
+        check("the write asked for JSON", dict(calls)["write"].get("format") == "json")
+        code, calls = run("[]", author=None)
+        check("no MEM_AUTHOR: refuses to start (exit 2), touches nothing",
+              code == 2 and not calls, str((code, calls)))
 
     print(f"\n{ran - len(failures)}/{ran} checks passed"
           + (f"; FAILED: {', '.join(failures)}" if failures else ""))

@@ -30,8 +30,14 @@ def row(mid, project=None, level=None):
 
 
 class FakeCursor:
+    stale = frozenset()
+
     def execute(self, sql, params=None):
-        if "FROM mem.perspective_graph pg" in sql:
+        if "mem.premises_live" in sql:
+            # The query-time premise check: which of these conclusions lost a premise.
+            assert "NOT mem.premises_live(u.id)" in sql
+            self.rows = [(mid,) for mid in params[0] if mid in self.stale]
+        elif "FROM mem.perspective_graph pg" in sql:
             ids = set(params[0])
             self.rows = [
                 (mid, {"id": 10, "namespace": "identity", "entity_type": "peer",
@@ -175,7 +181,7 @@ def main():
     observed_global = {}
     original_search = mem_ops.do_search
     try:
-        def global_search(cur, payload, track_access=True):
+        def global_search(cur, payload, track_access=True, **_kw):
             observed_global.update(payload=payload, track_access=track_access)
             return [row(5, "Infra")]
         mem_ops.do_search = global_search
@@ -306,6 +312,58 @@ def main():
     assert not any(x["id"] in (4, 6) for s in searched["sections"] if s["name"] == "relevant"
                    for x in s["items"])
 
+    # R4: a conclusion whose premises are not all live is not served -- it is named in
+    # scope.stale_premises, and its premises are not walked as evidence either.
+    stale_cursor = FakeCursor()
+    stale_cursor.stale = frozenset({4})
+    stale_ctx = mem_ops.do_context(stale_cursor, {"project": "sample-project",
+                                                  "depth": "high", "token_budget": 8192})
+    stale_sections = {s["name"]: s["items"] for s in stale_ctx["sections"]}
+    assert "derived" not in stale_sections and "evidence" not in stale_sections, stale_sections
+    assert stale_ctx["scope"]["stale_premises"] == [4], stale_ctx["scope"]
+    assert "stale_premises" not in mem_ops.do_context(
+        FakeCursor(), {"project": "sample-project", "depth": "high",
+                       "token_budget": 8192})["scope"]
+    # ...and the same for a conclusion found by SEARCH: dropped before depth selection.
+    original_search = mem_ops.do_search
+    seen_stale_flag = {}
+    try:
+        def stale_search(cur, payload, track_access=True, include_stale=False):
+            seen_stale_flag["include_stale"] = include_stale
+            return [row(6, "sample-project", "deductive"), row(3, "sample-project")]
+        mem_ops.do_search = stale_search
+        stale_cursor = FakeCursor()
+        stale_cursor.stale = frozenset({6})
+        searched_stale = mem_ops.do_context(stale_cursor, {"project": "sample-project",
+                                                           "depth": "auto",
+                                                           "query": "audit evidence chain",
+                                                           "token_budget": 8192})
+    finally:
+        mem_ops.do_search = original_search
+    assert seen_stale_flag["include_stale"] is True
+    ids_served = {x["id"] for s in searched_stale["sections"] for x in s["items"]}
+    assert 6 not in ids_served and 6 in searched_stale["scope"]["stale_premises"]
+    assert searched_stale["scope"]["depth_selection"]["signals"]["derived_hit_count"] == 0
+    # R6: query hits are marked, wherever the packer placed them, and counted.
+    marked = {x["id"]: x.get("query_match") for s in searched_stale["sections"]
+              for x in s["items"]}
+    assert marked[3] is True and not marked.get(1), marked
+    assert searched_stale["scope"]["query_hits"] == 1
+    assert not any(x.get("query_match") for s in live_shape["sections"] for x in s["items"])
+    assert live_shape["scope"]["query_hits"] == 0
+
+    # R6: importance and recency only break exact RRF ties. Together they stay below the
+    # smallest gap between two reachable RRF scores at the configured K and leg depth, so they
+    # can never swap two differently ranked hits (the old 0.002/0.001 outweighed ~4 ranks).
+    from fractions import Fraction
+    assert mem_ops._min_rrf_gap(60, 30) == Fraction(1, 45474372)
+    assert mem_ops.TIE_IMPORTANCE + mem_ops.TIE_RECENCY < mem_ops.RRF_MIN_GAP
+    leg = [0.0] + [1.0 / (mem_ops.RRF_K + r) for r in range(1, mem_ops.RRF_LEG_DEPTH + 1)]
+    scores = sorted({a + b for a in leg for b in leg})
+    worst = min(b - a for a, b in zip(scores, scores[1:]) if b - a > 1e-15)
+    assert mem_ops.TIE_IMPORTANCE * 1.0 + mem_ops.TIE_RECENCY < worst, worst
+    assert "{tie_imp}*m.importance" in mem_ops.SEARCH_SQL and "0.002" not in mem_ops.SEARCH_SQL
+
     # A `contradicts` edge is reported as a dispute, never as evidence_for its target.
     disputed_cursor = FakeCursor()
     disputed_cursor.with_contradiction = True
@@ -340,7 +398,7 @@ def main():
     original_search = mem_ops.do_search
     observed = {}
     try:
-        def fake_search(cur, payload, track_access=True):
+        def fake_search(cur, payload, track_access=True, **_kw):
             observed.update(payload=payload, track_access=track_access)
             return []
         mem_ops.do_search = fake_search
@@ -354,6 +412,46 @@ def main():
     assert queried["scope"]["query_used"] is True
     assert "private task text" not in json.dumps(queried)
     assert queried["notice"] == mem_ops.CONTEXT_NOTICE
+
+    # The pinned profile is cached for minutes, so it cannot vouch for a conclusion's premises:
+    # every profile list is explicit-only, and conclusions arrive through context instead.
+    profile_src = (ROOT / "hooks/mem_profile.py").read_text()
+    profile_sql = profile_src[profile_src.index('SQL = r"""'):profile_src.index('""".replace')]
+    for tag in ("#PREF#", "#FACT#", "#PLAN#"):
+        part = profile_sql[profile_sql.index(tag):]
+        part = part[:part.index(";")]
+        assert "coalesce(metadata->>'reasoning_level','explicit') = 'explicit'" in part, tag
+    assert "premises_live" not in profile_sql
+    # ...and a cache written by an older version (which could pin conclusions) is never served,
+    # not even on the stale-on-outage path that otherwise serves a cache indefinitely.
+    import hashlib, os, subprocess, tempfile
+    with tempfile.TemporaryDirectory() as home:
+        bindir = Path(home) / "bin"
+        bindir.mkdir()
+        (bindir / "psql").write_text("#!/bin/sh\nexit 2\n")      # the store is down
+        (bindir / "psql").chmod(0o755)
+        cache = Path(home) / ".claude" / (
+            "hypermnesia-profile-cache."
+            + hashlib.sha256(b"alice").hexdigest()[:16] + ".txt")
+        cache.parent.mkdir(mode=0o700)
+        env = {"HOME": home, "PATH": f"{bindir}:/usr/bin:/bin", "MEM_AUTHOR": "alice",
+               "HYPERMNESIA_ENV_FILE": str(Path(home) / "none.env")}
+
+        def profile_out():
+            os.utime(cache, (0, os.path.getmtime(cache) - 3600))   # past the TTL: outage path
+            return subprocess.run([sys.executable, str(ROOT / "hooks/mem_profile.py")],
+                                  input=b"{}", capture_output=True, env=env,
+                                  timeout=30).stdout.decode()
+        cache.write_text("[Key facts]\n- an old derived conclusion")
+        out = profile_out()
+        assert "old derived conclusion" not in out and "UNAVAILABLE" in out, out
+        os.utime(cache, None)                                       # and within the TTL too
+        out = subprocess.run([sys.executable, str(ROOT / "hooks/mem_profile.py")], input=b"{}",
+                             capture_output=True, env=env, timeout=30).stdout.decode()
+        assert "old derived conclusion" not in out, out
+        cache.write_text("#hypermnesia-profile v2 explicit-only\n[Key facts]\n- current fact")
+        out = profile_out()
+        assert "current fact" in out and "cached copy" in out, out
 
     src = (ROOT / "mcp-server/src/main.rs").read_text()
     assert '"name":"memory_context"' in src

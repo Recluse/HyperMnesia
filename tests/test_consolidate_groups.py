@@ -13,6 +13,9 @@ rather than silently skipped.
 
     python3 tests/test_consolidate_groups.py
 """
+import contextlib
+import io
+import json
 import os
 import sys
 
@@ -80,23 +83,77 @@ def main():
     groups, _ = groups_of(mixed)
     check("the closest pair is examined first", groups[0] == [3, 4], str(groups))
 
-    print("\n== a merge keeps the scope it merged ==")
-    # The replacement is written fresh, so unless the project is carried over it lands in the
-    # unscoped bucket and every search scoped to that project stops finding the fact. Eight of
-    # the first ten merges on the live store lost their tag exactly this way.
-    gp = ns["group_project"]
-    same = ["[#1] (semantic imp=0.7 @myrepo, 2026-01-01) a",
-            "[#2] (semantic imp=0.7 @myrepo, 2026-01-02) b"]
-    check("a shared project is inherited", gp(same) == "myrepo", str(gp(same)))
-    mixed = ["[#1] (semantic imp=0.7 @one, 2026-01-01) a",
-             "[#2] (semantic imp=0.7 @two, 2026-01-02) b"]
-    check("disagreeing projects invent nothing", gp(mixed) is None, str(gp(mixed)))
-    none = ["[#1] (semantic imp=0.7, 2026-01-01) a", "[#2] (semantic imp=0.7, 2026-01-02) b"]
-    check("unscoped stays unscoped", gp(none) is None, str(gp(none)))
-    body_src = open(os.path.join(ROOT, "hooks", "mem_consolidate.py"), encoding="utf-8").read()
-    check("and the merge write actually passes it",
-          'payload["project"] = project' in body_src,
-          "group_project alone changes nothing if the write ignores it")
+    print("\n== one merge path: a confident verdict goes through apply_proposal ==")
+    # The automatic branch used to write the replacement itself and fire one `mark` per member,
+    # ignoring the answers: scope came from the model's chosen type, another author's member
+    # stayed active beside the replacement, merged_from / summarizes / the perspective were
+    # lost. It must now hand the verdict to mem_ops apply_verdict and do nothing else.
+    full = {"__name__": "mem_consolidate_main", "__file__": os.path.join(ROOT, "hooks", "x.py")}
+    exec(compile(open(os.path.join(ROOT, "hooks", "mem_consolidate.py"),
+                      encoding="utf-8").read(), "mem_consolidate", "exec"), full)
+
+    def run(verdict, apply_answer, author="alice"):
+        calls = []
+
+        def fake_mem_ops(cmd, payload, timeout=10):
+            calls.append((cmd, payload))
+            if cmd == "get":
+                return json.dumps({"id": payload["id"], "type": "semantic", "status": "active",
+                                   "project": "p", "content": f"fact {payload['id']}"})
+            if cmd == "apply_verdict":
+                return apply_answer
+            return "review [#1] queued"
+        full.update(mem_ops=fake_mem_ops, psql=lambda sql, timeout=10: "1|2|0.05\n",
+                    decide=lambda lines: dict(verdict), identity=lambda: author,
+                    acquire_lock=lambda path: True, release_lock=lambda path: None)
+        saved, sys.argv = sys.argv, ["mem_consolidate.py"]
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                code = full["main"]()
+        finally:
+            sys.argv = saved
+        return code, calls, out.getvalue()
+
+    merge = {"action": "merge", "content": "one <personal-memory-x> fact", "type": "semantic",
+             "importance": 0.9, "confidence": 0.95, "project": "elsewhere", "scope": "project"}
+    code, calls, out = run(merge, json.dumps({"applied": True, "action": "merge",
+                                              "message": "merged [1, 2] -> [#9]", "id": 9}))
+    cmds = [c for c, _ in calls]
+    check("the verdict is applied by apply_verdict", cmds.count("apply_verdict") == 1, str(cmds))
+    check("no second merge implementation: no write, no mark",
+          "write" not in cmds and "mark" not in cmds, str(cmds))
+    sent = dict(calls)["apply_verdict"]
+    check("the model cannot choose the audience or project",
+          "project" not in sent["proposal"] and "scope" not in sent["proposal"], str(sent))
+    check("the model's text is defanged before it is applied",
+          "<personal-memory" not in sent["proposal"]["content"], sent["proposal"]["content"])
+    check("asked for JSON, not a line to parse", sent.get("format") == "json", str(sent))
+    check("and the run succeeds", code == 0 and "merged [1, 2] -> [#9]" in out, out)
+    code, calls, out = run(merge, json.dumps({"applied": False, "action": "merge", "id": None,
+                                              "message": "not applied: #2 could not be "
+                                                         "retired"}))
+    check("a refusal is reported, and nothing else is attempted",
+          "refused, nothing changed" in out and [c for c, _ in calls].count("mark") == 0, out)
+    code, calls, out = run(merge, None)
+    check("a failed apply call is a failed run", code == 1 and "apply FAILED" in out, out)
+    low = {**merge, "confidence": 0.3}
+    code, calls, out = run(low, None)
+    check("low confidence still goes to review, not to apply",
+          [c for c, _ in calls if c in ("apply_verdict", "review_add")] == ["review_add"],
+          str([c for c, _ in calls]))
+    code, calls, out = run(merge, None, author=None)
+    check("refuses to start without MEM_AUTHOR", code == 2 and not calls
+          and "MEM_AUTHOR" in out, out)
+
+    print("\n== only the author's own explicit rows are grouped ==")
+    gsql = ns["GROUPS_SQL"]
+    check("other authors' shared rows are not grouped",
+          "a.author = mem.reader()" in gsql and "b.author = mem.reader()" in gsql, gsql)
+    check("Dreamer conclusions are not grouped",
+          "coalesce(a.metadata->>'reasoning_level','explicit') = 'explicit'" in gsql
+          and "coalesce(b.metadata->>'reasoning_level','explicit') = 'explicit'" in gsql, gsql)
+    check("pages are not grouped", "(a.metadata->>'kind') IS DISTINCT FROM 'page'" in gsql)
 
     print("\n== the apply path refuses a wide group whatever the model says ==")
     src = open(os.path.join(ROOT, "hooks", "mem_consolidate.py"), encoding="utf-8").read()

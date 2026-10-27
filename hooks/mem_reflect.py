@@ -19,7 +19,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _mem_common import mem_ops, acquire_lock, release_lock, profile_cache_path  # noqa: E402
+from _mem_common import (mem_ops, acquire_lock, release_lock, profile_cache_path,  # noqa: E402
+                         identity)
 from _llm import complete        # noqa: E402
 
 MIN_MEMS = int(os.environ.get("MEM_REFLECT_MIN", "5"))   # skip projects with fewer active memories
@@ -51,16 +52,26 @@ def reflect_one(project, dry):
         return False
     r = mem_ops("page_upsert", {
         "project": project, "content": page.strip(), "importance": 0.6,
-        "source": {"source_type": "reflection", "channel": "reflect"},
+        "source": {"source_type": "reflection", "channel": "reflect"}, "format": "json",
     }, timeout=30)
-    ok = bool(r and "saved" in r)
-    print(f"  {project} ({len(grp)} mems): {r.strip() if r else 'WRITE FAILED'}")
-    return ok
+    try:
+        page_id = int(json.loads(r)["id"]) if r else None
+    except (ValueError, KeyError, TypeError):
+        page_id = None
+    print(f"  {project} ({len(grp)} mems): "
+          f"{f'saved [#{page_id}]' if page_id else 'WRITE FAILED'}")
+    return bool(page_id)
 
 
 def main():
     dry = "--dry-run" in sys.argv
     only = sys.argv[sys.argv.index("--project") + 1] if "--project" in sys.argv else None
+    if not identity():
+        # Pages are written in the author's name and built from what that author can read;
+        # without one, every page write is refused after the model has already been paid for.
+        print("refusing to start: MEM_AUTHOR is unset or invalid -- set it to the author whose "
+              "project pages this pass rebuilds", file=sys.stderr, flush=True)
+        return 2
 
     # Atomic PID lock: two launches cannot both enter (exists-then-create let them), a killed
     # owner is recovered, and so is a lock whose recorded PID was reused after a reboot.
@@ -96,4 +107,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

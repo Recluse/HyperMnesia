@@ -5,6 +5,14 @@ The model sees only the caller's RLS/project-scoped ``memory_context`` result. I
 claims with exact memory IDs; code rejects the entire answer if any claim lacks visible support.
 The final prose and citation objects are then built by code, including stored evidence paths.
 No memory row or access counter is modified.
+
+"Grounded" means exactly this: every cited ID exists in that context and is active there (and a
+cited conclusion still has all its premises -- the context does not serve one that does not).
+It does NOT mean the claim follows from the cited text; nothing here checks entailment.
+
+Abstention is decided in code before any model call when the query matched nothing: the
+context also carries profile rows chosen without looking at the query, and a model handed only
+those will happily answer from them.
 """
 import hashlib
 import json
@@ -17,6 +25,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _mem_common import defang, mem_ops
 from _llm import complete
+
+# The author-name rule of _mem_common.identity() and the MCP server's mem_author().
+_IDENT_OK = re.compile(r"\A[A-Za-z0-9._-]{1,64}\Z")
 
 DEPTHS = ("auto", "minimal", "low", "medium", "high", "max")
 
@@ -77,7 +88,9 @@ def _items(context):
 def validate_reply(value, context):
     """All-or-nothing grounding gate; partial acceptance would hide unsupported model prose."""
     items = _items(context)
-    active_ids = {mid for mid, item in items.items() if item.get("status") == "active"}
+    stale = set((context.get("scope") or {}).get("stale_premises") or [])
+    active_ids = {mid for mid, item in items.items()
+                  if item.get("status") == "active" and mid not in stale}
     if value.get("abstained") is True:
         if value.get("claims") not in ([], None):
             raise ValueError("an abstention cannot contain claims")
@@ -188,6 +201,15 @@ def answer(payload, generator=None):
         raise ValueError("token_budget must be from 512 to 8192")
     request = {"query": query, "depth": depth, "routing": routing, "token_budget": budget,
                "project": payload.get("project")}
+    # The identity the MCP server resolved and handed over. It used to be dropped here, and
+    # mem_ops() then filled in whatever THIS process's environment said -- which is a second
+    # resolution that can disagree with the first. Absent, mem_ops() resolves it as every
+    # other pass does; present but malformed is refused rather than silently replaced.
+    given = payload.get("_identity")
+    if given is not None:
+        if not isinstance(given, str) or not _IDENT_OK.match(given.strip()):
+            raise ValueError("_identity is not a plain author name")
+        request["_identity"] = given.strip()
     if payload.get("session_id") is not None:
         request["session_id"] = payload["session_id"]
     raw = mem_ops("context", request, timeout=min(CONTEXT_TIMEOUT, remaining()))
@@ -196,6 +218,12 @@ def answer(payload, generator=None):
     context = json.loads(raw)
     if not _items(context):
         return build_result(query, depth, context, [], "no grounded memories matched")
+    if not any(item.get("query_match") for item in _items(context).values()):
+        # Profile rows only. They are in the context by design (the model may need them to
+        # read a hit correctly), but they were selected without the query, so they cannot be
+        # the answer to it.
+        return build_result(query, depth, context, [],
+                            "no memories matched the query (only profile context)")
     try:
         claims, reason = validate_reply(generator(query, context), context)
     except (ValueError, TypeError, json.JSONDecodeError) as exc:

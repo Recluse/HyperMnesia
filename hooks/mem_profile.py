@@ -31,18 +31,27 @@ STALE_LINE = ("[Possibly stale] {n} fact(s) older than {d} days have gone unreca
 TRUNC = 220  # chars per memory line, and a line longer than this is marked ' ...[cut]'
 # so an amputated rule cannot read as a whole one -- the exception clause of a
 # preference is exactly the part that falls off a 220-character cut.
+# Explicit rows only. A derived conclusion may be served only while its premises are live, and
+# this profile is cached for TTL seconds -- long enough to keep serving one whose premise was
+# just superseded. Conclusions reach the agent through memory_context and memory_ask, where
+# mem.premises_live is checked on every call. The ordering is unchanged.
 # NB: content is whitespace-collapsed in SQL --
 # a multi-line memory (e.g. a reflect page) otherwise emits continuation lines
 # that match no #TAG# prefix and were silently dropped by the parser below.  # chars per memory line
 
 SQL = r"""
 SELECT '#PREF# ' || id || '|' || CASE WHEN length(regexp_replace(content, '\s+', ' ', 'g')) > %(t)s THEN left(regexp_replace(content, '\s+', ' ', 'g'), %(t)s) || ' ...[cut]' ELSE regexp_replace(content, '\s+', ' ', 'g') END FROM mem.active_memories
- WHERE memory_type='preference' ORDER BY importance DESC, created_at DESC LIMIT 10;
+ WHERE memory_type='preference'
+   AND coalesce(metadata->>'reasoning_level','explicit') = 'explicit'
+ ORDER BY importance DESC, created_at DESC LIMIT 10;
 SELECT '#FACT# ' || id || '|' || CASE WHEN length(regexp_replace(content, '\s+', ' ', 'g')) > %(t)s THEN left(regexp_replace(content, '\s+', ' ', 'g'), %(t)s) || ' ...[cut]' ELSE regexp_replace(content, '\s+', ' ', 'g') END FROM mem.active_memories
  WHERE memory_type IN ('semantic','procedural') AND importance >= 0.6
+   AND coalesce(metadata->>'reasoning_level','explicit') = 'explicit'
  ORDER BY importance DESC, created_at DESC LIMIT 10;
 SELECT '#PLAN# ' || id || '|' || CASE WHEN length(regexp_replace(content, '\s+', ' ', 'g')) > %(t)s THEN left(regexp_replace(content, '\s+', ' ', 'g'), %(t)s) || ' ...[cut]' ELSE regexp_replace(content, '\s+', ' ', 'g') END FROM mem.active_memories
- WHERE memory_type='prospective' ORDER BY importance DESC, created_at DESC LIMIT 5;
+ WHERE memory_type='prospective'
+   AND coalesce(metadata->>'reasoning_level','explicit') = 'explicit'
+ ORDER BY importance DESC, created_at DESC LIMIT 5;
 SELECT '#REVQ# ' || count(*) || '|' || coalesce(min(created_at)::date::text,'')
   FROM mem.review_queue WHERE status='pending';
 SELECT '#STALE# ' || count(*) FROM mem.active_memories
@@ -93,14 +102,28 @@ def build_profile():
     return "\n".join(out)
 
 
+# First line of every cache file this version writes. A cache without it was written by an
+# older version -- one whose profile could still pin derived conclusions -- and is ignored on
+# BOTH read paths, the fresh one and the stale-on-outage one, which would otherwise serve it for
+# as long as the store stays down. Bump it whenever what the profile may contain changes.
+CACHE_HEADER = "#hypermnesia-profile v2 explicit-only"
+
+
+def read_cache():
+    """The cached profile body, or None if absent, unreadable, or from another version."""
+    try:
+        with open(CACHE, encoding="utf-8") as f:
+            head, sep, body = f.read().partition("\n")
+    except OSError:
+        return None
+    return body if head == CACHE_HEADER and sep else None
+
+
 def main():
     read_stdin_json()  # source field unused -- all matchers get the same profile
     profile = None
     if os.path.exists(CACHE) and time.time() - os.path.getmtime(CACHE) < TTL:
-        try:
-            profile = open(CACHE, encoding="utf-8").read()
-        except OSError:
-            pass
+        profile = read_cache()
     stale_age = None
     if profile is None:
         profile = build_profile()
@@ -111,15 +134,16 @@ def main():
                 os.makedirs(os.path.dirname(CACHE), exist_ok=True)
                 fd = os.open(CACHE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(profile)
+                    f.write(CACHE_HEADER + "\n" + profile)
             except OSError:
                 pass
         elif os.path.exists(CACHE):   # store unreachable -> serve the stale cache, but SAY so
-            try:
-                profile = open(CACHE, encoding="utf-8").read()
-                stale_age = int((time.time() - os.path.getmtime(CACHE)) // 60)
-            except OSError:
-                profile = None
+            profile = read_cache()
+            if profile is not None:
+                try:
+                    stale_age = int((time.time() - os.path.getmtime(CACHE)) // 60)
+                except OSError:
+                    profile = None
     if profile is None:
         # Unreachable AND no cache: emit the one honest line instead of nothing, so a silently
         # memory-less machine is visible rather than looking like an empty store.

@@ -11,10 +11,14 @@ exact-substring + tight semantic paraphrase with a negation guard) drops repeats
 they don't pile up; deeper semantic consolidation is the cron agent's job.
 
     python3 hooks/mem_extract.py --selfcheck   # pure-logic checks, no DB
+
+Exit status: 0 when every pending transcript it reached was processed or legitimately skipped;
+1 when anything failed (a write, a duplicate check, an extraction) -- those transcripts stay
+queued for the next run; 2 when MEM_AUTHOR is unset or invalid (nothing is attempted).
 """
 import json, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _mem_common import mem_ops, defang, acquire_lock, release_lock
+from _mem_common import mem_ops, defang, acquire_lock, release_lock, identity
 from _llm import complete
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ingest"))
 from _redact import scrub
@@ -51,6 +55,58 @@ the transcript; if there is nothing to extract, return []. "type" must be exactl
 Output must parse with a strict JSON parser."""
 
 
+# Memory this system injected earlier (profile, recall, the outage notes), removed in code
+# before the model sees the transcript: the prompt's "ignore them" is a request, and an agent's
+# paraphrase of recalled memory is new text that reads as new knowledge, so the store re-learned
+# its own output.
+#
+# Only blocks in the exact shape _mem_common.fence() emits are removed: an opening tag with
+# `nonce=<hex>` and the closing tag of the SAME kind and nonce. A looser pattern did damage both
+# ways -- a block with another block nested in it ended at the inner close and left the rest of
+# the outer one behind, and a person merely mentioning the tag lost the remainder of their
+# message. A fence's body cannot forge a tag (fence() defangs `<personal-memory`), but quoted
+# output can contain anything, so the pairing is one linear pass over the tags with a stack,
+# not a regex: each close pairs with the innermost open of its kind and nonce (blocks nested
+# even under a REUSED nonce go whole, and nothing between their closes leaks), a close that
+# nothing opened is dropped, and the first opening tag still unpaired at the end -- a turn cut
+# mid-block -- truncates the turn there. A regex retrying from every opening tag was quadratic
+# in their number. A tag without a nonce is not our output and stays as written.
+_FENCE_TAG = re.compile(r"<(/?)personal-memory-([A-Za-z0-9_-]+) nonce=([0-9a-f]{4,64})>")
+
+
+def strip_memory_blocks(text):
+    """Remove fence()-shaped memory blocks from ONE turn's text (see above). Linear time."""
+    text = text or ""
+    stack, where, cut = [], {}, []    # open tags (key, start); key -> stack indexes; drop spans
+    for tag in _FENCE_TAG.finditer(text):
+        key = (tag.group(2), tag.group(3))
+        if not tag.group(1):
+            where.setdefault(key, []).append(len(stack))
+            stack.append((key, tag.start()))
+            continue
+        if not where.get(key):
+            cut.append((tag.start(), tag.end()))          # a close nothing opened
+            continue
+        depth = where[key][-1]
+        opened_at = stack[depth][1]
+        while len(stack) > depth:                         # each tag is popped at most once
+            popped, _ = stack.pop()
+            where[popped].pop()
+        cut.append((opened_at, tag.end()))
+    end = stack[0][1] if stack else len(text)             # first open never closed: cut there
+    out, pos = [], 0
+    for start, stop in sorted(cut):
+        if start >= end:
+            break
+        if start < pos:                                   # inside a span already dropped
+            continue
+        out.append(text[pos:start])
+        out.append(" ")
+        pos = stop
+    out.append(text[pos:end])
+    return "".join(out)
+
+
 def transcript_text(path):
     """User+assistant text turns from a Claude Code transcript JSONL.
 
@@ -77,7 +133,8 @@ def transcript_text(path):
                 else:
                     txt = " ".join(b.get("text", "") for b in (content or [])
                                    if isinstance(b, dict) and b.get("type") == "text")
-                txt = txt.strip()
+                # Before the per-turn cut, so a block is never half-removed by it.
+                txt = strip_memory_blocks(txt).strip()
                 if txt:
                     out.append(f"[{role}] {txt[:2000]}")
     except OSError:
@@ -147,25 +204,44 @@ def _salient_differs(a, b):
     return bool(sa ^ sb)
 
 
+class DuplicateCheckFailed(RuntimeError):
+    """The novelty gate could not ask the store. NOT the same as "not a duplicate": writing
+    anyway would re-store whatever the gate exists to stop, so the item is skipped and the
+    transcript stays queued."""
+
+
 def is_duplicate(content):
     cand = content.strip().lower()
     if not cand:
         return False
     # (1) conservative exact-substring vs the top-5 candidates (not just #1): catches an exact
-    # repeat even when it isn't the single closest hit.
-    out = mem_ops("search", {"query": content[:400], "k": 5}, timeout=15) or ""
-    for line in out.strip().splitlines():
-        if ") " not in line:
-            continue
-        existing = line.split(") ", 1)[-1].strip().lower()
+    # repeat even when it isn't the single closest hit. JSON, not the human-readable lines, and
+    # track_access=false: a probe is not a recall, and counting it as one "refreshed" every row
+    # near each extracted item, so the stale audit never saw them.
+    out = mem_ops("search", {"query": content[:400], "k": 5, "format": "json",
+                             "track_access": False}, timeout=15)
+    if out is None:
+        raise DuplicateCheckFailed("search failed")
+    try:
+        rows = json.loads(out)
+    except ValueError as exc:
+        raise DuplicateCheckFailed(f"unreadable search answer: {exc}")
+    if not isinstance(rows, list):
+        raise DuplicateCheckFailed("search answer is not a list")
+    for row in rows:
+        existing = str((row or {}).get("content") or "").strip().lower()
         if existing and (cand in existing or existing in cand):
             return True
     # (2) tight semantic paraphrase, with the negation guard.
     near = mem_ops("nearest", {"content": content[:400]}, timeout=15)
+    if near is None:
+        raise DuplicateCheckFailed("nearest failed")
     try:
-        hit = json.loads(near) if near else {}
-    except Exception:
-        hit = {}
+        hit = json.loads(near) if near.strip() else {}
+    except ValueError as exc:
+        raise DuplicateCheckFailed(f"unreadable nearest answer: {exc}")
+    if not isinstance(hit, dict):
+        raise DuplicateCheckFailed("nearest answer is not an object")
     near_txt = hit.get("content") or ""
     if hit and hit.get("distance", 1.0) < NOVELTY_MAXDIST \
             and not _neg_differs(cand, near_txt.lower()) \
@@ -192,13 +268,20 @@ def done_key(tp):
 def main():
     dry = "--dry-run" in sys.argv
     limit = int(sys.argv[sys.argv.index("--limit") + 1]) if "--limit" in sys.argv else 20
+    if not identity():
+        # Every write would be refused, each transcript would count as failed, and the queue
+        # would be re-read on every run with nothing to show for it. Say so once, up front.
+        print("refusing to start: MEM_AUTHOR is unset or invalid -- set it to the author these "
+              "transcripts belong to", file=sys.stderr)
+        return 2
+    run_failures = 0
 
     # Atomic PID lock: exists-then-create let two launches (a timer and a manual run) both
     # enter and extract the same transcripts twice. A killed run must not deadlock the extractor
     # either -- acquire_lock recovers a dead owner, and any lock older than 2h.
     if not acquire_lock(LOCK):
         print("another extract run holds the lock; exiting")
-        return
+        return 0
     try:
         done = set()
         if os.path.exists(DONE):
@@ -243,11 +326,18 @@ def main():
             try:
                 items = extract(text)
             except Exception as e:
+                run_failures += 1
                 print(f"  extract FAILED (will retry next run): {tp}: {e}")
                 continue
             saved, failed = 0, 0
             for it in items:
-                if is_duplicate(it["content"]):
+                try:
+                    duplicate = is_duplicate(it["content"])
+                except DuplicateCheckFailed as exc:
+                    failed += 1
+                    print(f"  duplicate check FAILED ({exc}), not written: {it['content'][:80]}")
+                    continue
+                if duplicate:
                     print(f"  dup, skip: {it['content'][:80]}")
                     continue
                 if dry:
@@ -265,10 +355,15 @@ def main():
                                "channel": "extractor",
                                "session_id": rec.get("session_id"),
                                "excerpt": f"session {rec.get('ts')} cwd={rec.get('cwd')}"},
+                    "format": "json",
                 }, timeout=30)
-                if r:
+                try:
+                    new_id = int(json.loads(r)["id"]) if r else None
+                except (ValueError, KeyError, TypeError):
+                    new_id = None
+                if new_id:
                     saved += 1
-                    print(f"  {r.strip()}: {it['content'][:90]}")
+                    print(f"  saved [#{new_id}]: {it['content'][:90]}")
                 else:
                     failed += 1
                     print(f"  write FAILED (will retry): {it['content'][:80]}")
@@ -279,9 +374,14 @@ def main():
                 with open(DONE, "a", encoding="utf-8") as f:
                     f.write(done_key(tp) + "\n")
             elif failed:
-                print(f"  NOT marking done -- {failed} write(s) failed, will retry next run")
+                run_failures += 1
+                print(f"  NOT marking done -- {failed} item(s) failed, will retry next run")
     finally:
         release_lock(LOCK)
+    if run_failures:
+        print(f"WARNING: {run_failures} transcript(s) failed and stay queued")
+        return 1
+    return 0
 
 
 def _selfcheck():
@@ -292,6 +392,20 @@ def _selfcheck():
     assert not _neg_differs("owner prefers zed", "the owner likes zed")
     assert not _neg_differs("both say no here", "no also here")
     assert 0.0 < NOVELTY_MAXDIST < 0.5
+    fenced = ("before <personal-memory-recall nonce=ab12>\nold fact\n"
+              "</personal-memory-recall nonce=ab12> after "
+              "<personal-memory-down nonce=99ff>cut mid-block")
+    stripped = strip_memory_blocks(fenced)
+    assert "old fact" not in stripped and "personal-memory" not in stripped, stripped
+    assert "before" in stripped and "after" in stripped and "cut mid" not in stripped
+    nested = ("<personal-memory-recall nonce=aa11><personal-memory-x nonce=bb22>inner"
+              "</personal-memory-x nonce=bb22>SECRET</personal-memory-recall nonce=aa11> kept")
+    assert strip_memory_blocks(nested).strip() == "kept", strip_memory_blocks(nested)
+    mention = "Explain the literal tag <personal-memory-recall> and preserve this normal request."
+    assert strip_memory_blocks(mention) == mention
+    reused = ("<personal-memory-recall nonce=aa11><personal-memory-recall nonce=aa11>x"
+              "</personal-memory-recall nonce=aa11>LEAK</personal-memory-recall nonce=aa11> tail")
+    assert strip_memory_blocks(reused).split() == ["tail"], strip_memory_blocks(reused)
     print("ok")
 
 
@@ -299,4 +413,4 @@ if __name__ == "__main__":
     if "--selfcheck" in sys.argv:
         _selfcheck()
     else:
-        main()
+        sys.exit(main())

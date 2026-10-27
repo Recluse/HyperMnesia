@@ -8,13 +8,19 @@ canonical failure). Run daily from cron or a user-level scheduler.
 1. Find groups of similar ACTIVE memories (pairwise cosine over mem embeddings, SQL).
 2. the LLM decides per group: keep | merge (one canonical text) |
    supersede (one member is the current truth, others outdated).
-3. Apply: merged/current memory written via mem_ops (source_type=consolidation),
-   losers marked superseded via mem_ops mark. Profile cache invalidated.
-Lock-serialized, small blast radius: touches only groups the LLM ruled on.
+3. Apply: a confident verdict goes to `mem_ops apply_verdict`, which runs the SAME code as
+   review approval (apply_proposal) in one transaction -- scope and project from the group,
+   cross-author refusal, summarizes edges, merged_from, the shared perspective, and every
+   member retired or nothing changed. Below the threshold it is queued for review instead.
+   Profile cache invalidated.
+Lock-serialized, small blast radius: touches only groups the LLM ruled on, only the running
+author's own explicit memories (no other author's rows, no Dreamer conclusions, no pages).
+Refuses to start without a valid MEM_AUTHOR.
 """
 import json, math, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _mem_common import mem_ops, psql, defang, acquire_lock, release_lock, profile_cache_path
+from _mem_common import (mem_ops, psql, defang, acquire_lock, release_lock, profile_cache_path,
+                         identity)
 from _llm import complete
 
 LOCK = os.path.expanduser("~/.claude/mem-consolidate.lock")
@@ -36,13 +42,20 @@ MAX_GROUP = int(os.environ.get("MEM_CONSOLIDATE_MAX_GROUP", "6"))
 # blocks on a hundred of them.
 MAX_GROUPS_PER_RUN = int(os.environ.get("MEM_CONSOLIDATE_MAX_GROUPS", "10"))
 
+# Own rows only: everything the reader can SEE includes other authors' shared rows, and a group
+# holding one of those can only be refused at apply time -- an LLM call spent on a verdict that
+# could never land. Explicit rows only: pages are syntheses of their sources, and a Dreamer
+# conclusion merged into its own premise came back as an "explicit fact" with no evidence.
 GROUPS_SQL = f"""
 SELECT a.id, b.id, round((a.embedding <=> b.embedding)::numeric, 3)
 FROM mem.active_memories a
 JOIN mem.active_memories b ON b.id > a.id
 WHERE a.embedding IS NOT NULL AND b.embedding IS NOT NULL
-  AND (a.metadata->>'kind') IS DISTINCT FROM 'page'   -- pages are syntheses of their sources:
-  AND (b.metadata->>'kind') IS DISTINCT FROM 'page'   -- never merge a page with what it summarizes
+  AND a.author = mem.reader() AND b.author = mem.reader()
+  AND (a.metadata->>'kind') IS DISTINCT FROM 'page'
+  AND (b.metadata->>'kind') IS DISTINCT FROM 'page'
+  AND coalesce(a.metadata->>'reasoning_level','explicit') = 'explicit'
+  AND coalesce(b.metadata->>'reasoning_level','explicit') = 'explicit'
   AND a.embedding <=> b.embedding < {SIM_DIST}
 ORDER BY a.embedding <=> b.embedding;
 """
@@ -64,23 +77,30 @@ REVIEW_THRESHOLD = float(os.environ.get("MEM_REVIEW_THRESHOLD", "0.8"))  # below
 
 
 def load_memory(mid):
-    out = mem_ops("get", {"id": mid}, timeout=20) or ""
-    return out.strip().splitlines()[0] if out.strip() else None
+    """The member as the model sees it, built from mem_ops' JSON -- never parsed from text."""
+    out = mem_ops("get", {"id": mid, "format": "json"}, timeout=20)
+    try:
+        row = json.loads(out) if out else None
+    except ValueError:
+        row = None
+    if not isinstance(row, dict) or row.get("status") != "active":
+        return None
+    # The project is shown to the model for context only. It is not read back: the scope and
+    # project of a merged row come from the group, in apply_proposal.
+    proj = f" @{row['project']}" if row.get("project") else ""
+    return f"[#{row['id']}] ({row['type']}{proj}) {defang(row.get('content') or '')}"
 
 
-def group_project(lines):
-    """The project every member shares, or None if they disagree.
-
-    A merge that forgets it moves the replacement into the unscoped bucket: the fact survives,
-    and every search scoped to that project stops finding it. Silent, and invisible in the
-    counts unless you go looking -- which is how the first ten merges lost eight tags.
-    """
-    seen = set()
-    for l in lines:
-        # "[#123] (type imp=0.7 @project, date) text"  -- the tag is optional
-        head = l.split(")", 1)[0]
-        seen.add(head.split("@", 1)[1].split(",")[0].strip() if "@" in head else None)
-    return seen.pop() if len(seen) == 1 else None
+def apply_verdict(action, members, verdict):
+    """Apply a confident verdict through mem_ops' one merge path. Returns the JSON result, or
+    None when the call itself failed (store down, a crash) -- which the caller reports."""
+    out = mem_ops("apply_verdict", {"action": action, "member_ids": members,
+                                    "proposal": verdict, "format": "json"}, timeout=60)
+    try:
+        result = json.loads(out) if out else None
+    except ValueError:
+        return None
+    return result if isinstance(result, dict) and "applied" in result else None
 
 
 def decide(group_lines):
@@ -148,6 +168,12 @@ def candidate_groups(pairs, max_size=None):
 
 def main():
     dry = "--dry-run" in sys.argv
+    if not identity():
+        # Without an identity the reader sees only what other people shared, and every apply
+        # is refused. Running anyway would spend model calls to produce nothing but refusals.
+        print("refusing to start: MEM_AUTHOR is unset or invalid -- set it to the author whose "
+              "memories this pass consolidates", file=sys.stderr)
+        return 2
     # Atomic PID lock (exists-then-create let two launches both enter); see acquire_lock.
     if not acquire_lock(LOCK):
         print("another consolidate run holds the lock; exiting")
@@ -156,7 +182,7 @@ def main():
         raw = psql(GROUPS_SQL, timeout=30)
         if raw is None:
             print("database unreachable; exiting")
-            return
+            return 1
         pairs = []
         for line in raw.strip().splitlines():
             a, b, d = line.split("|")
@@ -176,9 +202,13 @@ def main():
             print(f"{total} similar group(s) to review")
         changed = False
         failed = 0
+        apply_failed = 0
         for g in groups:
             lines = [l for l in (load_memory(m) for m in g) if l]
-            if len(lines) < 2:
+            if len(lines) != len(g):
+                # A verdict applies to every member, so the model must have seen every member.
+                print(f"  group {g}: {len(g) - len(lines)} member(s) could not be read -- "
+                      f"skipped")
                 continue
             if dry and os.environ.get("MEM_CONSOLIDATE_DRY_VERDICTS", "") not in ("1", "true"):
                 # The point of a dry run is to see WHAT would be reviewed. Asking the model
@@ -219,46 +249,30 @@ def main():
                 conf = 0.0
             if not math.isfinite(conf):     # NaN/inf must NOT sneak past the gate (nan<0.8 is False)
                 conf = 0.0
+            if action not in ("merge", "supersede"):
+                print(f"    unknown action {action!r} -- left untouched")
+                continue
+            # The model's text is untrusted: defanged before it is queued or written. Which
+            # project and audience the result gets is NOT taken from it (apply_proposal).
+            proposal = {k: verdict[k] for k in ("content", "type", "importance", "winner_id")
+                        if k in verdict}
+            if isinstance(proposal.get("content"), str):
+                proposal["content"] = defang(proposal["content"])
             if conf < REVIEW_THRESHOLD:
                 r = mem_ops("review_add", {"action": action, "member_ids": g,
-                            "proposal": verdict, "confidence": conf}, timeout=30)
+                            "proposal": proposal, "confidence": conf}, timeout=30)
                 print(f"    low-confidence ({conf:.2f}) -> queued for review: {r and r.strip()}")
                 continue  # no mutation -> profile cache stays valid
-            if action == "merge" and verdict.get("content"):
-                payload = {
-                    "type": verdict.get("type", "semantic"),
-                    "content": defang(verdict["content"]),       # untrusted model output
-                    "importance": min(0.7, max(0.0, float(verdict.get("importance", 0.6)))),
-                    "source": {"source_type": "consolidation", "channel": "consolidator",
-                               "excerpt": f"merged from {g}"}}
-                # The verdict may name a project (the members disagreed and a human settled it);
-                # otherwise inherit the one they all share. Never invent one.
-                project = verdict.get("project") or group_project(lines)
-                if project:
-                    payload["project"] = project
-                r = mem_ops("write", payload, timeout=30)
-                # NEVER hide the originals unless the replacement actually landed -- a failed
-                # write (embedder/DB hiccup) would otherwise silently drop the whole group.
-                if not (r and "saved" in r):
-                    print(f"    merge write FAILED, keeping originals intact: {r!r}")
-                    continue
-                print(f"    {r.strip()}")
-                # link every loser to the replacement, so "what displaced this fact" stays
-                # answerable; the merge path never sets supersedes_id (separate write + mark).
-                try:
-                    new_id = int(r.split("[#", 1)[1].split("]", 1)[0])
-                except (IndexError, ValueError):
-                    new_id = None
-                for m in g:
-                    mem_ops("mark", {"id": m, "status": "superseded", "by": new_id}, timeout=20)
-                changed = True
-            elif action == "supersede" and verdict.get("winner_id") in g:
-                for m in g:
-                    if m != verdict["winner_id"]:
-                        mem_ops("mark", {"id": m, "status": "superseded",
-                                         "by": verdict["winner_id"]}, timeout=20)
-                        print(f"    marked #{m} superseded (winner #{verdict['winner_id']})")
-                changed = True
+            result = apply_verdict(action, g, proposal)
+            if result is None:
+                apply_failed += 1
+                print("    apply FAILED (store error) -- nothing was changed")
+                continue
+            if not result["applied"]:
+                print(f"    refused, nothing changed: {result['message']}")
+                continue
+            print(f"    {result['message']}")
+            changed = True
         if changed and not dry:
             try:
                 os.remove(PROFILE_CACHE)
@@ -270,10 +284,14 @@ def main():
             # "every group examined, nothing to do".
             print(f"WARNING: {failed} group(s) got no verdict from the model -- "
                   f"they were NOT reviewed, not 'kept'")
+        if apply_failed:
+            print(f"WARNING: {apply_failed} confident verdict(s) could not be applied "
+                  f"(store error)")
         print("done" + (" (dry-run)" if dry else ""))
+        return 1 if apply_failed else 0
     finally:
         release_lock(LOCK)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

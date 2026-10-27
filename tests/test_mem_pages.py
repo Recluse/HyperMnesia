@@ -21,6 +21,7 @@ No database is needed: the SQL text and the pure functions are checked.
     python3 tests/test_mem_pages.py
 """
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -57,7 +58,9 @@ def main():
     q = q[:q.index('"""')]
     check("prior pages are selected without LIMIT", "LIMIT" not in q.upper(), q)
     check("extra pages are explicitly superseded", "status='superseded'" in body)
-    check("and their validity window is closed", "valid_to" in body)
+    check("and they are retired in belief time", "retired_at=now()" in body)
+    check("without claiming the facts stopped holding (event time untouched)",
+          "valid_to" not in body[body.index("for extra in prior[1:]"):])
     check("the page write is a trusted internal write", '"_trusted_metadata": True' in body)
 
     print("== page chunking ==")
@@ -124,6 +127,35 @@ def main():
             check("a stock configuration is accepted", False, str(exc))
     finally:
         mem_ops.embed, mem_ops.canon_project = saved
+
+    print("== reflect refuses to run without an author, and reads its write as JSON ==")
+    import contextlib, io
+    rsrc = (ROOT / "hooks/mem_reflect.py").read_text(encoding="utf-8")
+    rns = {"__name__": "mem_reflect_undertest", "__file__": str(ROOT / "hooks/x.py")}
+    exec(compile(rsrc, "mem_reflect", "exec"), rns)
+    called = []
+    rns.update(identity=lambda: None, mem_ops=lambda *a, **k: called.append(a) or None,
+               acquire_lock=lambda path: True, release_lock=lambda path: None)
+    argv, sys.argv = sys.argv, ["mem_reflect.py"]
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = rns["main"]()
+    finally:
+        sys.argv = argv
+    check("no MEM_AUTHOR: exit 2 before any store call", code == 2 and not called,
+          str((code, called)))
+    writes = []
+
+    def fake_ops(cmd, payload, timeout=10):
+        if cmd == "reflect_group":
+            return json.dumps([{"type": "semantic", "content": f"m{i}"} for i in range(6)])
+        writes.append(payload)
+        return json.dumps({"id": 12})
+    rns.update(mem_ops=fake_ops, complete=lambda prompt, text: "## Page\nbody")
+    with contextlib.redirect_stdout(io.StringIO()):
+        ok = rns["reflect_one"]("demo", False)
+    check("page_upsert is asked for JSON and its id is what counts",
+          ok is True and writes and writes[0].get("format") == "json", str(writes))
 
     print(f"\n{ran - len(failures)}/{ran} checks passed"
           + (f"; FAILED: {', '.join(failures)}" if failures else ""))

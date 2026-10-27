@@ -124,23 +124,47 @@ infra = ("project", "repository", "infra", [])
 
 
 class MergeCursor:
-    def __init__(self, pairs):
+    def __init__(self, pairs, refuse_retire=(), layered=(), authors=("alice",), changed=()):
         self.pairs = pairs
+        self.changed = set(changed)
+        self.locked = []
+        self.refuse_retire = set(refuse_retire)
+        self.layered = list(layered)
+        self.authors = list(authors)
+        self.savepoints = []
+        self.retired = []
 
     def execute(self, sql, params=None):
         self.row, self.rows = None, []
-        if "SELECT count(*) FROM mem.active_memories" in sql:
-            self.row = (2,)
+        if sql.startswith(("SAVEPOINT", "RELEASE SAVEPOINT", "ROLLBACK TO SAVEPOINT")):
+            self.savepoints.append(sql.split(" hm_")[0])
+        elif "SELECT count(*) FROM mem.active_memories" in sql:
+            self.row = (len(params[0]),)
         elif "SELECT DISTINCT author" in sql:
-            self.rows = [("alice",)]
+            self.rows = [(a,) for a in self.authors]
+        elif "coalesce(metadata->>'reasoning_level','explicit') <> 'explicit'" in sql:
+            self.rows = [(m,) for m in self.layered]
+        elif "ORDER BY id FOR NO KEY UPDATE" in sql:
+            self.locked = list(params[0])
+            self.rows = [(m, "superseded" if m in self.changed else "active", self.authors[0])
+                         for m in params[0]]
         elif "SELECT DISTINCT m.observer_entity_id" in sql:
             self.rows = [(10 + i, 20 + i) + o + d for i, (o, d) in enumerate(self.pairs)]
         elif "SELECT bool_or(scope = 'private')" in sql:
             self.row = (True,)
         elif "SELECT DISTINCT project" in sql:
             self.rows = [("sample-project",)]
-        elif ("UPDATE mem.memories SET status='superseded'" in sql
-              or "lower(btrim(content))" in sql):
+        elif "SELECT min(created_at), max(created_at)" in sql:
+            self.row = ("2026-01-01 00:00:00+00", "2026-02-01 00:00:00+00")
+        elif "UPDATE mem.memories SET status='superseded'" in sql:
+            # Belief time only: a merge must not claim the fact stopped holding today.
+            assert "retired_at=now()" in sql and "valid_to" not in sql, sql
+            assert "author=%s" in sql and "RETURNING id" in sql, sql
+            member = params[1]
+            if member not in self.refuse_retire:
+                self.retired.append(member)
+                self.row = (member,)
+        elif "lower(btrim(content))" in sql:
             pass
         else:
             raise AssertionError(sql)
@@ -163,11 +187,62 @@ try:
     assert merged["observer"]["name"] == "alice" and merged["observed"]["name"] == "infra"
     assert merged["_trusted_metadata"] is True and merged["metadata"]["merged_from"] == [1, 2]
 
+    assert merged["scope"] == "private", merged["scope"]     # any private member -> private
+    assert merged["metadata"]["merged_created_range"] == [
+        "2026-01-01 00:00:00+00", "2026-02-01 00:00:00+00"]
+    assert [e["relation"] for e in merged["evidence"]] == ["summarizes", "summarizes"]
+
     mem_ops.apply_proposal(MergeCursor([(alice, infra), (alice, alice)]), "merge", [1, 2],
                            {"content": "the merged fact"}, who="alice")
     merged = written[-1]
     assert "observer" not in merged and "observed" not in merged
     assert {"observer": "alice", "observed": "infra"} in merged["metadata"]["merged_perspectives"]
+
+    # R1: one member that cannot be retired aborts the WHOLE verdict -- rolled back to the
+    # savepoint, so the replacement written a moment earlier goes with it.
+    cur = MergeCursor([(alice, infra)], refuse_retire={2})
+    res = mem_ops.apply_proposal_result(cur, "merge", [1, 2], {"content": "the merged fact"},
+                                        who="alice")
+    assert res["applied"] is False and "#2 could not be retired" in res["message"], res
+    assert cur.savepoints == ["SAVEPOINT", "ROLLBACK TO SAVEPOINT"], cur.savepoints
+    ok_cur = MergeCursor([(alice, infra)])
+    res = mem_ops.apply_proposal_result(ok_cur, "merge", [1, 2], {"content": "merged"},
+                                        who="alice")
+    assert res["applied"] is True and res["id"] == 77 and ok_cur.retired == [1, 2], res
+    assert ok_cur.savepoints == ["SAVEPOINT", "RELEASE SAVEPOINT"], ok_cur.savepoints
+    # ...and so does a supersede whose loser is no longer the applier's.
+    cur = MergeCursor([(alice, infra)], refuse_retire={1})
+    res = mem_ops.apply_proposal_result(cur, "supersede", [1, 2], {"winner_id": 2},
+                                        who="alice")
+    assert res["applied"] is False and cur.savepoints[-1] == "ROLLBACK TO SAVEPOINT", res
+    res = mem_ops.apply_proposal_result(MergeCursor([(alice, infra)]), "supersede", [1, 2],
+                                        {"winner_id": "2"}, who="alice")
+    assert res["applied"] and res["message"] == "superseded [1] (winner #2)", res
+    # P1: every member -- the winner too -- is locked and rechecked before anything changes. A
+    # concurrent verdict that already retired the winner makes this one a refusal.
+    cur = MergeCursor([(alice, infra)], changed={2})
+    res = mem_ops.apply_proposal_result(cur, "supersede", [1, 2], {"winner_id": 2},
+                                        who="alice")
+    assert res["applied"] is False and "changed while" in res["message"], res
+    assert cur.locked == [1, 2] and cur.retired == [], (cur.locked, cur.retired)
+    # Derived conclusions and pages never take part in a merge.
+    count_before = len(written)
+    res = mem_ops.apply_proposal_result(MergeCursor([(alice, infra)], layered=[2]), "merge",
+                                        [1, 2], {"content": "merged"}, who="alice")
+    assert res["applied"] is False and "derived conclusions or knowledge pages" in res["message"]
+    assert len(written) == count_before, "a refused merge must not write"
+    # Cross-author groups are refused, and so is a group of somebody else's rows.
+    res = mem_ops.apply_proposal_result(MergeCursor([(alice, infra)], authors=("alice", "bob")),
+                                        "merge", [1, 2], {"content": "merged"}, who="alice")
+    assert res["applied"] is False and "alice, bob" in res["message"], res
+    res = mem_ops.apply_proposal_result(MergeCursor([(alice, infra)], authors=("bob",)),
+                                        "merge", [1, 2], {"content": "merged"}, who="alice")
+    assert res["applied"] is False and "belong to bob" in res["message"], res
+    # A model-chosen type outside the five is refused rather than reaching the enum cast.
+    res = mem_ops.apply_proposal_result(MergeCursor([(alice, infra)]), "merge", [1, 2],
+                                        {"content": "merged", "type": "summary-ish"},
+                                        who="alice")
+    assert res["applied"] is False and "unknown type" in res["message"], res
 
     # The Dreamer approval path is trusted too: its reasoning level must survive do_write.
     mem_ops.apply_proposal(MergeCursor([(alice, infra)]), "derive", [1, 2], {
