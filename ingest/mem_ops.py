@@ -425,7 +425,10 @@ def do_write(cur, p, supersedes_id=None):
         # only when the caller said when the new fact took over: a correction without a
         # valid_from says "I was wrong", not "it stopped being true today". LEAST, not
         # COALESCE: a pre-existing later valid_to is clamped down to the stated instant.
-        cur.execute("""UPDATE mem.memories SET status='superseded', retired_at=now(),
+        # clock_timestamp(), not now(): now() is when this transaction BEGAN, which can
+        # precede a reactivation committed while it waited on embedding or on the row lock --
+        # and a retirement stamped before that reactivation hides it from as_of for good.
+        cur.execute("""UPDATE mem.memories SET status='superseded', retired_at=clock_timestamp(),
                        valid_to = CASE WHEN %s::timestamptz IS NULL THEN valid_to
                                        ELSE LEAST(COALESCE(valid_to, 'infinity'::timestamptz),
                                                   %s::timestamptz) END
@@ -1223,6 +1226,11 @@ def do_context(cur, p):
 
     evidence_rows = _context_evidence(cur, [r[0] for r in derived_rows],
                                       depth_cfg["evidence_hops"], limit * 2)
+    # Evidence can itself be a conclusion (an explicit row citing one, cited in turn by a
+    # derived row in this context). Checking only the search hits and the derived section let
+    # such a conclusion, with its own premise retracted, arrive -- and be cited -- as evidence.
+    stale |= _stale_derived(cur, [r[0] for r in evidence_rows if r[0] not in stale])
+    evidence_rows = [r for r in evidence_rows if r[0] not in stale]
     all_rows = global_rows + relevant_rows + project_rows + session_rows + derived_rows + evidence_rows
     all_ids = list({r[0] for r in all_rows})
     sources = _context_sources(cur, all_ids)
@@ -1375,7 +1383,7 @@ def do_page_upsert(cur, p):
     # could retire a second author's page for the same project.
     me = (p.get("_identity") or "").strip() or None
     for extra in prior[1:]:
-        cur.execute("""UPDATE mem.memories SET status='superseded', retired_at=now()
+        cur.execute("""UPDATE mem.memories SET status='superseded', retired_at=clock_timestamp()
                        WHERE id=%s AND status='active' AND author = %s""", (extra, me))
     return mid
 
@@ -1601,7 +1609,7 @@ def _retire_members(cur, member_ids, by, author):
     duplicates being merged says nothing about when the fact stopped holding.
     """
     for m in member_ids:
-        cur.execute("UPDATE mem.memories SET status='superseded', retired_at=now(), "
+        cur.execute("UPDATE mem.memories SET status='superseded', retired_at=clock_timestamp(), "
                     "metadata = metadata || jsonb_build_object('superseded_by', %s::bigint) "
                     "WHERE id=%s AND status='active' AND author=%s RETURNING id",
                     (by, m, author))

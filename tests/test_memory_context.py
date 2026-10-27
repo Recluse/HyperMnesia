@@ -449,9 +449,18 @@ def main():
         out = subprocess.run([sys.executable, str(ROOT / "hooks/mem_profile.py")], input=b"{}",
                              capture_output=True, env=env, timeout=30).stdout.decode()
         assert "old derived conclusion" not in out, out
-        cache.write_text("#hypermnesia-profile v2 explicit-only\n[Key facts]\n- current fact")
+        cache.write_text("#hypermnesia-profile v2 explicit-only\n[Key facts]\n- a v2 page")
+        out = profile_out()
+        assert "a v2 page" not in out, out           # v2 could still pin a knowledge page
+        cache.write_text("#hypermnesia-profile v3 explicit-only, no pages\n[Key facts]\n"
+                         "- current fact")
         out = profile_out()
         assert "current fact" in out and "cached copy" in out, out
+        sql = (ROOT / "hooks/mem_profile.py").read_text()
+        for tag in ("#PREF#", "#FACT#", "#PLAN#"):
+            q = sql[sql.index(f"'{tag} '"):]
+            q = q[:q.index(";")]
+            assert "IS DISTINCT FROM 'page'" in q, f"{tag} query admits knowledge pages"
 
     src = (ROOT / "mcp-server/src/main.rs").read_text()
     assert '"name":"memory_context"' in src

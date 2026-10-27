@@ -542,6 +542,58 @@ def main():
         check("a premise deleted outright (its edge cascaded away) still counts as missing",
               not s and not d, f"search={s} derived={d}")
 
+        print("\n== R4b: a stale conclusion does not arrive as evidence either ==")
+        e1 = write(ac, alice, type="semantic", content="orchard trees are pruned in march")
+        e2 = write(ac, alice, type="semantic", content="orchard pruning needs dry weather")
+        inner = m.apply_proposal_result(ac, "derive", [e1, e2], {
+            "reasoning_level": "inductive", "confidence": 0.8, "importance": 0.5,
+            "content": "orchard pruning is a dry-march job"}, who="alice")
+        f1 = write(ac, alice, type="semantic", content="orchard ladders are stored in the barn")
+        f2 = write(ac, alice, type="semantic", content="orchard ladders are checked yearly")
+        outer = m.apply_proposal_result(ac, "derive", [f1, f2], {
+            "reasoning_level": "inductive", "confidence": 0.8, "importance": 0.5,
+            "content": "orchard ladders are barn-kept and yearly checked"}, who="alice")
+        alice.commit()
+        check("(both conclusions approved)", inner["applied"] and outer["applied"])
+        # The inner conclusion supports the outer one: it is reachable as EVIDENCE.
+        owner_sql("INSERT INTO mem.derivations (author, evidence_memory_id, derived_memory_id, "
+                  "relation) VALUES ('alice', %s, %s, 'supports')", (inner["id"], outer["id"]))
+        m.do_write(ac, {"_identity": "alice", "content": "orchard trees are pruned in april",
+                        "project": P1}, supersedes_id=e1)
+        alice.commit()
+        ctx = m.do_context(ac, {"query": "orchard ladders", "project": P1, "depth": "max",
+                                "token_budget": 8192})
+        alice.commit()
+        ev = [x["id"] for sec in ctx["sections"] if sec["name"] == "evidence"
+              for x in sec["items"]]
+        check("a conclusion whose premise was retracted is not served as evidence",
+              inner["id"] not in ev, str(ev))
+        check("and is named in stale_premises",
+              inner["id"] in ctx["scope"].get("stale_premises", []), str(ctx["scope"]))
+
+        print("\n== R4c: retirement is stamped when it happens, not when the transaction began ==")
+        old_row = write(ac, alice, type="semantic", content="lamp bulbs are warm white")
+        ac.execute("SELECT now()")
+        began = ac.fetchone()[0]
+        ac.execute("SELECT pg_sleep(0.3)")
+        m.do_write(ac, {"_identity": "alice", "content": "lamp bulbs are cool white",
+                        "project": P1}, supersedes_id=old_row)
+        alice.commit()
+        lag = (row(old_row)[5] - began).total_seconds()
+        check("supersede stamps retired_at after the transaction's own start", lag >= 0.3,
+              f"{lag:.3f}s")
+        g1 = write(ac, alice, type="semantic", content="kettle descaling is monthly")
+        g2 = write(ac, alice, type="semantic", content="kettle descaling happens each month")
+        ac.execute("SELECT now()")
+        began = ac.fetchone()[0]
+        ac.execute("SELECT pg_sleep(0.3)")
+        res = m.apply_proposal_result(ac, "merge", [g1, g2],
+                                      {"content": "kettle descaling is monthly",
+                                       "type": "semantic"}, who="alice", channel="consolidator")
+        alice.commit()
+        lag = min((row(g)[5] - began).total_seconds() for g in (g1, g2)) if res["applied"] else -1
+        check("and so does a merge", lag >= 0.3, f"{lag:.3f}s {res['message']}")
+
         print("\n== the pinned profile holds explicit rows only ==")
         q1 = write(ac, alice, type="semantic", content="printer jams on thick paper")
         q2 = write(ac, alice, type="semantic", content="printer jams when the tray is full")
@@ -566,6 +618,17 @@ def main():
               prof.stderr.decode()[-300:])
         check("a conclusion is not, whatever its importance",
               not any(l.split("|")[0].endswith(f" {concl}") for l in lines), str(lines[:12]))
+        page = write(ac, alice, type="semantic", content="kernel page: everything about builds",
+                     importance=0.95)
+        # `kind` is reserved metadata that only reflect's in-process path may set.
+        owner_sql("UPDATE mem.memories SET metadata = metadata || '{\"kind\":\"page\"}' "
+                  "WHERE id=%s", (page,))
+        prof = subprocess.run(["psql", DATABASE_URL, "-tAX", "-v", "ON_ERROR_STOP=1"],
+                              input=mem_profile.SQL.encode(), capture_output=True, timeout=60,
+                              env={**os.environ, "PGOPTIONS": "-c mem.reader=alice"})
+        lines = prof.stdout.decode().splitlines()
+        check("nor is a knowledge page (a synthesis, possibly of conclusions)",
+              not any(l.split("|")[0].endswith(f" {page}") for l in lines), str(lines[:12]))
 
         print("\n== R7: the novelty gate looks without recalling ==")
         probe = write(ac, alice, type="semantic", content="editor theme is dark")
