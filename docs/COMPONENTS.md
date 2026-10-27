@@ -22,22 +22,15 @@ docker run -d --name hypermnesia-postgres \
   pgvector/pgvector:0.8.5-pg16
 ```
 
-Wait for `pg_isready`, then apply the schema in order. Every call uses `ON_ERROR_STOP` so a
-partially loaded schema cannot look successful.
+Wait for `pg_isready`, then apply the schema. `./hm migrate` holds the one apply order
+(`./hm migrate --list`), runs every file with `ON_ERROR_STOP`, records each one's checksum in
+`hm_schema_migrations`, skips what is already applied and refuses to continue when an applied
+file has changed.
 
 ```bash
 export DATABASE_URL="postgresql://hm:$POSTGRES_PASSWORD@127.0.0.1:5432/hypermnesia"
 cd /opt/hypermnesia
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -v owner="$(id -un)" \
-  -f sql/schema.sql \
-  -f sql/schema_mem.sql \
-  -f sql/mem_multiuser.sql \
-  -f sql/migrate_entity_ownership.sql \
-  -f sql/migrate_memory_perspectives.sql \
-  -f sql/migrate_memory_evidence.sql \
-  -f sql/migrate_peer_cards.sql \
-  -f sql/migrate_dreamer.sql \
-  -f sql/mem_app_role.sql
+./hm migrate --owner "$(id -un)"
 ```
 
 Check it:
@@ -47,8 +40,10 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c \
   "select extversion from pg_extension where extname = 'vector'"
 ```
 
-For multiple users, finish the scoped application-role setup in
-[INSTALL.md#two-people-one-store](INSTALL.md#two-people-one-store) before writing memories.
+For multiple users, choose between the shared `hm_app` login (row-level security filters, it
+does not tell people apart) and one login per author (`./hm author add`, enforced by the
+database) in [INSTALL.md#two-people-one-store](INSTALL.md#two-people-one-store) before writing
+memories.
 
 ## 2. Embedder: Ollama
 

@@ -12,6 +12,11 @@ No embedder is needed: pgvector takes a literal vector, so the test writes its o
 point -- it isolates the SQL and the view from the model.
 
     DATABASE_URL=postgresql://... python3 tests/test_memory_sql.py
+    DATABASE_URL=... HM_APP_URL=postgresql://hm_app:...@.../... python3 tests/test_memory_sql.py
+
+With HM_APP_URL set, the whole contract runs a second time as the application role, which is
+the one row-level security binds. As the owner alone it proves the views and nothing about the
+policies: the owner bypasses them.
 """
 import os
 import shutil
@@ -22,6 +27,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "ingest"))
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://hm:hm@localhost:5432/hypermnesia")
+APP_URL = os.environ.get("HM_APP_URL", "")
+URL = DATABASE_URL       # the connection the current pass runs as; see __main__
 DIM = 1024
 
 failures, ran = [], 0
@@ -40,7 +47,7 @@ def psql(sql):
     # it queries the RLS-aware views, so the SQL contract must do the same on every call.
     env = {**os.environ, "PGOPTIONS": "-c mem.reader=ci"}
     try:
-        p = subprocess.run(["psql", DATABASE_URL, "-tAX", "-v", "ON_ERROR_STOP=1"],
+        p = subprocess.run(["psql", URL, "-tAX", "-v", "ON_ERROR_STOP=1"],
                            input=sql.encode(), capture_output=True, timeout=60, env=env)
     except FileNotFoundError:
         # Say which of the two it is. A stack trace ending in FileNotFoundError reads like a
@@ -114,8 +121,6 @@ def main():
     check("the test cleans up after itself",
           psql("SELECT count(*) FROM mem.memories WHERE (metadata->>'sqltest')='true';") == "0")
 
-    print(f"\n{ran - len(failures)}/{ran} checks passed"
-          + (f"; FAILED: {', '.join(failures)}" if failures else ""))
     return 1 if failures else 0
 
 
@@ -131,13 +136,14 @@ def unavailable():
         return "psql is not on PATH"
     if not os.environ.get("DATABASE_URL"):
         return "DATABASE_URL is not set"
-    try:
-        p = subprocess.run(["psql", DATABASE_URL, "-tAX", "-c", "SELECT 1"],
-                           capture_output=True, timeout=15)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return f"psql could not run ({exc})"
-    if p.returncode != 0:
-        return f"the database did not answer: {p.stderr.decode(errors='replace').strip()}"
+    for url in [DATABASE_URL] + ([APP_URL] if APP_URL else []):
+        try:
+            p = subprocess.run(["psql", url, "-tAX", "-c", "SELECT 1"],
+                               capture_output=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return f"psql could not run ({exc})"
+        if p.returncode != 0:
+            return f"the database did not answer: {p.stderr.decode(errors='replace').strip()}"
     return None
 
 
@@ -148,4 +154,13 @@ if __name__ == "__main__":
             sys.exit(f"FAIL: {reason} -- CI provides a database for this test")
         print(f"SKIP: {reason}; this test needs a live database (set DATABASE_URL)")
         sys.exit(0)
-    sys.exit(main())
+    if os.environ.get("CI") and not APP_URL:
+        sys.exit("FAIL: HM_APP_URL is not set -- under CI the contract must also run as hm_app")
+    passes = [("the owner", DATABASE_URL)] + ([("hm_app", APP_URL)] if APP_URL else [])
+    for label, url in passes:
+        print(f"\n#### as {label} ####")
+        URL = url
+        main()
+    print(f"\n{ran - len(failures)}/{ran} checks passed"
+          + (f"; FAILED: {', '.join(failures)}" if failures else ""))
+    sys.exit(1 if failures else 0)

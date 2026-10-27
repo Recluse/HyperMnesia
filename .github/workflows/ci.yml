@@ -68,7 +68,7 @@ jobs:
         run: python tests/test_mem_pages.py
       # Four modules ship an executable self-check and only one of them was run. For each of
       # the three below, that self-check is the ONLY automated coverage its behaviour has:
-      # Tier-1 selection (longest-match order, 1-hop propagation, cross-repo isolation),
+      # Tier-1 selection (specificity order, 1-hop propagation, cross-repo isolation),
       # secret redaction, and the novelty gate with its negation guard. A change that leaked
       # another repo's constraints or broke a redaction pattern passed everything else green.
       - name: Tier-1 selection (1-hop propagation and cross-repo isolation)
@@ -140,17 +140,21 @@ jobs:
       PGPASSWORD: hm
     steps:
       - uses: actions/checkout@v4
-      - name: Load schemas
+      # The one apply order lives in ./hm; nothing here keeps a copy of it. Twice, because the
+      # second run is the claim: every file recorded with its checksum, nothing re-applied.
+      - name: Migrate (hm migrate) -- and again, which must be a no-op
+        env:
+          DATABASE_URL: postgresql://hm:hm@localhost:5432/hypermnesia
         run: |
-          psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -f sql/schema.sql
-          psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -f sql/schema_mem.sql
-          psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -f sql/mem_multiuser.sql
-          psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -v owner=ci -f sql/migrate_entity_ownership.sql
-          psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -f sql/migrate_memory_perspectives.sql
-          psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -f sql/migrate_memory_evidence.sql
-          psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -f sql/migrate_peer_cards.sql
-          psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -f sql/migrate_dreamer.sql
-          psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -f sql/mem_app_role.sql
+          ./hm migrate --owner ci
+          second=$(./hm migrate --owner ci)
+          echo "$second"
+          echo "$second" | grep -q "nothing to apply"
+      # The application role gets a password only here, in a throwaway database. Everything
+      # below that claims something about isolation connects AS hm_app or as a per-author
+      # login: the owner bypasses every policy, so a check run as the owner proves nothing.
+      - name: Give hm_app a password for the live tests
+        run: psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -c "ALTER ROLE hm_app PASSWORD 'hm_app'"
       - name: Load the example seed + assert Tier-1 resolves
         run: |
           psql -h localhost -U hm -d hypermnesia -v ON_ERROR_STOP=1 -f examples/seed_example.sql
@@ -174,4 +178,23 @@ jobs:
       - name: Memory SQL contract (the view hides what it promises, the gate abstains)
         env:
           DATABASE_URL: postgresql://hm:hm@localhost:5432/hypermnesia
+          HM_APP_URL: postgresql://hm_app:hm_app@localhost:5432/hypermnesia
         run: python tests/test_memory_sql.py
+      # Two readers on the shared login, two per-author logins that try to read and write as
+      # each other, the definer functions, the author directory, and hm migrate refusing an
+      # edited file.
+      - name: Row-level security and enforced identity, as the roles that use them
+        env:
+          DATABASE_URL: postgresql://hm:hm@localhost:5432/hypermnesia
+          HM_APP_URL: postgresql://hm_app:hm_app@localhost:5432/hypermnesia
+        run: python tests/test_rls_live.py
+      - name: Memory lifecycle, live (one merge path, two time axes, live premises)
+        env:
+          DATABASE_URL: postgresql://hm:hm@localhost:5432/hypermnesia
+        run: |
+          pip install --quiet psycopg2-binary
+          python tests/test_memory_lifecycle_live.py
+      - name: Tier 1 and constraint sources, live
+        env:
+          DATABASE_URL: postgresql://hm:hm@localhost:5432/hypermnesia
+        run: python tests/test_arch_live.py

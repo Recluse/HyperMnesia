@@ -80,29 +80,20 @@ docker run -d --name hm-pg -e POSTGRES_PASSWORD="$PGPW" -e POSTGRES_DB=hypermnes
 export DATABASE_URL="postgresql://postgres:$PGPW@localhost:5432/hypermnesia"
 echo "$DATABASE_URL"   # put this in your shell profile and your MCP client's env
 
-# 2. Schema
-# -v ON_ERROR_STOP=1 on every psql call here and below, deliberately: without it psql prints
-# the error, keeps going and exits 0, so a failed statement is indistinguishable from success.
-# The order is load-bearing. The owner value claims only unreferenced legacy entities; on a
-# fresh store it changes no rows. Every file is idempotent.
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -v owner="$(id -un)" \
-  -f sql/schema.sql \
-  -f sql/schema_mem.sql \
-  -f sql/mem_multiuser.sql \
-  -f sql/migrate_entity_ownership.sql \
-  -f sql/migrate_memory_perspectives.sql \
-  -f sql/migrate_memory_evidence.sql \
-  -f sql/migrate_peer_cards.sql \
-  -f sql/migrate_dreamer.sql \
-  -f sql/mem_app_role.sql
+# 2. Schema: every sql/ file, in the one order that works (`./hm migrate --list`), each
+# recorded with its checksum in hm_schema_migrations. Re-running it is a no-op; it refuses to
+# continue if a file it already applied has since changed. It connects as HM_ADMIN_URL, else
+# DATABASE_URL -- here that is still the owner. --owner claims only unreferenced legacy
+# entities; on a fresh store it changes no rows.
+./hm migrate --owner "$(id -un)"
 
 # 2b. Say who you are. Writes are REFUSED without it, on a one-person store too --
 #     a memory with no author cannot be scoped, shared or revoked.
 mkdir -p ~/.claude && echo "MEM_AUTHOR=$(id -un)" >> ~/.claude/hypermnesia.env
 chmod 600 ~/.claude/hypermnesia.env
 
-# 2c. More than one person? Set a password for hm_app and point DATABASE_URL at it -- see
-#     "Two people, one store" below, before anyone writes anything.
+# 2c. More than one person? Read "Two people, one store" below before anyone writes anything:
+#     a shared hm_app login filters, one login per author (./hm author add) enforces.
 
 # 3. Embedder: Ollama
 ollama pull bge-m3            # 1.2 GB
@@ -578,10 +569,21 @@ your own private file, and only the exact names listed here are accepted.
 ## Two people, one store
 
 A personal memory store stops being one person's the moment a second author can write to it.
-`sql/mem_multiuser.sql`, the entity/perspective/evidence migrations, and `sql/mem_app_role.sql`
-make that safe. Apply them in the quick-start order before anyone else connects. The later
-migrations rely on author-owned entities; `mem_app_role.sql` comes last because it grants the
-tables and views those migrations create.
+`./hm migrate` applies everything this needs — the author/audience columns, author-owned
+entities, the `hm_app` role with its row-level policies, and the per-author login map — so do it
+before anyone else connects. What it protects you from depends on how people connect, and that
+is a choice to make deliberately:
+
+| | shared `hm_app` login | one login per author |
+|---|---|---|
+| identity comes from | the caller's own `MEM_AUTHOR` (the `mem.reader` setting) | the database: `mem.author_roles` maps the login to its author |
+| row-level security is | a **filter** against buggy or forgetful queries | a **boundary**: the login cannot read or write as anyone else |
+| anyone with the password can | read and write as **any** author | act as that one author |
+| set up with | a password on `hm_app` | `./hm author add <name>` per person (and per job) |
+
+Neither covers the document corpus: `documents` and `chunks` are shared by design and writable by
+every application login. Anyone who can ingest can replace any repo's documents. The full
+reasoning is in [DESIGN.md](DESIGN.md#trust).
 
 ### Why not a namespace per person
 
@@ -603,8 +605,10 @@ authorization, and the identifier must never come from an untrusted request.)*
 ### Identity
 
 `MEM_AUTHOR`, from `~/.claude/hypermnesia.env` (read by both the Python hooks and the Rust MCP
-server, so one machine has one identity) or from the environment. It reaches Postgres as the
-connection option `mem.reader`.
+server, so one machine has one identity) or from the environment. A non-empty value in the
+environment decides: an invalid one leaves the process with no identity rather than falling back
+to the file. It reaches Postgres as the connection option `mem.reader` — which a shared login
+believes and a per-author login ignores (`SELECT * FROM mem.whoami()` shows which one you are).
 
 Without it, **reads** return only what is shared with projects you belong to and **writes** are
 refused. Both fail closed, and the read failure is loud — your own preferences stop appearing in
@@ -633,49 +637,96 @@ The tag is matched exactly, so a case variant grants nothing and reports success
 
 ### The rule is not only in a view
 
-`mem_multiuser.sql` puts it in the function `mem.may_read`, called by the views **and** by the
-callers that cannot use a view. That is necessary and not sufficient, which we established the
-expensive way: an adversarial audit of the first version found four callers that reached the
-base tables instead — a history flag swapping the view out, a fetch-by-id that checked the scope
-but forgot membership, a write that accepted any project, and a retract that checked nothing.
+`mem_multiuser.sql` puts it in one place — `mem.may_read`, fed by `mem.reader()` — called by the
+views **and** by the callers that cannot use a view. That is necessary and not sufficient, which
+we established the expensive way: an adversarial audit of the first version found four callers
+that reached the base tables instead — a history flag swapping the view out, a fetch-by-id that
+checked the scope but forgot membership, a write that accepted any project, and a retract that
+checked nothing.
 
-`mem_app_role.sql` is what makes it hold anyway. `hm_app` is an ordinary role, so the row-level
-policies bind it: a query that forgets the rule comes back with **no rows** instead of every row.
+`mem_app_role.sql` is what makes the rule apply to a caller that forgets it. `hm_app` is an
+ordinary role, so the row-level policies bind it: a query that leaves out the rule comes back
+with **no rows** instead of every row. That is protection against mistakes in queries. Whether
+it is also protection against *people* is the login question above.
+
+### Shared login: `hm_app`
 
 It is created **with no password** — set one and point the application at it:
 
 ```bash
 read -rs APP_PW
 printf "ALTER ROLE hm_app PASSWORD '%s';\n" "$APP_PW" | psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+export HM_ADMIN_URL="$DATABASE_URL"      # the owner: migrations, restores, author logins
 export DATABASE_URL="postgresql://hm_app:$APP_PW@localhost:5432/hypermnesia"
 ```
 
-Keep the owning role for migrations, restores, and the one view with no rule on it
+Everyone who has that password can read and write as anyone: set the name, become the person.
+Use it for one person, or for people who would share their memory with each other anyway.
+
+### One login per author: enforced identity
+
+```bash
+./hm author add alice          # creates login hm_alice, mapped to author alice
+./hm author add alice alice_ci # a second login for the same author, e.g. her scheduled jobs
+./hm author list
+./hm author remove hm_alice    # unmaps it, revokes hm_app from it, disables the login
+```
+
+`./hm author add` prints how to set the password (`\password` in psql, so it never touches a
+file or your history) and what the person puts in their own settings: `DATABASE_URL` with their
+login, and `MEM_AUTHOR` set to the same name — a write under any other name is refused. The login
+inherits `hm_app`'s privileges, so the same policies bind it; what changes is that `mem.reader()`
+returns the mapped author whatever the session sets. A member of `hm_app` with no mapping reads
+nothing. `mem.author_roles` and `mem.project_members` are readable by the owner only: an
+application login learns its own mapping (`mem.whoami()`) and its own projects
+(`mem.reader_projects()`), never the list of who else uses the store.
+
+This holds only while people hold only their own password. Keep the `hm_app` password away from
+them (or set `ALTER ROLE hm_app NOLOGIN` once nothing connects as it), and the owner's too.
+
+### The owner
+
+Keep the owning role for migrations, restores, author logins and the one view with no rule on it
 (`mem.all_active_memories`, which a post-restore row count must use — `mem.active_memories`
 returns 0 for a connection with no identity, which is correct and looks exactly like an empty
-restore).
+restore). `./hm migrate` and `./hm author` read `HM_ADMIN_URL` for it, falling back to
+`DATABASE_URL`.
 
 **Everything that connects has to move with it.** Anything still using the owner's credentials
 keeps working and silently bypasses every policy; anything using the owner's *name* with the
 app's password fails authentication outright. The second is how document search went down in
 this project's own deployment for half an hour — the pod's password was repointed and one
-script still named the old role.
-
-If the application connects as the role that OWNS the tables, RLS is inert — owners bypass
-their own policies and a superuser bypasses everything.
+script still named the old role. `./hm doctor` reports a connection that bypasses row-level
+security, and fails on one when the store holds more than one author.
 
 ### Check that the boundary is up
 
+Run these **as the application login**, never as the owner: the owner bypasses every policy, so
+a probe run as the owner passes with the policies deleted.
+
 ```bash
-# must print 0: no identity, no rows
+# who does the database say this connection is?  hm_app|<name>|filter  or  hm_alice|alice|enforced
+psql "$DATABASE_URL" -tAXc "SELECT * FROM mem.whoami();"
+
+# must print 0: no identity, no rows (on a per-author login, use a name that is not yours below)
 psql "$DATABASE_URL" -tAXc "SELECT count(*) FROM mem.memories;"
 
-# and the probe that fails if the rule is removed — it writes as one identity and reads as a
-# second, which is the only arrangement that can tell an isolating store from one that is not.
-# Run it with the OWNER's DATABASE_URL: its cleanup deletes the rows it wrote, and under the
-# app role a delete it is not entitled to make is a silent no-op that still reports success.
-DATABASE_URL="postgresql://hm:...@localhost:5432/hypermnesia" python3 eval/mem_probes.py
+# write as one identity, read as a second: the second must see 0 rows, the first must delete 1.
+PGOPTIONS='-c mem.reader=probe-a' psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tAXc \
+  "INSERT INTO mem.memories (memory_type, content, author, metadata)
+   VALUES ('semantic', 'rls probe', 'probe-a', '{\"rls_probe\": true}') RETURNING id;"
+PGOPTIONS='-c mem.reader=probe-b' psql "$DATABASE_URL" -tAXc \
+  "SELECT count(*) FROM mem.memories WHERE metadata->>'rls_probe' = 'true';"     # 0
+PGOPTIONS='-c mem.reader=probe-a' psql "$DATABASE_URL" -tAXc \
+  "WITH d AS (DELETE FROM mem.memories WHERE metadata->>'rls_probe' = 'true' RETURNING 1)
+   SELECT count(*) FROM d;"                                                       # 1
+PGOPTIONS='-c mem.reader=probe-a' psql "$DATABASE_URL" -qtAXc \
+  "DELETE FROM mem.entities WHERE author = 'probe-a';"       # the identity node the write made
 ```
+
+On a per-author login the first INSERT is refused (`probe-a` is not you), which is the point.
+`tests/test_rls_live.py` runs the full version of this in CI: two readers on `hm_app`, two
+per-author logins trying to read and write as each other, and the definer functions.
 
 ## Secrets and what the store keeps
 

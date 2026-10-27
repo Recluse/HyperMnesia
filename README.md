@@ -186,11 +186,17 @@ flowchart TB
   self-hosted store both fail in ways that still answer, so the failures are reported rather than
   inferred: `ci/freshness.py` flags globs matching no file and documents indexed at an older
   commit, and refuses a scope nothing is mapped under; `./hm doctor` (and the `status` MCP tool,
-  which runs the same script) checks the ANN index, embedding coverage, model consistency and the
-  scope name; search says when it fell back to lexical-only or to plain RRF order; a cached map
+  which runs the same script) checks the ANN index, migrations, embedding coverage, model consistency
+  and drift, the connection's identity mode and the scope name; search says when it fell back to lexical-only or to plain RRF order; a cached map
   carries its staleness and expires; an empty enumeration refuses to write rather than emptying
   the store. Each of those, and why it exists, is in
   **[docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md)**.
+- **Who can read a memory.** Every row records its author and its audience (private, or shared
+  with a project), and row-level security applies that rule to every query, including the ones
+  that forget it. On the shared `hm_app` login the caller names itself, so this is a filter
+  against buggy queries, not a boundary between people; with one login per author
+  (`./hm author add`) the database itself decides who is reading. The document corpus is shared
+  and writable by every application login. See **[Trust](docs/DESIGN.md#trust)**.
 - **Timeouts, output limits and cache expiry.** Every child process the MCP server spawns is on a
   clock, a document comes back capped with the cut announced, and the structural map is re-read
   on a TTL rather than held for the life of the process.
@@ -217,12 +223,12 @@ See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full system picture
 
 | Path | What |
 |------|------|
-| `hm` | one wrapper over the documented steps: `init` (compose + ordered schemas/migrations), `ingest` (ingest -> embed -> ANN index, incremental when the scope already exists), `doctor`, `latency` |
-| `sql/` | doc-RAG and personal-memory schemas, ordered entity/perspective/evidence/Dreamer migrations, and the role + row-level security that enforce ownership and visibility |
+| `hm` | one wrapper over the documented steps: `init` (compose + migrations), `migrate` (the one apply order, recorded with checksums; a second run is a no-op, an edited applied file is refused), `author` (per-author logins), `ingest` (ingest -> embed -> ANN index, incremental when the scope already exists), `refresh`, `doctor`, `latency` |
+| `sql/` | doc-RAG and personal-memory schemas, the migrations `./hm migrate` applies and records in order, and the roles + row-level security behind memory visibility: a filter on the shared `hm_app` login, an enforced boundary with one login per author ([trust](docs/DESIGN.md#trust)) |
 | `ingest/` | markdown chunker, embedder (Ollama/TEI), hybrid RRF search, `mem_ops`; incremental re-ingest via `--known-hashes` (unchanged docs keep their embeddings) |
 | `rerank/` | optional cross-encoder reranker service + search orchestrator |
 | `hooks/` | Claude Code hooks plus model-backed maintenance: constraint/profile/recall injection, capture, extract, consolidate, reflect, review-gated Dreamer, and grounded Dialectic Q&A |
-| `ci/` | `doctor.py` — health check for faults that leave an install answering normally (missing index, partial embeddings, mixed models, wrong scope); `latency.py` — where the time goes (hook, embedder, database, reranker); `freshness.py` — map-staleness / orphan-glob checker (run against a target repo); `check_graph_sql_parity.py` — keeps the Python and Rust copies of the graph query identical |
+| `ci/` | `doctor.py` — health check for faults that leave an install answering normally (missing index or migration, partial embeddings, mixed or drifted models, wrong scope, a connection that bypasses row-level security, a stalled extractor); `latency.py` — where the time goes (hook, embedder, database, reranker); `freshness.py` — map-staleness / orphan-glob checker (run against a target repo); `check_graph_sql_parity.py` — keeps the Python and Rust copies of the graph query identical |
 | `tests/` | contract tests, all wired into CI: hook I/O, ingest behavior, memory perspectives/evidence/context/Dreamer/Dialectic, glob parity, query hygiene, diagnostics, settings and the live SQL boundary |
 | `mcp-server/` | Rust MCP server exposing project map, constraints, doc search, scoped memory, grounded context/Q&A, `project_status`, and install `status` |
 | `console/` | the operator's side: a menu-bar tray and four command-line tools (`stats`, `jobs`, `settings`, `setup`) over any deployment — volumes, scheduled jobs, tunables, and a first-run wizard |
@@ -250,7 +256,7 @@ edit.
 
 ```bash
 ./hm init                          # writes .env with a generated password, compose up,
-                                   # waits for Postgres, loads schemas and migrations
+                                   # waits for Postgres, applies the migrations (hm migrate)
 export DATABASE_URL=...            # init prints the exact line
 ./hm ingest /path/to/your/repo myrepo    # ingest -> embed -> ANN index -> doctor
 ```

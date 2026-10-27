@@ -90,23 +90,20 @@ Wait for `kubectl -n hypermnesia rollout status deploy/postgres --timeout=180s`.
 
 ## 3. Load or upgrade the schema
 
-From the repository root, stream every file in order. `ON_ERROR_STOP` prevents a partial load from
-looking successful.
+From the repository root, apply the migrations with `./hm migrate` through a port-forward. It
+holds the one apply order (`./hm migrate --list`), runs every file with `ON_ERROR_STOP`, records
+each one's checksum in `hm_schema_migrations`, skips what is already applied and refuses to
+continue when an applied file has changed.
 
 ```bash
-for file in \
-  sql/schema.sql sql/schema_mem.sql sql/mem_multiuser.sql \
-  sql/migrate_entity_ownership.sql sql/migrate_memory_perspectives.sql \
-  sql/migrate_memory_evidence.sql sql/migrate_peer_cards.sql \
-  sql/migrate_dreamer.sql sql/mem_app_role.sql
-do
-  kubectl -n hypermnesia exec -i deploy/postgres -- \
-    psql -U hm -d hypermnesia -v ON_ERROR_STOP=1 -v owner="$USER" < "$file"
-done
+kubectl -n hypermnesia port-forward svc/postgres 15432:5432 &
+export HM_ADMIN_URL="postgresql://hm:$POSTGRES_PASSWORD@127.0.0.1:15432/hypermnesia"
+./hm migrate --owner "$USER"
+./hm migrate --status
 ```
 
-The migrations are idempotent, but their order is part of the contract. Back up Postgres before
-an upgrade and run `hm doctor` afterward.
+Back up Postgres before an upgrade and run `hm doctor` afterward; it reports any migration in the
+list that this database has not recorded.
 
 ## 4. TEI embedder
 
@@ -258,8 +255,19 @@ final `hm doctor` after all shards finish.
 Consolidation, reflection and Dreamer can be separate CronJobs. Use
 `concurrencyPolicy: Forbid`, a bounded deadline and the scoped application role.
 
-`sql/mem_app_role.sql` creates `hm_app` with no password. Set one once, and keep it in its own
-secret:
+Choose the identity mode before the first job writes anything ([Trust](../../docs/DESIGN.md#trust)):
+
+- **Shared login.** One Secret with the `hm_app` password, mounted by every worker. Row-level
+  security then filters by the `MEM_AUTHOR` each job claims; anyone who can read that Secret can
+  read and write as every author. Acceptable for one person.
+- **Enforced, one login per author.** One login and **one Secret per author**, and each author's
+  jobs mount only their own. The database maps the login to its author and ignores what the job
+  claims, so a job — or whoever can read its Secret — reaches that author's memory and nothing
+  else. Do not create the shared `hm-app-auth` Secret at all in this mode; with no workload left
+  on it, `ALTER ROLE hm_app NOLOGIN` closes it for good.
+
+`sql/mem_app_role.sql` creates `hm_app` with no password. For the shared login, set one once and
+keep it in its own Secret:
 
 ```bash
 HM_APP_PASSWORD=$(openssl rand -hex 24)
@@ -270,11 +278,24 @@ kubectl -n hypermnesia create secret generic hm-app-auth \
   --from-literal=DATABASE_URL="postgresql://hm_app:$HM_APP_PASSWORD@postgres:5432/hypermnesia"
 ```
 
+For enforced mode, per author (through the same port-forward as section 3):
+
+```bash
+./hm author add alice                        # prints the login: hm_alice
+ALICE_PASSWORD=$(openssl rand -hex 24)
+printf "ALTER ROLE hm_alice PASSWORD '%s';\n" "$ALICE_PASSWORD" |
+  kubectl -n hypermnesia exec -i deploy/postgres -- \
+    psql -U hm -d hypermnesia -v ON_ERROR_STOP=1
+kubectl -n hypermnesia create secret generic hm-author-alice \
+  --from-literal=DATABASE_URL="postgresql://hm_alice:$ALICE_PASSWORD@postgres:5432/hypermnesia" \
+  --from-literal=MEM_AUTHOR=alice
+```
+
 A worker needs:
 
 ```text
-DATABASE_URL=postgresql://hm_app:...@postgres:5432/hypermnesia   # from hm-app-auth
-MEM_AUTHOR=<the identity whose memories this job maintains>
+DATABASE_URL=postgresql://<hm_app or the author's login>:...@postgres:5432/hypermnesia
+MEM_AUTHOR=<the identity whose memories this job maintains; on an author login, that author>
 EMBED_BACKEND=tei
 TEI_URL=http://tei
 HM_LLM_BACKEND=openai
@@ -283,10 +304,11 @@ HM_LLM_MODEL=Qwen/Qwen2.5-7B-Instruct
 HM_LLM_KEY=<secret>
 ```
 
-`MEM_AUTHOR` is not optional here. Under `hm_app` the row-level policies show a connection with
-no identity only what is shared with projects it belongs to, which for a job is usually nothing,
-and writes are refused. Consolidation, reflection and Dreamer then run, find nothing and exit
-successfully. Use the same name the clients write as (`MEM_AUTHOR` in their settings file), and
+`MEM_AUTHOR` is not optional here, in either mode. Under `hm_app` a connection with no identity
+sees only what is shared with projects it belongs to, which for a job is usually nothing, and
+writes are refused; on an author login a different `MEM_AUTHOR` has every write refused. The
+scheduled passes refuse to start without a valid `MEM_AUTHOR` rather than run, find nothing and
+exit successfully. Use the same name the clients write as (`MEM_AUTHOR` in their settings file), and
 run one set of jobs per author on a shared store. The identity, membership and role model is
 described in [Two people, one store](../../docs/INSTALL.md#two-people-one-store).
 
