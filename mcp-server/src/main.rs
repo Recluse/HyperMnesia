@@ -201,18 +201,6 @@ fn spawn_child(cmd: &mut std::process::Command, what: &str) -> Result<std::proce
     Ok(child)
 }
 
-/// Hand `data` to the child's stdin on a thread of its own. Writing it inline, before the wait
-/// loop, meant a child that never reads stdin and a payload larger than the pipe buffer
-/// blocked the worker in write() for ever -- before the deadline or a cancellation could run.
-/// The writer ends when the data is written or the pipe breaks (the child exited or was
-/// killed); the child's exit status and output, not this write, report what happened.
-fn feed_stdin(child: &mut std::process::Child, data: Vec<u8>) -> Result<(), String> {
-    let mut si = child.stdin.take().ok_or("no stdin")?;
-    std::thread::Builder::new().name("child-stdin".into())
-        .spawn(move || { let _ = si.write_all(&data); })
-        .map_err(|e| format!("start stdin writer: {e}"))?;
-    Ok(())
-}
 
 /// Cancel one in-flight request: mark it, and ask its current child group to stop.
 fn cancel_request(request_id: &Value) {
@@ -322,9 +310,9 @@ fn env_secs(key: &str, default: u64) -> u64 {
 #[cfg(unix)]
 mod pipes {
     use std::fs::File;
-    use std::io::{ErrorKind, Read};
+    use std::io::{ErrorKind, Read, Write};
     use std::os::fd::{AsRawFd, OwnedFd};
-    use std::process::{ChildStderr, ChildStdout};
+    use std::process::{ChildStderr, ChildStdin, ChildStdout};
     use std::time::Duration;
 
     #[repr(C)]
@@ -338,6 +326,10 @@ mod pipes {
         fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     }
     const POLLIN: i16 = 0x1;
+    const POLLOUT: i16 = 0x4;
+    /// Without O_NONBLOCK, the most one write may carry after POLLOUT: POSIX's minimum
+    /// PIPE_BUF, which a pipe reported writable always takes whole.
+    const BLOCKING_WRITE_MAX: usize = 512;
     const F_GETFL: i32 = 3;
     const F_SETFL: i32 = 4;
     /// O_NONBLOCK is not one number everywhere. Where it is not known here the pipe stays
@@ -357,15 +349,19 @@ mod pipes {
 
     struct Pipe { file: Option<File>, nonblocking: bool, buf: Vec<u8> }
 
+    fn set_nonblocking(fd: &Option<OwnedFd>) -> bool {
+        match (fd, O_NONBLOCK) {
+            (Some(fd), Some(flag)) => unsafe {
+                let fl = fcntl(fd.as_raw_fd(), F_GETFL);
+                fl >= 0 && fcntl(fd.as_raw_fd(), F_SETFL, fl | flag) == 0
+            },
+            _ => false,
+        }
+    }
+
     impl Pipe {
         fn new(fd: Option<OwnedFd>) -> Pipe {
-            let nonblocking = match (&fd, O_NONBLOCK) {
-                (Some(fd), Some(flag)) => unsafe {
-                    let fl = fcntl(fd.as_raw_fd(), F_GETFL);
-                    fl >= 0 && fcntl(fd.as_raw_fd(), F_SETFL, fl | flag) == 0
-                },
-                _ => false,
-            };
+            let nonblocking = set_nonblocking(&fd);
             Pipe { file: fd.map(File::from), nonblocking, buf: Vec::new() }
         }
 
@@ -385,28 +381,71 @@ mod pipes {
         }
     }
 
-    /// Both pipes of one child.
-    pub struct Drain { pipes: [Pipe; 2], chunk: Vec<u8> }
+    /// The child's stdin and what is still to be written to it.
+    struct Feed { file: File, nonblocking: bool, data: Vec<u8>, done: usize }
+
+    impl Feed {
+        /// Write what the pipe takes now. false: stop feeding -- everything is written, the
+        /// child has closed its end (EPIPE), or the pipe failed. Dropping the Feed closes it,
+        /// which is how the child sees EOF.
+        fn write_ready(&mut self) -> bool {
+            let rounds = if self.nonblocking { MAX_READS } else { 1 };
+            for _ in 0..rounds {
+                if self.done >= self.data.len() { return false; }
+                let end = if self.nonblocking { self.data.len() }
+                          else { self.data.len().min(self.done + BLOCKING_WRITE_MAX) };
+                match self.file.write(&self.data[self.done..end]) {
+                    Ok(0) => return false,
+                    Ok(n) => self.done += n,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => return true,
+                    Err(_) => return false,          // EPIPE included: nobody will read it
+                }
+            }
+            self.done < self.data.len()
+        }
+    }
+
+    /// The pipes of one child: stdout and stderr read, stdin (optionally) written.
+    pub struct Drain { pipes: [Pipe; 2], feed: Option<Feed>, chunk: Vec<u8> }
 
     impl Drain {
-        pub fn new(out: Option<ChildStdout>, err: Option<ChildStderr>) -> Drain {
+        pub fn new(out: Option<ChildStdout>, err: Option<ChildStderr>,
+                   input: Option<(ChildStdin, Vec<u8>)>) -> Drain {
+            let feed = input.and_then(|(si, data)| {
+                let fd = Some(OwnedFd::from(si));
+                let nonblocking = set_nonblocking(&fd);
+                let file = File::from(fd.unwrap());
+                // Nothing to write: close at once, so the child sees EOF straight away.
+                (!data.is_empty()).then_some(Feed { file, nonblocking, data, done: 0 })
+            });
             Drain { pipes: [Pipe::new(out.map(OwnedFd::from)), Pipe::new(err.map(OwnedFd::from))],
-                    chunk: vec![0; 64 * 1024] }
+                    feed, chunk: vec![0; 64 * 1024] }
         }
 
+        /// Is stdout or stderr still open? (stdin does not count: nothing waits for it.)
         pub fn any_open(&self) -> bool { self.pipes.iter().any(|p| p.file.is_some()) }
+
+        /// Stop feeding stdin and close it: the child exited, or the call is being given up.
+        pub fn close_stdin(&mut self) { self.feed = None; }
 
         /// Wait up to `timeout` for either pipe to have something, and read it. Returns as soon
         /// as there is output, so a fast writer is read at its own pace, not 20 ms at a time;
         /// with nothing open it just sleeps.
         pub fn pump(&mut self, timeout: Duration) {
-            let mut fds: Vec<PollFd> = Vec::with_capacity(2);
-            let mut which: Vec<usize> = Vec::with_capacity(2);
+            let mut fds: Vec<PollFd> = Vec::with_capacity(3);
+            let mut which: Vec<usize> = Vec::with_capacity(3);
             for (i, p) in self.pipes.iter().enumerate() {
                 if let Some(f) = &p.file {
                     fds.push(PollFd { fd: f.as_raw_fd(), events: POLLIN, revents: 0 });
                     which.push(i);
                 }
+            }
+            // stdin is index 2. Written in the same loop as the reads: a child that reads its
+            // input only after writing its output gets both sides served, never a deadlock.
+            if let Some(f) = &self.feed {
+                fds.push(PollFd { fd: f.file.as_raw_fd(), events: POLLOUT, revents: 0 });
+                which.push(2);
             }
             if fds.is_empty() { std::thread::sleep(timeout); return; }
             let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
@@ -419,9 +458,15 @@ mod pipes {
                 }
                 return;
             }
-            // revents also carries POLLHUP / POLLERR, which a read turns into EOF or an error.
+            // revents also carries POLLHUP / POLLERR, which a read turns into EOF or an error
+            // and a write into EPIPE or an error.
             for (pfd, &i) in fds.iter().zip(&which) {
-                if pfd.revents != 0 { self.pipes[i].read_ready(&mut self.chunk); }
+                if pfd.revents == 0 { continue; }
+                if i == 2 {
+                    if !self.feed.as_mut().is_some_and(Feed::write_ready) { self.feed = None; }
+                } else {
+                    self.pipes[i].read_ready(&mut self.chunk);
+                }
             }
         }
 
@@ -457,13 +502,20 @@ mod pipes {
     }
 
     impl Drain {
-        pub fn new(out: Option<std::process::ChildStdout>, err: Option<std::process::ChildStderr>) -> Drain {
+        pub fn new(out: Option<std::process::ChildStdout>, err: Option<std::process::ChildStderr>,
+                   input: Option<(std::process::ChildStdin, Vec<u8>)>) -> Drain {
+            // stdin is written by a thread of its own here, with the same leak as the readers.
+            if let Some((mut si, data)) = input {
+                std::thread::spawn(move || { use std::io::Write; let _ = si.write_all(&data); });
+            }
             let (ro, go) = reader(out);
             let (re, ge) = reader(err);
             Drain { rx: [ro, re], got: [go, ge] }
         }
 
         pub fn any_open(&self) -> bool { self.got.iter().any(Option::is_none) }
+
+        pub fn close_stdin(&mut self) {}
 
         pub fn pump(&mut self, timeout: Duration) {
             std::thread::sleep(timeout);
@@ -525,19 +577,39 @@ fn reap_leader(child: &mut std::process::Child, pid: i32, own_group: bool, job: 
 fn kill_rest(pgid: i32) { sig::group_unchecked(pgid, sig::HARD); }
 
 /// Wait for a child with a deadline, draining both pipes. Returns (ok, stdout, stderr).
+fn wait_with_timeout(child: std::process::Child, secs: u64, what: &str)
+    -> Result<(bool, String, String), String> {
+    wait_with_input(child, None, secs, what)
+}
+
+/// Feed `input` to the child's stdin (closing it once written), wait for it with a deadline,
+/// and drain both output pipes. Returns (ok, stdout, stderr).
 ///
 /// The pipes are read WHILE waiting, and that is not decoration. Polling for the exit while
 /// the child writes more than a pipe buffer (64 KiB) deadlocks: the child blocks in write(), the
 /// parent never reads, and the timeout then kills a perfectly HEALTHY process -- a "safety"
 /// feature that manufactures the failure it was added to prevent. Read first, wait second.
-fn wait_with_timeout(mut child: std::process::Child, secs: u64, what: &str)
+///
+/// stdin is written from the same loop, never inline before it: a child that does not read its
+/// stdin and a payload larger than the pipe buffer used to block the worker in write() for
+/// ever, before the deadline or a cancellation could run. Nor on a thread of its own, as it was
+/// next: a detached writer blocked on a pipe that an escaped descendant holds open without
+/// reading stayed blocked after the call returned, one thread and one fd per call. Feeding stops
+/// when everything is written, the child closes its end (EPIPE), the child exits, or the call
+/// is given up at the deadline or on cancel; the child's exit status and output, not this
+/// write, report what happened.
+fn wait_with_input(mut child: std::process::Child, input: Option<Vec<u8>>, secs: u64, what: &str)
     -> Result<(bool, String, String), String> {
+    let input = match input {
+        Some(data) => Some((child.stdin.take().ok_or_else(|| format!("{what}: no stdin"))?, data)),
+        None => None,
+    };
     // Nothing here waits for EOF without a clock. Killing the child does not necessarily close
     // the pipe -- anything it spawned inherits the same handle, so a `psql` wrapper or a script
     // with a background job keeps stdout open after its parent dies, and a wait for EOF would
     // sit there for as long as the grandchild lives. That turned a 3s timeout into a 30s one,
     // measured.
-    let mut drain = pipes::Drain::new(child.stdout.take(), child.stderr.take());
+    let mut drain = pipes::Drain::new(child.stdout.take(), child.stderr.take(), input);
     let deadline = Instant::now() + Duration::from_secs(secs);
     let job = current_job();
     let pid = child.id() as i32;
@@ -561,6 +633,9 @@ fn wait_with_timeout(mut child: std::process::Child, secs: u64, what: &str)
             Err(e) => return Err(format!("{what}: wait failed: {e}")),
         }
     };
+    // Exited, timed out or cancelled: either way nobody will read stdin any more (whatever is
+    // left holding it is not ours to serve).
+    drain.close_stdin();
     let was_cancelled = job.as_ref().is_some_and(|j| j.cancelled.load(Ordering::SeqCst));
     if status.is_some() && was_cancelled {
         return Err(format!("{what}: cancelled by the client"));
@@ -610,12 +685,12 @@ fn wait_with_timeout(mut child: std::process::Child, secs: u64, what: &str)
 
 fn db_query(sql: &str) -> Result<String, String> {
     use std::process::{Command, Stdio};
-    let mut child = spawn_child(Command::new("psql")
+    let child = spawn_child(Command::new("psql")
         .arg(database_url()).args(["-tAX", "-v", "ON_ERROR_STOP=1"])
         .env("PGCLIENTENCODING", "UTF8")
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()), "psql")?;
-    feed_stdin(&mut child, sql.as_bytes().to_vec())?;
-    let (ok, out, err) = wait_with_timeout(child, env_secs("HM_DB_TIMEOUT_SECS", 30), "psql")?;
+    let (ok, out, err) = wait_with_input(child, Some(sql.as_bytes().to_vec()),
+                                         env_secs("HM_DB_TIMEOUT_SECS", 30), "psql")?;
     if !ok {
         return Err(format!("psql failed: {err}"));
     }
@@ -1161,10 +1236,10 @@ fn tool_search_docs(query: &str, k: u32) -> Result<String, String> {
         Ok(p) if !p.is_empty() => p,
         _ => script_path("HM_SEARCH", "ingest/search.py"),
     };
-    let mut child = spawn_child(Command::new(py()).arg(script).arg(kk.to_string()).arg(repo())
+    let child = spawn_child(Command::new(py()).arg(script).arg(kk.to_string()).arg(repo())
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()), "search")?;
-    feed_stdin(&mut child, format!("{query}\n").into_bytes())?;
-    let (ok, so, se) = wait_with_timeout(child, env_secs("HM_SEARCH_TIMEOUT_SECS", 60), "search")?;
+    let (ok, so, se) = wait_with_input(child, Some(format!("{query}\n").into_bytes()),
+                                       env_secs("HM_SEARCH_TIMEOUT_SECS", 60), "search")?;
     if !ok {
         return Err(format!("search failed: {se}"));
     }
@@ -1417,10 +1492,10 @@ fn tool_memory(cmd: &str, payload: &Value) -> Result<String, String> {
     }
     let payload = &payload;
     let script = script_path("HM_MEM_OPS", "ingest/mem_ops.py");
-    let mut child = spawn_child(Command::new(py()).arg(script).arg(cmd)
+    let child = spawn_child(Command::new(py()).arg(script).arg(cmd)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()), "mem_ops")?;
-    feed_stdin(&mut child, payload.to_string().into_bytes())?;
-    let (ok, so, se) = wait_with_timeout(child, env_secs("HM_MEMOPS_TIMEOUT_SECS", 60),
+    let (ok, so, se) = wait_with_input(child, Some(payload.to_string().into_bytes()),
+                                       env_secs("HM_MEMOPS_TIMEOUT_SECS", 60),
                                          &format!("mem_ops {cmd}"))?;
     if !ok {
         return Err(format!("mem_ops {cmd} failed: {se}"));
@@ -1444,14 +1519,12 @@ fn tool_dialectic(args: &Value) -> Result<Value, String> {
         obj.insert("_identity".into(), Value::String(who));
     }
     let script = script_path("HM_DIALECTIC", "hooks/mem_dialectic.py");
-    let mut child = spawn_child(Command::new(py())
+    let child = spawn_child(Command::new(py())
         .arg(script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped()), "memory dialectic")?;
-    feed_stdin(&mut child, payload.to_string().into_bytes())?;
-    let (ok, stdout, stderr) = wait_with_timeout(
-        child,
+    let (ok, stdout, stderr) = wait_with_input(child, Some(payload.to_string().into_bytes()),
         dialectic_kill_secs(),
         "memory dialectic",
     )?;
@@ -1525,10 +1598,10 @@ fn tool_project_status(args: &Value) -> Result<Value, String> {
         }
     };
     let script = script_path("HM_PROJECT_STATUS", "ci/project_status.py");
-    let mut child = spawn_child(Command::new(py()).arg(script).arg(root).arg(scope)
+    let child = spawn_child(Command::new(py()).arg(script).arg(root).arg(scope)
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()), "project_status")?;
-    feed_stdin(&mut child, snapshot.to_string().into_bytes())?;
-    let (ok, so, _se) = wait_with_timeout(child, 60, "project_status")?;
+    let (ok, so, _se) = wait_with_input(child, Some(snapshot.to_string().into_bytes()), 60,
+                                        "project_status")?;
     if !ok { return Err("project_status source check failed".into()); }
     serde_json::from_str(so.trim()).map_err(|e| format!("project_status JSON: {e}"))
 }
@@ -2159,11 +2232,32 @@ mod tests {
     #[test]
     fn unread_stdin_cannot_outlast_the_deadline() {
         let started = Instant::now();
-        let mut child = own_group_sh("sleep 30");
-        feed_stdin(&mut child, vec![b'x'; 4 << 20]).unwrap();
-        let err = wait_with_timeout(child, 1, "deaf").unwrap_err();
+        let child = own_group_sh("sleep 30");
+        let err = wait_with_input(child, Some(vec![b'x'; 4 << 20]), 1, "deaf").unwrap_err();
         assert!(err.contains("no answer within 1s"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+    }
+
+    /// A child that reads its stdin only AFTER writing more than a pipe buffer of output, fed
+    /// more than a pipe buffer of input: both sides must be served from the one loop.
+    #[test]
+    fn input_and_output_larger_than_a_pipe_do_not_deadlock() {
+        let child = own_group_sh("head -c 300000 /dev/zero | tr '\\0' 'z'; echo; wc -c");
+        let (ok, out, _) = wait_with_input(child, Some(vec![b'x'; 1 << 20]), 20, "both")
+            .expect("must not time out");
+        assert!(ok);
+        let mut lines = out.lines();
+        assert_eq!(lines.next().map(str::len), Some(300_000));
+        assert_eq!(lines.next().map(str::trim), Some("1048576"), "the whole payload, intact");
+    }
+
+    /// A child that closes stdin without reading it: EPIPE ends the feed, the call does not.
+    #[test]
+    fn a_child_that_closes_stdin_still_answers() {
+        let child = own_group_sh("exec 0<&-; sleep 0.2; echo ok");
+        let (ok, out, _) = wait_with_input(child, Some(vec![b'x'; 1 << 20]), 10, "closer")
+            .expect("must answer");
+        assert!(ok && out.trim() == "ok", "{out:?}");
     }
 
     /// Item: a new file under a symlinked root -- canonicalize() of the file itself fails, the

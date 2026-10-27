@@ -69,7 +69,17 @@ esac
         // stdout and stderr, and records its pid so the test can clean it up. It answers only
         // once the descendant has written its pid from inside the new session: answering
         // earlier races the group kill against setsid().
-        let mem_ops = write_exec("mem_ops.sh", &format!(r#"payload=$(cat); echo x >> {dir}/memops.calls
+        // `get` (memory_get) is the one command that never reads its stdin: it leaves a
+        // descendant in a session of its own that keeps stdin open WITHOUT reading it (stdout
+        // and stderr closed), waits until that descendant has detached, and exits 0 -- so a
+        // payload larger than the pipe buffer can never be fully written.
+        let mem_ops = write_exec("mem_ops.sh", &format!(r#"if [ "$1" = get ]; then
+  f={dir}/hold.$$; exec 3<&0
+  setsid sh -c "echo \$\$ > $f; exec sleep 60" <&3 3<&- >/dev/null 2>&1 &
+  exec 3<&-
+  while [ ! -s $f ]; do sleep 0.05; done; cat $f >> {dir}/escaped; echo "op get"; exit 0
+fi
+payload=$(cat); echo x >> {dir}/memops.calls
 case "$payload" in
   *big*) head -c 100000 /dev/zero | tr '\0' 'a'; echo ;;
   *escape*) f={dir}/esc.$$; setsid sh -c "echo \$\$ > $f; exec sleep 60" &
@@ -429,6 +439,59 @@ fn an_escaped_pipe_holder_does_not_leak_threads() {
         std::thread::sleep(Duration::from_millis(50));
     }
     // Still serving.
+    s.send(json!({"jsonrpc":"2.0","id":20,"method":"ping"}));
+    assert_eq!(s.next(Duration::from_secs(5)).expect("ping")["id"], 20);
+}
+
+/// Open fds of the server process, from /proc.
+fn fds(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/fd")).map_or(0, |d| d.count())
+}
+
+/// A helper that exits 0 while a detached descendant keeps its stdin open and never reads it.
+/// With a payload larger than the pipe buffer, the stdin feeder -- a detached thread blocked in
+/// write_all -- used to stay blocked after the call had answered and released its slot: one
+/// thread and one fd more per call, for as long as the descendant lived.
+#[test]
+fn an_escaped_stdin_holder_does_not_leak_threads_or_fds() {
+    struct Reap(std::path::PathBuf);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            for p in std::fs::read_to_string(&self.0).unwrap_or_default().split_whitespace() {
+                let _ = Command::new("kill").arg("-9").arg(p).status();
+            }
+        }
+    }
+    let mut s = Session::start("stdin-hold");
+    let _reap = Reap(s.dir.join("escaped"));
+    let server = s.child.id();
+    s.send(Session::call(1, "memory_search", json!({"query":"plain"})));
+    s.send(json!({"jsonrpc":"2.0","id":2,"method":"ping"}));
+    for _ in 0..2 { s.next(Duration::from_secs(10)).expect("warm-up answered"); }
+    std::thread::sleep(Duration::from_millis(500));
+    let (t0, f0) = (threads(server), fds(server));
+    assert!(t0 > 0 && f0 > 0, "cannot read /proc/{server}");
+
+    let pad = "p".repeat(200_000);
+    for id in 10..14 {
+        s.send(Session::call(id, "memory_get", json!({"id": 1, "pad": pad})));
+        let v = s.next(Duration::from_secs(20)).expect("each call answered");
+        assert_eq!(v["id"], id);
+        let text = v["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(v["result"]["isError"] == false && text.contains("op get"), "{v}");
+    }
+    let held = std::fs::read_to_string(s.dir.join("escaped")).unwrap_or_default();
+    assert_eq!(held.split_whitespace().count(), 4, "{held:?}");
+    assert!(held.split_whitespace().all(|p| !dead(p.parse().unwrap())),
+            "the stdin holders should still be alive");
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        let (t, f) = (threads(server), fds(server));
+        if t <= t0 && f <= f0 { break; }
+        assert!(Instant::now() < until,
+                "four calls whose stdin is still held: threads {t0} -> {t}, fds {f0} -> {f}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     s.send(json!({"jsonrpc":"2.0","id":20,"method":"ping"}));
     assert_eq!(s.next(Duration::from_secs(5)).expect("ping")["id"], 20);
 }
