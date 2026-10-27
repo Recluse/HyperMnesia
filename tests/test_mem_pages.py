@@ -58,7 +58,8 @@ def main():
     q = q[:q.index('"""')]
     check("prior pages are selected without LIMIT", "LIMIT" not in q.upper(), q)
     check("extra pages are explicitly superseded", "status='superseded'" in body)
-    check("and they are retired in belief time", "retired_at=clock_timestamp()" in body)
+    check("and they are retired in belief time, at the new page's own instant",
+          "retired_at=(SELECT created_at FROM mem.memories WHERE id=%s)" in body)
     check("without claiming the facts stopped holding (event time untouched)",
           "valid_to" not in body[body.index("for extra in prior[1:]"):])
     check("the page write is a trusted internal write", '"_trusted_metadata": True' in body)

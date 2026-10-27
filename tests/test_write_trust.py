@@ -47,7 +47,7 @@ class WriteCursor:
             self.row = (True,)
         elif "INSERT INTO mem.memories" in sql:
             self.inserted = params
-            self.row = (99,)
+            self.row = (99, "2026-01-01 00:00:00+00")   # id, created_at
         elif ("INSERT INTO mem.sources" in sql or "INSERT INTO mem.assertions" in sql
               or "INSERT INTO mem.derivations" in sql):
             pass
@@ -158,9 +158,9 @@ class MergeCursor:
             self.row = ("2026-01-01 00:00:00+00", "2026-02-01 00:00:00+00")
         elif "UPDATE mem.memories SET status='superseded'" in sql:
             # Belief time only: a merge must not claim the fact stopped holding today.
-            assert "retired_at=clock_timestamp()" in sql and "valid_to" not in sql, sql
+            assert "retired_at=(SELECT r.created_at" in sql and "valid_to" not in sql, sql
             assert "author=%s" in sql and "RETURNING id" in sql, sql
-            member = params[1]
+            member = params[2]
             if member not in self.refuse_retire:
                 self.retired.append(member)
                 self.row = (member,)

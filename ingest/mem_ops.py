@@ -410,29 +410,34 @@ def do_write(cur, p, supersedes_id=None):
         (memory_type, content, title, lang, importance, confidence, subject_entity_id,
          observer_entity_id, observed_entity_id,
          project, valid_from, valid_to, event_time, supersedes_id, metadata, embedding,
-         embedding_model, author, scope)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector,%s,%s,%s)
-        RETURNING id""",
+         embedding_model, author, scope, created_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::vector,%s,%s,%s,
+                clock_timestamp())
+        RETURNING id, created_at""",
         (mtype, content, title, p.get("lang", "en"),
          _unit(p.get("importance", 0.5), 0.5), _unit(p.get("confidence", 0.8), 0.8), subj_id,
          observer_id, observed_id,
          project, p.get("valid_from"), p.get("valid_to"), p.get("event_time"),
          supersedes_id, json.dumps(_scrub_deep(_caller_metadata(p))), vector,
          EMBED_MODEL, author, scope))
-    mid = cur.fetchone()[0]
+    # created_at is the instant of THIS statement, not of the transaction's start, and a
+    # supersede retires the old row at exactly that instant: one belief hands over to the next
+    # with neither an overlap (both believed) nor a gap, and -- the target being locked above --
+    # after any reactivation of it that committed while this transaction waited.
+    mid, learned_at = cur.fetchone()
     if supersedes_id:
         # The store stops BELIEVING the old row now (retired_at). Its EVENT window is closed
         # only when the caller said when the new fact took over: a correction without a
         # valid_from says "I was wrong", not "it stopped being true today". LEAST, not
         # COALESCE: a pre-existing later valid_to is clamped down to the stated instant.
-        # clock_timestamp(), not now(): now() is when this transaction BEGAN, which can
-        # precede a reactivation committed while it waited on embedding or on the row lock --
-        # and a retirement stamped before that reactivation hides it from as_of for good.
-        cur.execute("""UPDATE mem.memories SET status='superseded', retired_at=clock_timestamp(),
+        # Not now(): now() is when this transaction BEGAN, which can precede a reactivation
+        # committed while it waited on embedding or on the row lock -- and a retirement stamped
+        # before that reactivation hides it from as_of for good.
+        cur.execute("""UPDATE mem.memories SET status='superseded', retired_at=%s,
                        valid_to = CASE WHEN %s::timestamptz IS NULL THEN valid_to
                                        ELSE LEAST(COALESCE(valid_to, 'infinity'::timestamptz),
                                                   %s::timestamptz) END
-                       WHERE id=%s""", (p.get("valid_from"), p.get("valid_from"),
+                       WHERE id=%s""", (learned_at, p.get("valid_from"), p.get("valid_from"),
                                         supersedes_id))
     src = p.get("source") or {}
     cur.execute("""INSERT INTO mem.sources (memory_id, source_type, session_id, channel, excerpt)
@@ -1229,7 +1234,10 @@ def do_context(cur, p):
     # Evidence can itself be a conclusion (an explicit row citing one, cited in turn by a
     # derived row in this context). Checking only the search hits and the derived section let
     # such a conclusion, with its own premise retracted, arrive -- and be cited -- as evidence.
-    stale |= _stale_derived(cur, [r[0] for r in evidence_rows if r[0] not in stale])
+    # Only conclusions: premises_live() is false for a row with no premises, which is what an
+    # explicit fact is, and checking those dropped every ordinary fact a conclusion rests on.
+    stale |= _stale_derived(cur, [r[0] for r in evidence_rows
+                                  if r[0] not in stale and r[11] != "explicit"])
     evidence_rows = [r for r in evidence_rows if r[0] not in stale]
     all_rows = global_rows + relevant_rows + project_rows + session_rows + derived_rows + evidence_rows
     all_ids = list({r[0] for r in all_rows})
@@ -1383,8 +1391,10 @@ def do_page_upsert(cur, p):
     # could retire a second author's page for the same project.
     me = (p.get("_identity") or "").strip() or None
     for extra in prior[1:]:
-        cur.execute("""UPDATE mem.memories SET status='superseded', retired_at=clock_timestamp()
-                       WHERE id=%s AND status='active' AND author = %s""", (extra, me))
+        # Retired at the instant the replacing page was written (see do_write).
+        cur.execute("""UPDATE mem.memories SET status='superseded',
+                              retired_at=(SELECT created_at FROM mem.memories WHERE id=%s)
+                       WHERE id=%s AND status='active' AND author = %s""", (mid, extra, me))
     return mid
 
 
@@ -1609,10 +1619,13 @@ def _retire_members(cur, member_ids, by, author):
     duplicates being merged says nothing about when the fact stopped holding.
     """
     for m in member_ids:
-        cur.execute("UPDATE mem.memories SET status='superseded', retired_at=clock_timestamp(), "
+        # Retired at the instant the replacement was written (see do_write); the members are
+        # locked before it is, so no reactivation of theirs can fall after that instant.
+        cur.execute("UPDATE mem.memories SET status='superseded', "
+                    "retired_at=(SELECT r.created_at FROM mem.memories r WHERE r.id=%s), "
                     "metadata = metadata || jsonb_build_object('superseded_by', %s::bigint) "
                     "WHERE id=%s AND status='active' AND author=%s RETURNING id",
-                    (by, m, author))
+                    (by, by, m, author))
         if not cur.fetchone():
             raise Refused(f"not applied: #{m} could not be retired (no longer active, or not "
                           f"{author}'s) -- nothing was changed")

@@ -570,6 +570,24 @@ def main():
               inner["id"] not in ev, str(ev))
         check("and is named in stale_premises",
               inner["id"] in ctx["scope"].get("stale_premises", []), str(ctx["scope"]))
+        served_ids = {x["id"] for sec in ctx["sections"] for x in sec["items"]}
+        stale_now = ctx["scope"].get("stale_premises", [])
+        check("while the explicit facts the live conclusion rests on are still served",
+              {f1, f2} <= served_ids and not ({f1, f2} & set(stale_now)),
+              f"served={sorted(served_ids)} stale={stale_now}")
+        # The same explicit facts reached ONLY through the evidence walk: a query that does not
+        # match them, so they cannot ride in through the relevant section.
+        ctx = m.do_context(ac, {"query": "barn-kept yearly checked", "project": P1,
+                                "depth": "max", "token_budget": 8192})
+        alice.commit()
+        ev = [x["id"] for sec in ctx["sections"] if sec["name"] == "evidence"
+              for x in sec["items"]]
+        rel = [x["id"] for sec in ctx["sections"] if sec["name"] == "relevant"
+               for x in sec["items"]]
+        check("an explicit premise reached only as evidence is kept, not called stale",
+              all(f in ev or f in rel for f in (f1, f2))
+              and not ({f1, f2} & set(ctx["scope"].get("stale_premises", []))),
+              f"evidence={ev} relevant={rel} stale={ctx['scope'].get('stale_premises')}")
 
         print("\n== R4c: retirement is stamped when it happens, not when the transaction began ==")
         old_row = write(ac, alice, type="semantic", content="lamp bulbs are warm white")
@@ -582,6 +600,11 @@ def main():
         lag = (row(old_row)[5] - began).total_seconds()
         check("supersede stamps retired_at after the transaction's own start", lag >= 0.3,
               f"{lag:.3f}s")
+        handover = owner_sql("SELECT o.retired_at = n.created_at FROM mem.memories o "
+                             "JOIN mem.memories n ON n.supersedes_id = o.id WHERE o.id=%s",
+                             (old_row,))
+        check("and exactly when its replacement was learned: no overlap, no gap",
+              handover and handover[0][0] is True, str(handover))
         g1 = write(ac, alice, type="semantic", content="kettle descaling is monthly")
         g2 = write(ac, alice, type="semantic", content="kettle descaling happens each month")
         ac.execute("SELECT now()")
