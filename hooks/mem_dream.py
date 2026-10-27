@@ -14,7 +14,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _mem_common import acquire_lock, defang, mem_ops, release_lock
+from _mem_common import acquire_lock, defang, identity, mem_ops, release_lock
 from _llm import complete
 
 LOCK = os.path.expanduser("~/.claude/hypermnesia-dream.lock")
@@ -107,6 +107,12 @@ def run_fingerprint(group):
 
 def main():
     dry = "--dry-run" in sys.argv
+    if not identity():
+        # Dreamer inputs are the author's own explicit rows and every run is recorded in the
+        # author's name; with no identity there are no inputs, and an empty pass looks healthy.
+        print("refusing to start: MEM_AUTHOR is unset or invalid -- set it to the author whose "
+              "memories this pass reasons over", file=sys.stderr, flush=True)
+        return 2
     if not acquire_lock(LOCK):
         print("another dream run holds the lock; exiting", flush=True)
         return
@@ -171,4 +177,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -21,7 +21,8 @@ CONTEXT = {
     "sections": [
         {"name": "global", "items": [
             {"id": 1, "type": "preference", "status": "active", "project": None,
-             "reasoning_level": "explicit", "content": "prefers concise reports"},
+             "reasoning_level": "explicit", "content": "prefers concise reports",
+             "query_match": True},
         ]},
         {"name": "derived", "items": [
             {"id": 4, "type": "semantic", "status": "active", "project": "sample-project",
@@ -81,6 +82,48 @@ def main():
     assert seen["cmd"] == "context" and seen["payload"]["project"] == "sample-project"
     assert seen["payload"]["depth"] == "auto" and seen["payload"]["routing"] == "global"
     assert live["abstained"] is False
+
+    # The identity the MCP server resolved is forwarded, not re-resolved here.
+    try:
+        mod.mem_ops = fake_mem_ops
+        mod.answer({"query": "How should I report?", "_identity": "alice"},
+                   generator=lambda query, context: valid)
+        assert seen["payload"]["_identity"] == "alice", seen["payload"]
+        mod.answer({"query": "How should I report?"}, generator=lambda query, context: valid)
+        assert "_identity" not in seen["payload"], seen["payload"]   # mem_ops() resolves it
+        try:
+            mod.answer({"query": "x", "_identity": "alice; DROP"}, generator=lambda *_: valid)
+            raise AssertionError("a malformed identity was accepted")
+        except ValueError:
+            pass
+    finally:
+        mod.mem_ops = original
+
+    # R6: abstention is decided in code when nothing matched the query. Profile rows alone are
+    # not an answer, and the model is never asked.
+    profile_only = json.loads(json.dumps(CONTEXT))
+    for section in profile_only["sections"]:
+        for entry in section["items"]:
+            entry.pop("query_match", None)
+    asked = []
+    try:
+        mod.mem_ops = lambda cmd, payload, timeout=0: json.dumps(profile_only)
+        abstained = mod.answer({"query": "Unrelated question?"},
+                               generator=lambda q, c: asked.append(q) or valid)
+    finally:
+        mod.mem_ops = original
+    assert abstained["abstained"] is True and not asked, abstained
+    assert "matched the query" in abstained["reason"]
+
+    # R4: a conclusion the context reports as stale cannot be cited, even if an item slipped in.
+    stale_ctx = json.loads(json.dumps(CONTEXT))
+    stale_ctx["scope"]["stale_premises"] = [4]
+    try:
+        mod.validate_reply({"abstained": False, "claims": [
+            {"text": "Alice prefers audited rollout reports.", "memory_ids": [4]}]}, stale_ctx)
+        raise AssertionError("a stale conclusion was citable")
+    except ValueError:
+        pass
 
     invalid = mod.answer
     for payload in ({"query": ""}, {"query": "x", "depth": "infinite"},

@@ -129,7 +129,7 @@ def run_dream(review_results):
             return results.pop(0)
         return "ok"
 
-    full.update(mem_ops=fake_mem_ops, acquire_lock=lambda path: True,
+    full.update(mem_ops=fake_mem_ops, acquire_lock=lambda path: True, identity=lambda: "alice",
                 release_lock=lambda path: None,
                 generate=lambda g: [{**valid, "evidence_ids": [3]}, dict(second)])
     saved_argv = sys.argv
@@ -146,4 +146,7 @@ assert len(finished) == 1 and finished[0]["status"] == "failed", finished
 assert finished[0]["candidate_count"] == 1 and "1 of 2" in finished[0]["error"], finished
 finished = run_dream(["review [#1] queued", "review [#2] already pending (derive duplicate)"])
 assert finished == [{"id": 5, "status": "succeeded", "candidate_count": 2}], finished
+# Every scheduled pass refuses to start without an identity, and says so.
+full.update(identity=lambda: None)
+assert full["main"]() == 2
 print("dreamer contract passed")

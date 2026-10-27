@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
 """Personal-memory operations -- CRUD over the `mem.*` schema (Postgres + embedder via _common).
 
-Usage: python3 mem_ops.py <write|search|supersede|get|mark|review_add|review_list|
-       review_resolve>   with a JSON payload on stdin.
+Usage: python3 mem_ops.py <write|search|supersede|get|mark|apply_verdict|review_add|
+       review_list|review_resolve|...>   with a JSON payload on stdin.
 
 write     {type, content, title?, importance?, confidence?, project?, lang?,
            subject? {namespace, entity_type, name, aliases?},
            valid_from?, valid_to?, event_time?, supersedes_id?,
            source? {source_type, session_id?, channel?, excerpt?},
            assertions? [{predicate, object_text? | object_number?, unit?}]}
-search    {query, k?, types? [..], project?, include_inactive?, max_distance?}
+search    {query, k?, types? [..], project?, include_inactive?, max_distance?,
+           as_of? (timestamptz), track_access? (default true)}
 supersede {old_id, ...same as write minus type (defaults to old memory's type)}
 get       {id}
-mark      {id, status}   -- admin op (consolidator): flip status, close validity window
+mark      {id, status, by?, valid_to?}   -- admin op: flip status; retired_at follows it
+apply_verdict {action: merge|supersede, member_ids, proposal}
+          -- a fresh consolidation verdict, applied by the same code as review approval
+
+write, supersede, search, get and mark take `"format": "json"` for a machine-readable answer
+(the default is the human-readable text the hooks inject); scripts must use it rather than
+parse the text.
+
+Two time axes. valid_from/valid_to are EVENT time and change only when a caller states event
+time; retired_at is when the store stopped believing a row (merge, mark, supersede), which is
+what `as_of` reads to reconstruct "what did I hold true then".
 
 Retrieval defaults to mem.active_memories (A3: superseded/out-of-window facts are
 invisible unless include_inactive). Hybrid RRF (bge-m3 vector + composite fts),
-recency + importance as tiebreakers.
+recency + importance as tiebreakers that can never reorder two different RRF scores.
 """
 import hashlib
 import re
@@ -237,7 +248,10 @@ def _write_derivations(cur, derived_id, author, items):
 # callers that ARE that machinery (Dreamer approval, merges, pages) may set them, and they say
 # so with _trusted_metadata -- a key no external payload can carry, because main() strips it.
 RESERVED_METADATA = frozenset(("kind", "reasoning_level", "dream_run_id", "merged_from",
-                               "merged_perspectives", "superseded_by"))
+                               "merged_perspectives", "merged_created_range", "superseded_by",
+                               "premise_ids", "valid_to_repaired_from",
+                               "retired_intervals"))
+MEMORY_TYPES = ("preference", "semantic", "episodic", "prospective", "procedural")
 
 
 def _caller_metadata(p):
@@ -247,6 +261,32 @@ def _caller_metadata(p):
     if p.get("_trusted_metadata") is True:
         return meta
     return {k: v for k, v in meta.items() if k not in RESERVED_METADATA}
+
+
+def _timestamps(cur, *values):
+    """Parse caller-supplied instants with Postgres' own rules, plus the transaction's now().
+
+    Only queried when there is something to parse, so plain writes cost no extra round trip.
+    A malformed value is refused here with a sentence, not later as a DataError traceback.
+    """
+    try:
+        cur.execute("SELECT now()" + "".join(", %s::timestamptz" for _ in values), values)
+    except Exception as exc:          # psycopg2.DataError; the module is imported lazily
+        raise SystemExit(f"not a timestamp: {values!r} ({str(exc).strip().splitlines()[0]})")
+    row = cur.fetchone()
+    return row[0], list(row[1:])
+
+
+def _check_event_window(cur, p):
+    """Refuse a write whose event window ends before it starts -- no instant satisfies it, so
+    the row would be stored and never once be visible, with nothing said."""
+    if p.get("valid_from") is None and p.get("valid_to") is None:
+        return
+    _, (vf, vt) = _timestamps(cur, p.get("valid_from"), p.get("valid_to"))
+    if vf is not None and vt is not None and vt < vf:
+        raise SystemExit(f"refusing to write: valid_to ({p.get('valid_to')}) is before "
+                         f"valid_from ({p.get('valid_from')}) -- such a fact holds at no "
+                         f"instant and would never be recalled.")
 
 
 def do_write(cur, p, supersedes_id=None):
@@ -267,16 +307,18 @@ def do_write(cur, p, supersedes_id=None):
                          "alias and must match observed")
     observed_spec = observed_spec or subject_spec
     observer_id = observed_id = None
+    _check_event_window(cur, p)
     supersedes_id = supersedes_id or p.get("supersedes_id")
     mtype = p.get("type")
     inherited_project = inherited_scope = None
     if supersedes_id:
-        # Lock the target row FOR UPDATE so two concurrent supersedes of the same memory can't
-        # both create an active replacement; refuse if it's no longer active.
+        # Lock the target row (NO KEY UPDATE: its key never changes, and a stronger lock
+        # would block foreign-key checks against it) so two concurrent supersedes of the same
+        # memory can't both create an active replacement; refuse if it's no longer active.
         cur.execute("SELECT memory_type, status, author, scope::text, project, "
-                    "subject_entity_id, observer_entity_id, observed_entity_id "
+                    "subject_entity_id, observer_entity_id, observed_entity_id, valid_from "
                     "FROM mem.memories "
-                    "WHERE id=%s FOR UPDATE", (supersedes_id,))
+                    "WHERE id=%s FOR NO KEY UPDATE", (supersedes_id,))
         row = cur.fetchone()
         if not row:
             raise SystemExit(f"supersedes_id {supersedes_id} not found")
@@ -301,6 +343,26 @@ def do_write(cur, p, supersedes_id=None):
             raise SystemExit(f"#{supersedes_id} was written by {row[2]}, not by you. Write your "
                              f"own memory, or ask them to supersede theirs -- replacing another "
                              f"author's fact silently is not something this store does.")
+        if p.get("valid_from") is not None:
+            # The caller stated EVENT time: the new fact holds from valid_from, so the old one
+            # stopped holding there. Two instants that cannot be that are refused rather than
+            # stored. In the future, the old row would be retired now and its replacement not
+            # yet valid -- no active row at all until then. Before the old row's own start,
+            # closing its window there would end it before it began.
+            now, (new_from,) = _timestamps(cur, p.get("valid_from"))
+            if new_from > now:
+                raise SystemExit(
+                    f"refusing to supersede #{supersedes_id}: valid_from {p['valid_from']} is "
+                    f"in the future, so nothing would be active until then. Write the new fact "
+                    f"now without supersedes_id (it becomes visible at valid_from), and end "
+                    f"#{supersedes_id} at the same instant with `mark` (status active, "
+                    f"valid_to set) instead.")
+            if row[8] is not None and new_from < row[8]:
+                raise SystemExit(
+                    f"refusing to supersede #{supersedes_id}: valid_from {p['valid_from']} is "
+                    f"before that memory's own valid_from, so its window would end before it "
+                    f"began. Supersede with a later valid_from, or correct #{supersedes_id} "
+                    f"first.")
         mtype = mtype or row[0]
         inherited_scope, inherited_project = row[3], row[4]
         if not observer_spec:
@@ -345,12 +407,16 @@ def do_write(cur, p, supersedes_id=None):
          EMBED_MODEL, author, scope))
     mid = cur.fetchone()[0]
     if supersedes_id:
-        # Close the old fact's window at the moment the new one takes over. LEAST (not COALESCE):
-        # a pre-existing *future* valid_to must be clamped down, not kept active past supersede.
-        cur.execute("""UPDATE mem.memories SET status='superseded',
-                       valid_to = LEAST(COALESCE(valid_to, 'infinity'::timestamptz),
-                                        COALESCE(%s::timestamptz, now()))
-                       WHERE id=%s""", (p.get("valid_from"), supersedes_id))
+        # The store stops BELIEVING the old row now (retired_at). Its EVENT window is closed
+        # only when the caller said when the new fact took over: a correction without a
+        # valid_from says "I was wrong", not "it stopped being true today". LEAST, not
+        # COALESCE: a pre-existing later valid_to is clamped down to the stated instant.
+        cur.execute("""UPDATE mem.memories SET status='superseded', retired_at=now(),
+                       valid_to = CASE WHEN %s::timestamptz IS NULL THEN valid_to
+                                       ELSE LEAST(COALESCE(valid_to, 'infinity'::timestamptz),
+                                                  %s::timestamptz) END
+                       WHERE id=%s""", (p.get("valid_from"), p.get("valid_from"),
+                                        supersedes_id))
     src = p.get("source") or {}
     cur.execute("""INSERT INTO mem.sources (memory_id, source_type, session_id, channel, excerpt)
                    VALUES (%s,%s,%s,%s,%s)""",
@@ -371,6 +437,41 @@ def do_write(cur, p, supersedes_id=None):
     return mid
 
 
+# -- RRF and its tiebreakers -------------------------------------------------------------------
+# score = 1/(K+rank_dense) + 1/(K+rank_lexical), each leg cut at LEG_DEPTH ranks. Importance and
+# recency are meant to break TIES, but they used to be 0.002*importance and 0.001 for "under 30
+# days" -- at K=60 the gap between ranks 1 and 2 of one leg is 1/61-1/62 ~ 2.6e-4, so the
+# "tiebreakers" outweighed several rank positions and reordered genuinely better matches.
+#
+# A tiebreaker must be smaller than the smallest DIFFERENCE between two reachable RRF scores.
+# Each leg contributes 0 (absent) or 1/(K+r), r = 1..LEG_DEPTH; the reachable scores are all
+# pairwise sums. Enumerated exactly (rationals, 31 x 31 sums) at K=60, LEG_DEPTH=30 the smallest
+# positive gap is 1/45474372 ~ 2.199e-8, between 164/6723 and 165/6764 -- two-leg sums, far
+# below any single-leg rank step (the smallest of those is 1/89-1/90 = 1/8010 ~ 1.2e-4).
+# Each tiebreaker is given a quarter of that gap, so both together stay under half of it: an
+# exact tie is broken by importance, then recency; no two different scores are ever swapped.
+# Score arithmetic is numeric/float8, whose resolution at ~0.03 is ~1e-17 -- far below the gap.
+RRF_K = 60
+RRF_LEG_DEPTH = 30
+
+
+def _min_rrf_gap(k=RRF_K, depth=RRF_LEG_DEPTH):
+    from fractions import Fraction
+    leg = [Fraction(0)] + [Fraction(1, k + r) for r in range(1, depth + 1)]
+    sums = sorted({a + b for a in leg for b in leg})
+    return min(b - a for a, b in zip(sums, sums[1:]))
+
+
+RRF_MIN_GAP = float(_min_rrf_gap())
+TIE_IMPORTANCE = RRF_MIN_GAP / 4          # times importance in [0, 1]
+TIE_RECENCY = RRF_MIN_GAP / 4             # for a row created in the last 30 days
+
+# A derived conclusion is served only while every premise it was drawn from is active and
+# readable (mem.premises_live, sql/migrate_memory_lifecycle.sql). Decided at query time: nothing
+# is cascaded onto the conclusion, so a premise that comes back makes it servable again.
+DERIVED_LIVE = ("CASE WHEN coalesce(m.metadata->>'reasoning_level','explicit')='explicit' "
+                "THEN true ELSE mem.premises_live(m.id) END")
+
 SEARCH_SQL = """
 WITH q AS (
   SELECT %s::vector AS emb,
@@ -387,25 +488,37 @@ pool AS (
     AND (%s::text IS NULL OR m.id IN (
           SELECT memory_id FROM mem.perspective_graph
           WHERE lower(observed->>'name') = lower(%s)))
+    -- as_of: the belief state at that instant -- learned by then, not retired by then, and
+    -- not inside an earlier retirement that a later reactivation closed; whatever the row's
+    -- status is today.
+    AND (%s::timestamptz IS NULL OR (m.created_at <= %s::timestamptz
+         AND (m.retired_at IS NULL OR m.retired_at > %s::timestamptz)
+         AND NOT EXISTS (
+           SELECT 1 FROM jsonb_array_elements(
+             CASE WHEN jsonb_typeof(m.metadata->'retired_intervals') = 'array'
+                  THEN m.metadata->'retired_intervals' ELSE '[]'::jsonb END) iv
+            -- try_timestamptz: a malformed entry is ignored, never fatal to the search.
+            WHERE mem.try_timestamptz(iv->>'retired_at') <= %s::timestamptz
+              AND mem.try_timestamptz(iv->>'reactivated_at') > %s::timestamptz)))
 ),
 semantic AS (
   -- distance gate: an irrelevant query must return NOTHING (abstention), not top-k noise
   SELECT id, RANK() OVER (ORDER BY embedding <=> (SELECT emb FROM q)) AS rank
   FROM pool WHERE embedding IS NOT NULL
     AND embedding <=> (SELECT emb FROM q) < {maxdist}
-  ORDER BY embedding <=> (SELECT emb FROM q) LIMIT 30
+  ORDER BY embedding <=> (SELECT emb FROM q) LIMIT {depth}
 ),
 lexical AS (
   SELECT id, RANK() OVER (ORDER BY ts_rank_cd(fts,(SELECT ts FROM q),1) DESC) AS rank
   FROM pool WHERE fts @@ (SELECT ts FROM q)
-  ORDER BY ts_rank_cd(fts,(SELECT ts FROM q),1) DESC LIMIT 30
+  ORDER BY ts_rank_cd(fts,(SELECT ts FROM q),1) DESC LIMIT {depth}
 )
 SELECT m.id, m.memory_type::text, m.status::text, m.importance, m.confidence,
        m.created_at::date::text, m.valid_from::date::text, m.valid_to::date::text,
        m.project, m.content,
-       (COALESCE(1.0/(60+s.rank),0) + COALESCE(1.0/(60+l.rank),0)
-        + 0.002*m.importance
-        + CASE WHEN m.created_at > now()-interval '30 days' THEN 0.001 ELSE 0 END) AS score,
+       (COALESCE(1.0/({k}+s.rank),0) + COALESCE(1.0/({k}+l.rank),0)
+        + {tie_imp}*m.importance
+        + CASE WHEN m.created_at > now()-interval '30 days' THEN {tie_rec} ELSE 0 END) AS score,
        -- The row's real layer. Context assembly labels search hits with it; without this
        -- column a Dreamer conclusion found by search was presented as an explicit fact.
        coalesce(m.metadata->>'reasoning_level','explicit') AS reasoning_level
@@ -416,9 +529,10 @@ LEFT JOIN lexical  l ON l.id = m.id
 -- near-misses of the semantic gate (identifiers, unstemmed forms), not to admit a memory that
 -- merely shares one incidental token with the query. Without this floor, OR-converted lexical
 -- matching defeats abstention.
-WHERE s.id IS NOT NULL
-   OR (l.id IS NOT NULL AND (m.embedding IS NULL OR m.embedding <=> (SELECT emb FROM q) < {lexdist}))
-ORDER BY score DESC LIMIT %s;
+WHERE (s.id IS NOT NULL
+   OR (l.id IS NOT NULL AND (m.embedding IS NULL OR m.embedding <=> (SELECT emb FROM q) < {lexdist})))
+  AND {derived_live}
+ORDER BY score DESC, m.importance DESC, m.created_at DESC, m.id DESC LIMIT %s;
 """
 
 
@@ -475,12 +589,20 @@ def _simple_query(q):
     return " ".join(toks) if toks else "zzz-no-lexemes-zzz"   # nothing meaningful -> matches nothing
 
 
-def do_search(cur, p, track_access=True):
+def do_search(cur, p, track_access=True, include_stale=False):
+    """Hybrid search. `include_stale` keeps derived rows whose premises are gone, for the one
+    caller (do_context) that reports them; every other reader never sees them."""
     # `mem.all_memories`, NOT the base table. Swapping in `mem.memories` here took the scope
     # rule out of the query entirely -- reproduced: a second reader entitled only to shared rows
     # searched with include_inactive and got the owner's private preferences plus rows from a
     # project they are not a member of. History is a narrower question than "everything".
-    src = "mem.all_memories" if p.get("include_inactive") else "mem.active_memories"
+    as_of = p.get("as_of") or None
+    if as_of is not None:
+        if not isinstance(as_of, str):
+            raise SystemExit("as_of must be a timestamp string, e.g. 2026-09-01T00:00:00Z")
+        _timestamps(cur, as_of)
+    history = bool(p.get("include_inactive") or as_of)
+    src = "mem.all_memories" if history else "mem.active_memories"
     emb = embed(p["query"])
     q = p["query"]
     types = p.get("types") or None
@@ -501,13 +623,18 @@ def do_search(cur, p, track_access=True):
     lexdist = float(os.environ.get("MEM_LEX_MAXDIST") or maxdist)
     cur.execute("SET hnsw.ef_search = 100")
     cur.execute("SET hnsw.iterative_scan = relaxed_order")
+    # History shows what was there, stale conclusions included (their level is in the row).
+    derived_live = "TRUE" if (history or include_stale) else DERIVED_LIVE
     cur.execute(SEARCH_SQL.format(src=src, maxdist=maxdist, lexdist=lexdist,
-                                  lang=FTS_LANG),
+                                  lang=FTS_LANG, k=RRF_K, depth=RRF_LEG_DEPTH,
+                                  tie_imp=repr(TIE_IMPORTANCE), tie_rec=repr(TIE_RECENCY),
+                                  derived_live=derived_live),
                 (emb, _no_neg(q), _simple_query(q), proj, proj, types, types,
-                 observer, observer, observed, observed, p.get("k", 8)))
+                 observer, observer, observed, observed, as_of, as_of, as_of, as_of, as_of,
+                 p.get("k", 8)))
     rows = cur.fetchall()
     ids = [r[0] for r in rows]
-    if ids and not p.get("include_inactive") and track_access:
+    if ids and not history and track_access:
         # The definer function applies may_read() before touching rows. A direct UPDATE is
         # author-scoped by RLS and silently skipped shared project memories from other authors,
         # making hot shared knowledge look stale to its owner.
@@ -590,7 +717,7 @@ def do_peer_card(cur, p):
                      ORDER BY pc.last_seen_at DESC,e.id), '[]'::jsonb)
                    FROM mem.peer_cards pc JOIN mem.entities e
                      ON e.author=pc.author AND e.id=pc.peer_entity_id
-                   WHERE pc.author=current_setting('mem.reader',true)
+                   WHERE pc.author=mem.reader()
                      AND (lower(e.canonical_name)=lower(%s)
                           OR EXISTS (SELECT 1 FROM unnest(e.aliases) a
                                      WHERE lower(a)=lower(%s)))
@@ -613,7 +740,7 @@ def do_dream_inputs(cur, p):
                               PARTITION BY m.observer_entity_id,m.observed_entity_id
                               ORDER BY m.created_at DESC,m.importance DESC,m.id DESC) rn
                        FROM mem.memories m
-                      WHERE m.author=current_setting('mem.reader',true)
+                      WHERE m.author=mem.reader()
                         AND m.status='active'
                         AND (m.valid_from IS NULL OR m.valid_from <= now())
                         AND (m.valid_to IS NULL OR m.valid_to > now())
@@ -625,9 +752,9 @@ def do_dream_inputs(cur, p):
                           oo.namespace,oo.entity_type,oo.canonical_name,
                           od.namespace,od.entity_type,od.canonical_name
                      FROM ranked r
-                     JOIN mem.entities oo ON oo.author=current_setting('mem.reader',true)
+                     JOIN mem.entities oo ON oo.author=mem.reader()
                                          AND oo.id=r.observer_entity_id
-                     JOIN mem.entities od ON od.author=current_setting('mem.reader',true)
+                     JOIN mem.entities od ON od.author=mem.reader()
                                          AND od.id=r.observed_entity_id
                     WHERE r.rn <= %s
                     ORDER BY r.observer_entity_id,r.observed_entity_id,
@@ -688,7 +815,7 @@ def do_dream_finish(cur, p):
         raise SystemExit("dream status must be succeeded or failed")
     cur.execute("""UPDATE mem.dream_runs
                       SET status=%s,candidate_count=%s,error=%s,finished_at=now()
-                    WHERE id=%s AND author=current_setting('mem.reader',true)
+                    WHERE id=%s AND author=mem.reader()
                       AND status='running' RETURNING id""",
                 (status, max(0, int(p.get("candidate_count", 0))),
                  scrub(p.get("error"))[:1000] if p.get("error") else None, int(p["id"])))
@@ -727,7 +854,7 @@ def _context_metadata(value):
 
 def _context_row(r, sources=None, reasoning_level=None, evidence_for=None, evidence_depth=None,
                  evidence_paths=None, perspective=None, contradicts=None,
-                 contradicted_by=None):
+                 contradicted_by=None, query_match=False):
     content = context_safe(r[9])
     clipped = len(content) > CONTEXT_ITEM_CHARS
     out = {
@@ -750,7 +877,20 @@ def _context_row(r, sources=None, reasoning_level=None, evidence_for=None, evide
         out["contradicted_by"] = sorted(set(contradicted_by))
     if perspective:
         out["perspective"] = perspective
+    if query_match:
+        # Matched the query through search, as opposed to riding along as profile. memory_ask
+        # abstains, before any model call, when no packed item carries this.
+        out["query_match"] = True
     return out
+
+
+def _stale_derived(cur, ids):
+    """The derived rows among `ids` whose premises are no longer all active and readable."""
+    if not ids:
+        return set()
+    cur.execute("SELECT u.id FROM unnest(%s::bigint[]) AS u(id) "
+                "WHERE NOT mem.premises_live(u.id)", (list(ids),))
+    return {r[0] for r in cur.fetchall()}
 
 
 def pack_context(sections, token_budget, scope):
@@ -893,7 +1033,8 @@ def _context_perspectives(cur, ids, ranked_ids=None, route_limit=3):
                             'observed_count',pc.observed_count) END
                      FROM mem.perspective_graph pg
                      LEFT JOIN mem.peer_cards pc ON pc.author=pg.author
-                       AND pc.peer_entity_id=(pg.observed->>'id')::bigint
+                       AND pc.peer_entity_id=CASE WHEN (pg.observed->>'id') ~ '^[0-9]{1,18}$'
+                                                  THEN (pg.observed->>'id')::bigint END
                     WHERE pg.memory_id=ANY(%s)
                     ORDER BY pg.memory_id""", (ids,))
     rows = cur.fetchall()
@@ -992,8 +1133,13 @@ def do_context(cur, p):
     pre_limit = 40 if requested_depth == "auto" else CONTEXT_DEPTHS[requested_depth]["limit"]
     searched_rows = do_search(cur, {**p, "query": query, "project": project,
                                     "k": min(80, pre_limit * 2)},
-                              track_access=False) if query else []
+                              track_access=False, include_stale=True) if query else []
     levels = {r[0]: r[11] for r in searched_rows}
+    # A conclusion whose premises were superseded, retracted or merged away is not served: it is
+    # named in scope.stale_premises instead, so the omission is visible, and never cited.
+    stale = _stale_derived(cur, [r[0] for r in searched_rows
+                                 if levels.get(r[0]) in ("deductive", "inductive")])
+    searched_rows = [r for r in searched_rows if r[0] not in stale]
     if requested_depth == "auto":
         depth, selection_reason, selection_signals = _auto_depth(
             query, routing, searched_rows, levels)
@@ -1056,7 +1202,10 @@ def do_context(cur, p):
         # Preserve priority order while presenting every conclusion once.
         seen_derived = set()
         derived_rows = [r for r in derived_rows
-                        if not (r[0] in seen_derived or seen_derived.add(r[0]))][:limit]
+                        if not (r[0] in seen_derived or seen_derived.add(r[0]))]
+        stale |= _stale_derived(cur, [r[0] for r in derived_rows if r[0] not in stale
+                                      and r[0] not in levels])
+        derived_rows = [r for r in derived_rows if r[0] not in stale][:limit]
 
     evidence_rows = _context_evidence(cur, [r[0] for r in derived_rows],
                                       depth_cfg["evidence_hops"], limit * 2)
@@ -1065,6 +1214,9 @@ def do_context(cur, p):
     sources = _context_sources(cur, all_ids)
     perspectives, _ = _context_perspectives(cur, all_ids)
     evidence_meta = {r[0]: (r[13], r[12], r[14], r[15]) for r in evidence_rows}
+    # What the query actually brought in: explicit hits plus conclusions found by search.
+    query_ids = ({r[0] for r in relevant_rows}
+                 | {r[0] for r in derived_rows if r[0] in levels})
     contradicted_by = {}
     for r in evidence_rows:
         for target in r[15] or []:
@@ -1075,7 +1227,8 @@ def do_context(cur, p):
         return _context_row(row, sources.get(row[0]), level,
                             evidence_for=roots, evidence_depth=hops, evidence_paths=paths,
                             perspective=perspectives.get(row[0]), contradicts=contradicts,
-                            contradicted_by=contradicted_by.get(row[0]))
+                            contradicted_by=contradicted_by.get(row[0]),
+                            query_match=row[0] in query_ids)
 
     base_sections = [
         ("global", [context_item(r) for r in global_rows]),
@@ -1096,6 +1249,7 @@ def do_context(cur, p):
     scope_routes = routes
     depth_selection = {"selected": depth, "reason": selection_reason,
                        "signals": selection_signals}
+    stale_ids = sorted(stale)[:4 if budget < 1024 else 20]
     if budget < 1024:
         # A 512-byte request must remain valid even after routing metadata was added. Preserve the
         # decision and its audit identity, while compacting optional diagnostics before packing.
@@ -1106,14 +1260,21 @@ def do_context(cur, p):
             "peer_active_count": (route.get("peer_card") or {}).get("active_count"),
         } for route in routes[:1]]
         depth_selection = {"selected": depth, "reason": selection_reason}
-    return pack_context(sections, budget,
-                        {"global": True, "project": project, "routing": routing,
-                         "routes": scope_routes, "session_id": session_id,
-                         "depth": depth, "requested_depth": requested_depth,
-                         "depth_selection": depth_selection,
-                         "query_used": bool(query),
-                         "query_sha256": hashlib.sha256(query.encode()).hexdigest()[:16]
-                                         if query else None})
+    scope = {"global": True, "project": project, "routing": routing,
+             "routes": scope_routes, "session_id": session_id,
+             "depth": depth, "requested_depth": requested_depth,
+             "depth_selection": depth_selection,
+             "query_used": bool(query),
+             "query_sha256": hashlib.sha256(query.encode()).hexdigest()[:16]
+                             if query else None}
+    if budget >= 1024:
+        # Diagnostic only (memory_ask reads the per-item query_match flags), so it gives way
+        # first when the budget is at its floor.
+        scope["query_hits"] = len(query_ids)
+    if stale_ids:
+        # Only when there is something to say: the smallest budget has no room for an empty list.
+        scope["stale_premises"] = stale_ids
+    return pack_context(sections, budget, scope)
 
 
 def do_nearest(cur, p):
@@ -1154,9 +1315,12 @@ def do_reflect_group(cur, p):
     the project and to anyone the document search reaches. The page is shared by construction,
     so only shared material may go into it.
     """
+    # Fully ordered: the caller feeds the first MEM_REFLECT_MAX rows to the model, and with
+    # importance alone (most automatic rows sit at the 0.7 clamp) WHICH rows made the cut was
+    # whatever order the planner produced that night.
     cur.execute("""SELECT coalesce(json_agg(json_build_object(
                      'id',id,'type',memory_type,'imp',importance,'content',content)
-                     ORDER BY importance DESC),'[]')
+                     ORDER BY importance DESC, created_at DESC, id DESC),'[]')
                    FROM mem.active_memories
                    WHERE (metadata->>'kind') IS DISTINCT FROM 'page'
                      AND scope = 'project' AND project = %s""",
@@ -1188,15 +1352,16 @@ def do_page_upsert(cur, p):
                "importance": p.get("importance", 0.6), "confidence": p.get("confidence", 0.7)}
     # The newest becomes the supersede TARGET, so the chain stays walkable from the new page.
     mid = do_write(cur, payload, supersedes_id=prior[0] if prior else None)
-    # Any others are retired the same way do_write retires a supersede target: status plus a
-    # closed validity window, so they leave active recall but stay readable as history.
+    # Any others are retired the same way do_write retires a supersede target: status plus
+    # retired_at (belief time), so they leave active recall but stay readable as history. The
+    # event window (valid_to) is not touched: a page being rebuilt says nothing about when the
+    # facts it summarized stopped holding.
     # ...and only the author's own. This loop retires rows by id, one line after do_write
     # refuses to supersede another author's -- so it walked straight around that check and
     # could retire a second author's page for the same project.
     me = (p.get("_identity") or "").strip() or None
     for extra in prior[1:]:
-        cur.execute("""UPDATE mem.memories SET status='superseded',
-                       valid_to = LEAST(COALESCE(valid_to, 'infinity'::timestamptz), now())
+        cur.execute("""UPDATE mem.memories SET status='superseded', retired_at=now()
                        WHERE id=%s AND status='active' AND author = %s""", (extra, me))
     return mid
 
@@ -1320,12 +1485,28 @@ def do_stale_list(cur, p):
 def fmt_row(r):
     mid, mtype, status, imp, conf, created, vfrom, vto, project, content, _ = r[:11]
     flags = f"{mtype} imp={imp:.1f}"
+    level = r[11] if len(r) > 11 else None
+    if level in ("deductive", "inductive"):
+        # A conclusion is not a fact anyone stated. Search serves it only while its premises
+        # are live, and says what it is.
+        flags += f" derived:{level}"
     if status != "active":
         flags += f" [{status}]"
     if project:
         flags += f" @{project}"
     window = f" valid {vfrom or '…'}→{vto or '…'}" if (vfrom or vto) else ""
     return f"[#{mid}] ({flags}, {created}{window}) {content}"
+
+
+def row_json(r):
+    """One search/get row as a machine-readable object -- the contract scripts parse."""
+    out = {"id": r[0], "type": r[1], "status": r[2], "importance": float(r[3]),
+           "confidence": float(r[4]), "created_at": r[5], "valid_from": r[6],
+           "valid_to": r[7], "project": r[8], "content": r[9]}
+    if len(r) > 11:
+        out["score"] = float(r[10])
+        out["reasoning_level"] = r[11]
+    return out
 
 
 def _group_scope(cur, member_ids):
@@ -1365,21 +1546,75 @@ def _member_perspectives(cur, member_ids):
             for r in cur.fetchall()]
 
 
+class Refused(Exception):
+    """A proposal that cannot be applied as asked. Raised, never returned, so that whatever it
+    had already written is rolled back with it: a verdict is applied whole or not at all."""
+
+
 def apply_proposal(cur, action, member_ids, proposal, who=None):
-    """Apply an approved consolidation proposal — the same effect the consolidator would
-    have had at write time (merge → one canonical memory + supersede members; supersede →
-    mark losers). Returns a human summary."""
+    """Apply an approved consolidation proposal and return a human summary.
+
+    The ONE implementation of a consolidation change: review approval and the consolidator's
+    high-confidence branch (`apply_verdict`) both come here. Runs under a savepoint, so a
+    refusal at any step -- including a member that can no longer be retired -- leaves nothing
+    changed, while the caller's own transaction (the review-queue claim) survives."""
+    return apply_proposal_result(cur, action, member_ids, proposal, who)["message"]
+
+
+def apply_proposal_result(cur, action, member_ids, proposal, who=None, channel="review"):
+    """apply_proposal, structured: {applied, action, message, id}. `channel` only labels the
+    merged row's provenance (review approval vs the consolidator's own verdict)."""
+    if not isinstance(proposal, dict):
+        return {"applied": False, "action": action, "id": None,
+                "message": "not applied: the proposal is not an object"}
+    cur.execute("SAVEPOINT hm_apply_proposal")
+    try:
+        message, new_id = _apply(cur, action, list(member_ids or []), proposal, who, channel)
+    except Refused as exc:
+        cur.execute("ROLLBACK TO SAVEPOINT hm_apply_proposal")
+        return {"applied": False, "action": action, "message": str(exc), "id": None}
+    cur.execute("RELEASE SAVEPOINT hm_apply_proposal")
+    return {"applied": True, "action": action, "message": message, "id": new_id}
+
+
+def _retire_members(cur, member_ids, by, author):
+    """Retire every member in favour of `by`, or refuse the whole proposal.
+
+    One UPDATE per member, each required to hit exactly its row: still active, still the
+    author's. The consolidator used to fire one `mark` per member and ignore the answers, so a
+    member it was not allowed to retire stayed active next to the replacement that restated it.
+    Belief time only: retired_at is set, the EVENT window (valid_to) is left as it was -- two
+    duplicates being merged says nothing about when the fact stopped holding.
+    """
+    for m in member_ids:
+        cur.execute("UPDATE mem.memories SET status='superseded', retired_at=now(), "
+                    "metadata = metadata || jsonb_build_object('superseded_by', %s::bigint) "
+                    "WHERE id=%s AND status='active' AND author=%s RETURNING id",
+                    (by, m, author))
+        if not cur.fetchone():
+            raise Refused(f"not applied: #{m} could not be retired (no longer active, or not "
+                          f"{author}'s) -- nothing was changed")
+
+
+def _apply(cur, action, member_ids, proposal, who, channel="review"):
     # Re-validate: if another pass already consolidated the group (no members still active),
     # applying now would create a redundant canonical memory.
-    unique_members = sorted(set(int(mid) for mid in member_ids))
+    try:
+        unique_members = sorted(set(int(mid) for mid in member_ids))
+    except (TypeError, ValueError):
+        raise Refused(f"invalid member ids {member_ids} -- not applied")
     if len(unique_members) != len(member_ids):
-        return f"invalid duplicate member ids {member_ids} -- not applied"
+        raise Refused(f"invalid duplicate member ids {member_ids} -- not applied")
+    member_ids = [int(m) for m in member_ids]
+    if len(unique_members) < 1:
+        raise Refused("no member ids -- not applied")
     cur.execute("SELECT count(*) FROM mem.active_memories WHERE id = ANY(%s)",
                 (unique_members,))
     active_count = cur.fetchone()[0]
     if active_count != len(unique_members):
-        return (f"stale/incomplete group {member_ids}: {active_count}/{len(unique_members)} "
-                "members are still active and visible -- not applied")
+        raise Refused(f"stale/incomplete group {member_ids}: {active_count}/"
+                      f"{len(unique_members)} members are still active and visible -- "
+                      f"not applied")
     # Consolidation ends with every member row superseded -- gone from every retrieval path --
     # and, for a merge, one new row in the applier's name carrying what they all said. Across
     # authors that is one person quietly rewriting what another knows, which is the same thing
@@ -1388,30 +1623,46 @@ def apply_proposal(cur, action, member_ids, proposal, who=None):
     cur.execute("SELECT DISTINCT author FROM mem.memories WHERE id = ANY(%s)", (member_ids,))
     authors = sorted(a for (a,) in cur.fetchall() if a)
     if len(authors) > 1:
-        return (f"not applied: {member_ids} were written by {', '.join(authors)}. Merging "
-                f"across authors would supersede one person's memory in another's name.")
+        raise Refused(f"not applied: {member_ids} were written by {', '.join(authors)}. "
+                      f"Merging across authors would supersede one person's memory in "
+                      f"another's name.")
     if authors and who and authors[0] != who:
-        return (f"not applied: {member_ids} belong to {authors[0]}, not to {who}.")
+        raise Refused(f"not applied: {member_ids} belong to {authors[0]}, not to {who}.")
+    if not authors:
+        raise Refused(f"not applied: {member_ids} have no author on record")
+    author = authors[0]
+    # Only explicit rows take part. A Dreamer conclusion merged into its own premise would come
+    # out as an "explicit fact" with no evidence edges; a page merged into its sources would
+    # summarize itself. Neither is a duplicate of anything.
+    cur.execute("""SELECT id FROM mem.memories WHERE id = ANY(%s)
+                     AND ((metadata->>'kind') = 'page'
+                          OR coalesce(metadata->>'reasoning_level','explicit') <> 'explicit')
+                   ORDER BY id""", (member_ids,))
+    layered = [r[0] for r in cur.fetchall()]
+    if layered:
+        raise Refused(f"not applied: {layered} are derived conclusions or knowledge pages; "
+                      f"consolidation acts on explicit memories only")
     if action == "derive":
         level = proposal.get("reasoning_level")
         minimum = 1 if level == "deductive" else 2
         if level not in ("deductive", "inductive"):
-            return "not applied: derive proposal has no valid reasoning_level"
+            raise Refused("not applied: derive proposal has no valid reasoning_level")
         if len(unique_members) < minimum or len(unique_members) > 8:
-            return (f"not applied: {level} conclusion needs {minimum}..8 distinct premises, "
-                    f"got {len(unique_members)}")
+            raise Refused(f"not applied: {level} conclusion needs {minimum}..8 distinct "
+                          f"premises, got {len(unique_members)}")
         perspective = _group_perspective(cur, unique_members)
         if not perspective:
-            return "not applied: premises do not share one observer/observed perspective"
+            raise Refused("not applied: premises do not share one observer/observed perspective")
         content = scrub(proposal.get("content") or "").strip()
         if len(content) < 20 or len(content) > 1200:
-            return "not applied: derived content must contain 20..1200 characters"
+            raise Refused("not applied: derived content must contain 20..1200 characters")
         cur.execute("""SELECT id FROM mem.active_memories
                         WHERE author=%s AND lower(btrim(content))=lower(btrim(%s)) LIMIT 1""",
-                    (authors[0], content))
+                    (author, content))
         duplicate = cur.fetchone()
         if duplicate:
-            return f"not applied: equivalent active memory already exists as #{duplicate[0]}"
+            raise Refused(f"not applied: equivalent active memory already exists as "
+                          f"#{duplicate[0]}")
         project = _group_project(cur, unique_members)
         scope = _group_scope(cur, unique_members)
         # Cross-project induction narrows to private/global. A derived statement may combine
@@ -1420,77 +1671,119 @@ def apply_proposal(cur, action, member_ids, proposal, who=None):
             scope = "private"
         observer, observed = perspective
         confidence = _unit(proposal.get("confidence", 0.0), 0.0)
-        mid = do_write(cur, {
+        mid = _write_or_refuse(cur, {
             "type": "semantic", "content": content,
-            "importance": min(0.7, max(0.0, float(proposal.get("importance", 0.5)))),
+            "importance": min(0.7, _unit(proposal.get("importance", 0.5), 0.5)),
             "confidence": confidence, "project": project, "scope": scope,
             "observer": observer, "observed": observed,
+            # premise_ids: the premises as approved, so a premise deleted outright later (its
+            # edge goes with it) still counts as a missing premise -- see mem.premises_live.
             "metadata": {"kind": "dream", "reasoning_level": level,
-                         "dream_run_id": proposal.get("dream_run_id")},
+                         "dream_run_id": proposal.get("dream_run_id"),
+                         "premise_ids": unique_members},
             "_trusted_metadata": True,
             "evidence": [{"memory_id": m, "relation": "inferred_from",
                           "confidence": confidence, "note": f"dreamer {level} premise"}
                          for m in unique_members],
-            "_identity": authors[0],
+            "_identity": author,
             "source": {"source_type": "assistant_inference", "channel": "dreamer",
                        "excerpt": f"{level} from {unique_members}"}})
-        return f"derived {level} {unique_members} -> [#{mid}]"
-    # A group spanning two projects has no single audience to inherit. `_group_project` returns
-    # NULL for it, and a project-scoped row with no project fails the CHECK -- which aborted the
-    # whole review transaction rather than declining the one proposal.
-    if action == "merge" and _group_scope(cur, member_ids) == "project" \
-            and _group_project(cur, member_ids) is None:
-        return (f"not applied: {member_ids} are shared with different projects, so the merged "
-                f"memory would have no audience of its own. Merge within one project.")
-    if action == "merge" and proposal.get("content"):
+        return f"derived {level} {unique_members} -> [#{mid}]", mid
+    if len(unique_members) < 2:
+        raise Refused(f"not applied: {action} needs at least two members, got {member_ids}")
+    # Lock EVERY member -- the winner of a supersede included -- before changing any, in id
+    # order so two appliers cannot deadlock, and recheck under the lock. The checks above read
+    # a snapshot: two concurrent supersede verdicts on [A, B], one naming A the winner and one
+    # naming B, both passed them, each retired only its loser, and both committed -- leaving
+    # neither row active. With the lock the second waits, then sees the first one's work here.
+    # Under RLS a row the applier may not update is not returned at all, which refuses too.
+    # NO KEY UPDATE, not UPDATE: only status, retired_at and metadata change, and a full UPDATE
+    # lock conflicts with the KEY SHARE lock a foreign-key check takes. A concurrent write whose
+    # evidence edge points at a member (it holds the derivations lock from the evidence guard,
+    # then checks the FK) would wait on that member while this one, holding the member, waited
+    # for the derivations lock to write its own edges: a deadlock.
+    cur.execute("SELECT id, status::text, author FROM mem.memories WHERE id = ANY(%s) "
+                "ORDER BY id FOR NO KEY UPDATE", (unique_members,))
+    locked = {r[0]: r for r in cur.fetchall()}
+    gone = [m for m in unique_members
+            if m not in locked or locked[m][1] != "active" or locked[m][2] != author]
+    if gone:
+        raise Refused(f"not applied: {gone} changed while this was being applied (no longer "
+                      f"active, or not {author}'s) -- nothing was changed")
+    if action == "merge":
+        content = (proposal.get("content") or "").strip() if isinstance(
+            proposal.get("content"), str) else ""
+        if not content:
+            raise Refused("not applied: merge proposal has no content")
+        mtype = proposal.get("type", "semantic")
+        if mtype not in MEMORY_TYPES:
+            raise Refused(f"not applied: merge proposal has unknown type {mtype!r}")
+        # The GROUP decides scope and project, not the proposal. `proposal` is the LLM
+        # consolidator's output -- untrusted text -- and reading `scope`/`project` from it let a
+        # merge of private rows come back project-scoped, or land under a different project's
+        # tag, on the say-so of the thing being reviewed. `private` if ANY member was.
+        scope = _group_scope(cur, member_ids)
+        project = _group_project(cur, member_ids)
+        # A group spanning two projects has no single audience to inherit: `_group_project`
+        # returns NULL for it, and a project-scoped row with no project fails the CHECK.
+        if scope == "project" and project is None:
+            raise Refused(f"not applied: {member_ids} are shared with different projects, so "
+                          f"the merged memory would have no audience of its own. Merge "
+                          f"within one project.")
         # The merged row keeps the members' perspective when they share one. Without it the
         # write defaulted to the author observing themself, and the peer card of whoever the
         # members were about lost those rows from its counts. Members that disagree get the
         # default, with what each one said recorded rather than silently dropped.
         pairs = _member_perspectives(cur, member_ids)
         metadata = {"merged_from": list(member_ids)}
+        # created_at of the merged row is now() -- it is a new belief -- but when its content
+        # was first learned is recorded rather than lost.
+        cur.execute("SELECT min(created_at), max(created_at) FROM mem.memories "
+                    "WHERE id = ANY(%s)", (member_ids,))
+        span = cur.fetchone()
+        if span and span[0] is not None:
+            metadata["merged_created_range"] = [str(span[0]), str(span[1])]
         perspective = {}
         if len(pairs) == 1:
             perspective = {"observer": pairs[0][0], "observed": pairs[0][1]}
         elif pairs:
             metadata["merged_perspectives"] = [{"observer": o["name"], "observed": d["name"]}
                                                for o, d in pairs]
-        mid = do_write(cur, {
-            "type": proposal.get("type", "semantic"),
-            "content": proposal["content"],
-            "importance": min(0.7, max(0.0, float(proposal.get("importance", 0.6)))),
+        mid = _write_or_refuse(cur, {
+            "type": mtype, "content": content,
+            "importance": min(0.7, _unit(proposal.get("importance", 0.6), 0.6)),
             **perspective,
             "metadata": metadata, "_trusted_metadata": True,
             "evidence": [{"memory_id": m, "relation": "summarizes",
                           "note": "consolidation source"} for m in member_ids],
             # The merged row keeps the group's author and audience rather than taking the
             # applier's defaults: a merge restates what was already there, it does not publish.
-            #
-            # The GROUP decides, not the proposal. `proposal` is the LLM consolidator's output
-            # -- untrusted text -- and reading `scope`/`project` from it let a merge of private
-            # rows come back project-scoped, or land under a different project's tag, on the
-            # say-so of the thing being reviewed.
-            "_identity": authors[0] if authors else who,
-            "scope": _group_scope(cur, member_ids),
-            "project": _group_project(cur, member_ids),
-            "source": {"source_type": "consolidation", "channel": "review",
+            "_identity": author, "scope": scope, "project": project,
+            "source": {"source_type": "consolidation", "channel": channel,
                        "excerpt": f"merged from {member_ids}"}})
-        for m in member_ids:
-            cur.execute("UPDATE mem.memories SET status='superseded', "
-                        "valid_to=COALESCE(valid_to, now()), "
-                        "metadata = metadata || jsonb_build_object('superseded_by', %s::bigint) "
-                        "WHERE id=%s AND status='active'", (mid, m))
-        return f"merged {member_ids} -> [#{mid}]"
-    if action == "supersede" and proposal.get("winner_id") in member_ids:
-        win = proposal["winner_id"]
-        for m in member_ids:
-            if m != win:
-                cur.execute("UPDATE mem.memories SET status='superseded', "
-                            "valid_to=COALESCE(valid_to, now()), "
-                            "metadata = metadata || jsonb_build_object('superseded_by', %s::bigint) "
-                            "WHERE id=%s AND status='active'", (win, m))
-        return f"superseded {[m for m in member_ids if m != win]} (winner #{win})"
-    return "no-op (proposal did not match action)"
+        _retire_members(cur, member_ids, mid, author)
+        return f"merged {member_ids} -> [#{mid}]", mid
+    if action == "supersede":
+        try:
+            win = int(proposal.get("winner_id"))
+        except (TypeError, ValueError):
+            win = None
+        if win not in member_ids:
+            raise Refused(f"not applied: winner {proposal.get('winner_id')!r} is not one of "
+                          f"{member_ids}")
+        losers = [m for m in member_ids if m != win]
+        _retire_members(cur, losers, win, author)
+        return f"superseded {losers} (winner #{win})", win
+    raise Refused(f"no-op: unknown action {action!r} -- not applied")
+
+
+def _write_or_refuse(cur, payload):
+    """do_write for a proposal: its refusals (a project the author left, a bad window) decline
+    the proposal instead of ending the process."""
+    try:
+        return do_write(cur, payload)
+    except SystemExit as exc:
+        raise Refused(f"not applied: {exc}")
 
 
 def main():
@@ -1505,22 +1798,32 @@ def main():
     # Before ANY statement: every read surface below filters on this, and a connection that
     # never set it sees only what is shared with the whole project.
     set_reader(cur, p)
+    as_json = p.get("format") == "json"
+    if p.get("format") not in (None, "text", "json"):
+        raise SystemExit("format must be text or json")
     if cmd == "write":
         mid = do_write(cur, p)
         conn.commit()
-        print(f"saved [#{mid}]")
+        print(json.dumps({"id": mid}) if as_json else f"saved [#{mid}]")
     elif cmd == "supersede":
         old = p.pop("old_id")
         mid = do_write(cur, p, supersedes_id=old)
         conn.commit()
-        print(f"saved [#{mid}], superseded [#{old}]")
+        print(json.dumps({"id": mid, "superseded": old}) if as_json
+              else f"saved [#{mid}], superseded [#{old}]")
     elif cmd == "search":
-        rows = do_search(cur, p)
+        # track_access=false is for callers that LOOK without recalling -- the extractor's
+        # novelty gate. Counting its probes as recall made every extraction "refresh" the rows
+        # near it and hid exactly the stale facts `stale_list` exists to surface.
+        rows = do_search(cur, p, track_access=p.get("track_access", True) is not False)
         conn.commit()
-        if not rows:
-            print("(no memories found)")
-        for r in rows:
-            print(fmt_row(r))
+        if as_json:
+            print(json.dumps([row_json(r) for r in rows], ensure_ascii=False, default=str))
+        else:
+            if not rows:
+                print("(no memories found)")
+            for r in rows:
+                print(fmt_row(r))
     elif cmd == "context":
         result = do_context(cur, p)
         conn.commit()
@@ -1553,15 +1856,37 @@ def main():
     elif cmd == "page_upsert":
         mid = do_page_upsert(cur, p)
         conn.commit()
-        print(f"saved [#{mid}]")
+        print(json.dumps({"id": mid}) if as_json else f"saved [#{mid}]")
     elif cmd == "page_publish":
         res = do_page_publish(cur, p)
         conn.commit()
         print(json.dumps(res, ensure_ascii=False))
+    elif cmd == "apply_verdict":
+        # A fresh consolidation verdict the consolidator is confident enough to apply without a
+        # person. Same code as review approval -- apply_proposal -- in this one transaction:
+        # scope and project from the group, cross-author and derived/page members refused,
+        # summarizes edges, merged_from, the perspective kept, and every member retired or
+        # nothing changed. Derive is not accepted here: Dreamer conclusions always need review.
+        who = require_author(p.get("_identity"))
+        action = p.get("action")
+        if action not in ("merge", "supersede"):
+            raise SystemExit("apply_verdict action must be merge or supersede")
+        members = p.get("member_ids")
+        if not isinstance(members, list) or not members:
+            raise SystemExit("apply_verdict needs member_ids")
+        result = apply_proposal_result(cur, action, members, p.get("proposal"), who,
+                                       channel="consolidator")
+        if result["applied"]:
+            conn.commit()
+        else:
+            conn.rollback()
+        print(json.dumps(result) if as_json else
+              f"{'applied' if result['applied'] else 'NOT applied'}: {result['message']}")
     elif cmd == "mark":
-        # admin op for the consolidator: flip status without a replacement memory
-        status = p["status"]
-        assert status in ("active", "superseded", "retracted", "expired")
+        # admin op: flip status without a replacement memory
+        status = p.get("status")
+        if status not in ("active", "superseded", "retracted", "expired"):
+            raise SystemExit("status must be active, superseded, retracted or expired")
         # Provenance: record WHAT displaced this memory. The row surviving is not enough --
         # without this link "what replaced this fact, and why" is unanswerable, which was the
         # case for 146 of 148 superseded rows (the consolidator marks losers separately from
@@ -1572,25 +1897,59 @@ def main():
         # number, including one they could not read. Refused the same way a cross-author
         # supersede is, and for the same reason: deciding what somebody else knows is not
         # something this store does quietly.
-        cur.execute("SELECT author FROM mem.memories WHERE id=%s FOR UPDATE", (p["id"],))
+        cur.execute("SELECT author, valid_from FROM mem.memories WHERE id=%s "
+                    "FOR NO KEY UPDATE", (p["id"],))
         owner = cur.fetchone()
         me = (p.get("_identity") or "").strip() or None
         if not owner:
-            print("(not found)")
+            print(json.dumps({"id": p["id"], "marked": False}) if as_json else "(not found)")
         elif owner[0] != me:
             # Same answer as "not found" would be an oracle the other way round; this path is
             # already authenticated, so it says whose it is.
             raise SystemExit(f"#{p['id']} was written by {owner[0]}, not by you -- "
                              f"retracting another author's memory is not something this does.")
         else:
+            # Belief time follows the status: leaving the active set stamps retired_at (once --
+            # the first retirement is when belief ended), returning to it clears it. The event
+            # window moves only when the caller states event time with `valid_to`.
+            valid_to = p.get("valid_to")
+            if valid_to is not None:
+                _, (vt,) = _timestamps(cur, valid_to)
+                if owner[1] is not None and vt < owner[1]:
+                    raise SystemExit(f"refusing to mark #{p['id']}: valid_to {valid_to} is "
+                                     f"before its valid_from")
+            # Reactivation keeps the history it ends: the retirement interval it closes is
+            # appended to metadata.retired_intervals (old retired_at, the reactivation), which
+            # is what lets `as_of` inside that interval still say the row was not believed then.
+            # The expressions below read the row's values from BEFORE this update. The row is
+            # locked above, and the instants are clock_timestamp(), not now(): now() is when
+            # this transaction BEGAN, which can precede a retirement another transaction
+            # committed while this one waited for the lock -- a reversed interval. One that
+            # would still not be later than the retirement is not recorded.
             cur.execute("UPDATE mem.memories SET status=%s::mem.memory_status, "
-                        "valid_to=COALESCE(valid_to, CASE WHEN %s<>'active' THEN now() END), "
+                        "retired_at = CASE WHEN %s='active' THEN NULL "
+                        "                  ELSE COALESCE(retired_at, clock_timestamp()) END, "
+                        "valid_to = COALESCE(%s::timestamptz, valid_to), "
                         "metadata = metadata || CASE WHEN %s::bigint IS NULL THEN '{}'::jsonb "
                         "ELSE jsonb_build_object('superseded_by', %s::bigint) END "
-                        "WHERE id=%s RETURNING id", (status, status, by, by, p["id"]))
+                        "|| CASE WHEN %s='active' AND retired_at IS NOT NULL "
+                        "         AND retired_at < clock_timestamp() THEN "
+                        "   jsonb_build_object('retired_intervals', "
+                        "     COALESCE(CASE WHEN jsonb_typeof(metadata->'retired_intervals')"
+                        "                        ='array' THEN metadata->'retired_intervals' "
+                        "              END, '[]'::jsonb) "
+                        "     || jsonb_build_array(jsonb_build_object("
+                        "          'retired_at', retired_at, "
+                        "          'reactivated_at', clock_timestamp()))) "
+                        "   ELSE '{}'::jsonb END "
+                        "WHERE id=%s RETURNING id",
+                        (status, status, valid_to, by, by, status, p["id"]))
             row = cur.fetchone()
             conn.commit()
-            print(f"marked [#{p['id']}] {status}" if row else "(not found)")
+            if as_json:
+                print(json.dumps({"id": p["id"], "status": status, "marked": bool(row)}))
+            else:
+                print(f"marked [#{p['id']}] {status}" if row else "(not found)")
     elif cmd == "get":
         # Reads the base table deliberately -- `get` must still show a superseded or
         # out-of-window row, which mem.active_memories excludes by design -- but through
@@ -1609,7 +1968,12 @@ def main():
                        WHERE m.id=%s
                          AND mem.may_read(m.author, m.scope, m.project)""", (p["id"],))
         r = cur.fetchone()
-        if not r:
+        if as_json:
+            # The row only: what a script needs to show it to a model or a person. Provenance,
+            # evidence and assertions stay with the text form.
+            print(json.dumps(row_json(r[:10] + (0.0,)) if r else None,
+                             ensure_ascii=False, default=str))
+        elif not r:
             # Deliberately the same answer as a missing id. "You may not see #123" tells a
             # caller that #123 exists and whose it is -- which is most of what they wanted.
             print("(not found)")
@@ -1657,7 +2021,7 @@ def main():
             content = scrub((p.get("proposal") or {}).get("content") or "").strip()
             cur.execute("""SELECT id FROM mem.review_queue
                             WHERE status='pending' AND action='derive'
-                              AND author=current_setting('mem.reader',true)
+                              AND author=mem.reader()
                               AND lower(btrim(proposal->>'content'))=lower(btrim(%s))
                             ORDER BY id LIMIT 1""", (content,))
             existing = cur.fetchone()
@@ -1680,7 +2044,7 @@ def main():
         cur.execute("""SELECT id, action, member_ids, confidence, proposal, created_at::date
                        FROM mem.review_queue
                        WHERE status='pending'
-                         AND author IS NOT DISTINCT FROM current_setting('mem.reader', true)
+                         AND author IS NOT DISTINCT FROM mem.reader()
                        ORDER BY created_at""")
         rows = cur.fetchall()
         if not rows:
@@ -1697,7 +2061,7 @@ def main():
         # and, on approval, rewrites the memories it names.
         cur.execute("UPDATE mem.review_queue SET status=%s, resolved_at=now() "
                     "WHERE id=%s AND status='pending' "
-                    "  AND author IS NOT DISTINCT FROM current_setting('mem.reader', true) "
+                    "  AND author IS NOT DISTINCT FROM mem.reader() "
                     "RETURNING action, member_ids, proposal",
                     (decision, p["id"]))
         row = cur.fetchone()
