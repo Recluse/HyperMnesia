@@ -30,12 +30,52 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 CREATE INDEX IF NOT EXISTS author_roles_author_idx ON mem.author_roles(author);
 
+-- Why login `r` cannot be an enforced author login, or NULL when it can. One answer for three
+-- callers: add_author_role refuses such a role, whoami reports a mapped one as `bypassable`, and
+-- the doctor fails on it -- a mapping made safely can be undone by a grant made later.
+--
+--   * it can become a superuser or BYPASSRLS role (attributes act only through SET ROLE);
+--   * it can use the memory table's owner (inherited or SET);
+--   * it holds pg_read_all_data or pg_write_all_data: they do not bypass row-level security as
+--     such, but the first reads the owner-run maintenance view (every author's rows) and the
+--     second writes the author map itself;
+--   * it has CREATEROLE: before PostgreSQL 16 that grants any non-superuser role, owner and
+--     hm_app included; from 16 it still administers the roles it creates;
+--   * it holds hm_app WITH ADMIN OPTION: it can reset hm_app's password and log in as it.
+CREATE OR REPLACE FUNCTION mem.author_login_problem(r name) RETURNS text
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp AS $$
+  SELECT CASE
+    WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_roles g
+                  WHERE (g.rolsuper OR g.rolbypassrls) AND mem.can_become(r, g.oid))
+      THEN 'it can become a superuser or BYPASSRLS role'
+    WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_class c
+                  WHERE c.oid = 'mem.memories'::regclass
+                    AND (pg_catalog.pg_has_role(r, c.relowner, 'USAGE')
+                         OR mem.can_become(r, c.relowner)))
+      THEN 'it can use the role that owns the memory tables'
+    WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_roles g
+                  WHERE g.rolname IN ('pg_read_all_data', 'pg_write_all_data')
+                    AND pg_catalog.pg_has_role(r, g.oid, 'MEMBER'))
+      THEN 'it holds pg_read_all_data or pg_write_all_data'
+    WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_roles g
+                  WHERE g.rolcreaterole AND (g.rolname = r OR mem.can_become(r, g.oid)))
+      THEN 'it has CREATEROLE'
+    WHEN pg_catalog.to_regrole('hm_app') IS NOT NULL
+         AND pg_catalog.pg_has_role(r, 'hm_app', 'MEMBER WITH ADMIN OPTION')
+      THEN 'it holds hm_app WITH ADMIN OPTION'
+  END;
+$$;
+GRANT EXECUTE ON FUNCTION mem.author_login_problem(name) TO PUBLIC;
+
 -- The caller's OWN mapping, and nothing else. `mode` is
---   enforced -- this login is mapped; `author` is fixed by the database;
---   filter   -- shared login (or a role that bypasses row-level security anyway); `author` is
---               whatever mem.reader was set to;
---   unmapped -- any other login, including one whose mapping was removed: it reads nothing
---               until it is mapped.
+--   enforced   -- this login is mapped; `author` is fixed by the database;
+--   bypassable -- mapped, but it holds a role that gets around the mapping
+--                 (mem.author_login_problem says which); nothing is enforced;
+--   filter     -- shared login (or a role that bypasses row-level security anyway); `author` is
+--                 whatever mem.reader was set to;
+--   unmapped   -- any other login, including one whose mapping was removed: it reads nothing
+--                 until it is mapped.
 CREATE OR REPLACE FUNCTION mem.whoami(OUT login name, OUT author text, OUT mode text)
 LANGUAGE plpgsql STABLE SECURITY DEFINER
 SET search_path = pg_catalog, mem, pg_temp AS $$
@@ -43,7 +83,8 @@ BEGIN
   login := session_user;
   author := mem.reader();
   IF EXISTS (SELECT 1 FROM mem.author_roles ar WHERE ar.role = session_user) THEN
-    mode := 'enforced';
+    mode := CASE WHEN mem.author_login_problem(session_user) IS NULL
+                 THEN 'enforced' ELSE 'bypassable' END;
   ELSIF mem.trusts_reader_setting(session_user) THEN
     mode := 'filter';
   ELSE
@@ -63,6 +104,7 @@ DECLARE
   r name;
   existing text;
   tbl_owner oid;
+  problem text;
 BEGIN
   IF p_author IS NULL OR p_author !~ '^[A-Za-z0-9._-]{1,64}$' THEN
     RAISE EXCEPTION 'author % is not a plain name ([A-Za-z0-9._-], up to 64)', p_author;
@@ -83,17 +125,10 @@ BEGIN
     EXECUTE format('CREATE ROLE %I LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE '
                    'NOREPLICATION NOBYPASSRLS', r);
   ELSE
-    -- 'MEMBER', not 'USAGE': a membership granted WITH INHERIT FALSE, SET TRUE gives no
-    -- inherited privileges but still lets the login SET ROLE to the owner, or to any
-    -- superuser or BYPASSRLS role it can reach, and skip every policy from there.
-    -- pg_read_all_data / pg_write_all_data do not bypass row-level security, but they read
-    -- the owner-run maintenance view (every author's rows) and write the author map itself.
-    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles g
-                WHERE (g.rolsuper OR g.rolbypassrls OR g.oid = tbl_owner
-                       OR g.rolname IN ('pg_read_all_data', 'pg_write_all_data'))
-                  AND pg_catalog.pg_has_role(r, g.oid, 'MEMBER')) THEN
-      RAISE EXCEPTION 'role % bypasses row-level security (superuser, BYPASSRLS, table owner, '
-                      'or pg_read_all_data/pg_write_all_data) and cannot be an author login', r;
+    problem := mem.author_login_problem(r);
+    IF problem IS NOT NULL THEN
+      RAISE EXCEPTION 'role % cannot be an author login: % -- it would bypass row-level '
+                      'security or the mapping itself', r, problem;
     END IF;
     EXECUTE format('ALTER ROLE %I LOGIN INHERIT', r);
   END IF;

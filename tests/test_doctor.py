@@ -50,6 +50,8 @@ for needle, rows in answers.items():
         if rows == "ERROR":      # this one query fails, the rest of the store answers
             sys.stderr.write("ERROR:  permission denied for table pg_class\n")
             sys.exit(1)
+        if rows == "SILENT":     # fails and says nothing
+            sys.exit(1)
         for r in rows:
             print("\x1f".join(r))
         sys.exit(0)
@@ -267,6 +269,20 @@ def main():
     check("a failed row-level-security inspection is reported, not certified 'enforced'",
           (by_title(f, "Row-level security not checked") or {}).get("level") == "warn"
           and not by_title(f, "Identity enforced"), str([x["title"] for x in f]))
+    silent = dict(app)
+    silent["NOT c.relrowsecurity"] = "SILENT"
+    f, _ = run(silent, env_extra={"MEM_AUTHOR": "alice"})
+    check("a query that fails without a message is still a failure, not a pass",
+          (by_title(f, "Row-level security not checked") or {}).get("level") == "warn"
+          and not by_title(f, "Identity enforced"), str([x["title"] for x in f]))
+    byp = dict(app)
+    byp["FROM mem.whoami()"] = [["hm_alice", "alice", "bypassable"]]
+    byp["author_login_problem"] = [["it holds pg_read_all_data or pg_write_all_data"]]
+    f, _ = run(byp, env_extra={"MEM_AUTHOR": "alice"})
+    got = by_title(f, "not enforced")
+    check("a mapped login holding a bypassing role is a failure that says which",
+          (got or {}).get("level") == "fail" and "pg_read_all_data" in got.get("detail", ""),
+          str(got))
     app["FROM mem.whoami()"] = [["hm_ghost", "", "unmapped"]]
     f, _ = run(app)
     check("an unmapped member of hm_app is a failure",

@@ -86,7 +86,9 @@ def q(sql, timeout=10):
     except OSError as e:
         return None, str(e)
     if p.returncode != 0:
-        return None, (p.stderr.decode("utf-8", "replace").strip().splitlines() or [""])[-1]
+        # Never an empty error: callers test `if err`, and a silent failure would read as success.
+        return None, ((p.stderr.decode("utf-8", "replace").strip().splitlines() or [""])[-1]
+                      or f"psql exited {p.returncode} with no message")
     text = p.stdout.decode("utf-8", "replace").strip()
     return [line.split("\x1f") for line in text.splitlines() if line], None
 
@@ -363,6 +365,13 @@ def check_identity(out):
         else:
             out.append(finding(OK, "Identity enforced by the database",
                                f"login {login} is author {author!r}; mem.reader is ignored"))
+    elif mode == "bypassable":
+        why = q("SELECT mem.author_login_problem(session_user)")[0] or [[""]]
+        out.append(finding(FAIL, "This author login is not enforced",
+                           f"login {login} is mapped to {author!r}, but "
+                           f"{(why[0][0] if why and why[0] else '') or 'it holds a role that gets around the mapping'}",
+                           "Revoke that role from the login (docs/INSTALL.md, \"Two people, one "
+                           "store\"); ./hm doctor re-checks it."))
     elif mode == "unmapped":
         out.append(finding(FAIL, "This login has no author mapping",
                            f"{login} is not hm_app and not in mem.author_roles: it reads "

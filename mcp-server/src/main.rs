@@ -962,15 +962,26 @@ fn env_file_value(key: &str) -> Option<String> {
     }
     let text = std::fs::read_to_string(&path).ok()?;
     for line in text.lines() {
-        let line = line.trim();
+        let line = line.trim_matches(py_space);
         if line.starts_with('#') { continue; }
         // Split on the FIRST '=', then trim. `strip_prefix("KEY=")` misses `KEY = value`,
         // which the Python loader accepts -- one file, two answers.
         let Some((k, v)) = line.split_once('=') else { continue };
-        if k.trim() != key { continue; }
-        return Some(v.trim().trim_matches('"').trim_matches('\'').trim().to_string());
+        if k.trim_matches(py_space) != key { continue; }
+        // As _mem_common.load_env_file: strip, then the quotes -- and an empty value counts as
+        // unset, so a later line for the same key still applies.
+        let v = v.trim_matches(py_space).trim_matches('"').trim_matches('\'');
+        if v.is_empty() { continue; }
+        return Some(v.to_string());
     }
     None
+}
+
+/// Python's str.strip() set: Unicode White_Space plus U+001C..U+001F, which Python's isspace()
+/// counts (bidirectional class B/S) and Rust's char::is_whitespace does not. Identity is decided
+/// on both sides of this server; the two trimming different characters is two answers.
+fn py_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
 /// A setting as the Python side resolves it: a non-empty environment variable beats the file.
@@ -993,15 +1004,25 @@ fn mem_author() -> Option<String> {
     // The raw value decides whether the environment set it, exactly as the Python loader does:
     // a blank-only value is set (and invalid), not unset -- trimming first would hand the
     // decision back to the file.
-    if let Some(raw) = std::env::var("MEM_AUTHOR").ok().filter(|v| !v.is_empty()) {
-        let v = raw.trim().to_string();
+    let raw = match std::env::var("MEM_AUTHOR") {
+        Ok(v) => Some(v),
+        // Set, and not even text: set and invalid, like any other unusable value -- NOT absent.
+        Err(std::env::VarError::NotUnicode(_)) => Some(String::from("\u{fffd}")),
+        Err(std::env::VarError::NotPresent) => None,
+    };
+    if let Some(raw) = raw.filter(|v| !v.is_empty()) {
+        let v = raw.trim_matches(py_space).to_string();
         if ok(&v) { return Some(v); }
         eprintln!("hypermnesia-mcp: MEM_AUTHOR {v:?} is not a plain name ([A-Za-z0-9._-], up to \
                    64) -- no identity for this session (the env file is NOT consulted): reads \
                    see only what is shared with its projects, and memory writes are refused.");
         return None;
     }
-    env_file_value("MEM_AUTHOR").filter(|v| ok(v))
+    let v = env_file_value("MEM_AUTHOR")?;
+    if ok(&v) { return Some(v); }
+    eprintln!("hypermnesia-mcp: MEM_AUTHOR {v:?} in the settings file is not a plain name -- no \
+               identity for this session.");
+    None
 }
 
 /// Margin between the Python run limit and this server's kill. Python must give up first: it
@@ -1553,7 +1574,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hm-envtest-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("hypermnesia.env");
-        std::fs::write(&file, "MEM_AUTHOR = alice\nMEM_DIALECTIC_TIMEOUT=45\n").unwrap();
+        std::fs::write(&file, "MEM_AUTHOR=\nMEM_AUTHOR = alice\nMEM_DIALECTIC_TIMEOUT=45\n").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::env::set_var("HYPERMNESIA_ENV_FILE", &file);
@@ -1568,6 +1589,14 @@ mod tests {
         assert_eq!(mem_author(), None, "blank-only env is set and invalid, as in Python");
         std::env::set_var("MEM_AUTHOR", " bob ");
         assert_eq!(mem_author().as_deref(), Some("bob"), "surrounding blanks are trimmed");
+        std::env::set_var("MEM_AUTHOR", "\u{1c}bob\u{1f}");
+        assert_eq!(mem_author().as_deref(), Some("bob"), "Python's whitespace set, not Rust's");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            std::env::set_var("MEM_AUTHOR", std::ffi::OsStr::from_bytes(b"\xff"));
+            assert_eq!(mem_author(), None, "non-UTF-8 env is set and invalid, not absent");
+        }
         std::env::set_var("MEM_AUTHOR", "bob");
         assert_eq!(mem_author().as_deref(), Some("bob"));
         std::env::remove_var("MEM_AUTHOR");

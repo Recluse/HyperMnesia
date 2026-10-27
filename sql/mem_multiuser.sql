@@ -92,12 +92,28 @@ COMMENT ON TABLE mem.author_roles IS
   'Postgres login -> author. A session whose login is listed here reads and writes as that '
   'author whatever it sets mem.reader to. Owner-only; see mem.whoami() for the caller''s row.';
 
+-- May login `r` act as role `g`? From PostgreSQL 16 a membership carries separate INHERIT and SET
+-- options, and only SET lets it become `g` (SET ROLE). Before 16 every membership is SET-able,
+-- which is what MEMBER means there. The privilege string is evaluated at run time, so the CASE
+-- keeps 'SET' away from a server that would reject it.
+CREATE OR REPLACE FUNCTION mem.can_become(r name, g oid) RETURNS boolean
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp AS $$
+  SELECT CASE WHEN pg_catalog.current_setting('server_version_num')::int >= 160000
+              THEN pg_catalog.pg_has_role(r, g, 'SET')
+              ELSE pg_catalog.pg_has_role(r, g, 'MEMBER') END;
+$$;
+GRANT EXECUTE ON FUNCTION mem.can_become(name, oid) TO PUBLIC;
+
 -- May this login name itself through the `mem.reader` setting? Rule 2 of mem.reader() below,
--- shared with mem.whoami() so the two can never disagree about a login's mode.
+-- shared with mem.whoami() so the two can never disagree about a login's mode. True for hm_app
+-- itself, and for a login that can bypass row-level security anyway:
 --
--- Counted are memberships the login can USE: inherited (USAGE) or SET ROLE-able (SET, from
--- PostgreSQL 16; before 16 every membership is SET-able, which is what MEMBER means there). A
--- grant WITH INHERIT FALSE, SET FALSE confers nothing and must not buy the filter mode.
+--   * SUPERUSER and BYPASSRLS are attributes of the CURRENT role, never inherited: they count
+--     only when the login can become such a role (SET ROLE), not merely inherit from it;
+--   * the table owner's rights ARE privileges, so they count inherited (USAGE) or SET-able.
+--
+-- A grant WITH INHERIT FALSE, SET FALSE confers nothing and buys nothing here.
 --
 -- An ordinary (invoker) function: it reads only catalogs every role may read, so it needs no
 -- privileges of its own -- which also keeps it callable from mem.reader() whichever role owns
@@ -109,13 +125,10 @@ SET search_path = pg_catalog, pg_temp AS $$
   SELECT r = 'hm_app'
       OR EXISTS (
            SELECT 1 FROM pg_catalog.pg_roles g
-            WHERE (g.rolsuper OR g.rolbypassrls
-                   OR g.oid = (SELECT c.relowner FROM pg_catalog.pg_class c
-                                WHERE c.oid = 'mem.memories'::regclass))
-              AND (pg_catalog.pg_has_role(r, g.oid, 'USAGE')
-                   OR CASE WHEN pg_catalog.current_setting('server_version_num')::int >= 160000
-                           THEN pg_catalog.pg_has_role(r, g.oid, 'SET')
-                           ELSE pg_catalog.pg_has_role(r, g.oid, 'MEMBER') END));
+            WHERE ((g.rolsuper OR g.rolbypassrls) AND mem.can_become(r, g.oid))
+               OR (g.oid = (SELECT c.relowner FROM pg_catalog.pg_class c
+                             WHERE c.oid = 'mem.memories'::regclass)
+                   AND (pg_catalog.pg_has_role(r, g.oid, 'USAGE') OR mem.can_become(r, g.oid))));
 $$;
 -- Restated, because CREATE OR REPLACE keeps the grants of an earlier definition that revoked it.
 GRANT EXECUTE ON FUNCTION mem.trusts_reader_setting(name) TO PUBLIC;
