@@ -482,7 +482,19 @@ def admin_helpers(fx):
             (f"GRANT TRUNCATE ON mem.sources TO {fx.role_a}",
              f"REVOKE TRUNCATE ON mem.sources FROM {fx.role_a}", "TRUNCATE on mem.sources"),
             (f"GRANT pg_execute_server_program TO {fx.role_a}",
-             f"REVOKE pg_execute_server_program FROM {fx.role_a}", "pg_execute_server_program")):
+             f"REVOKE pg_execute_server_program FROM {fx.role_a}", "pg_execute_server_program"),
+            # hm_app holding SOME column of the map must not mask Alice holding THE column
+            (f"GRANT SELECT (role), UPDATE (created_at) ON mem.author_roles TO hm_app; "
+             f"GRANT UPDATE (author) ON mem.author_roles TO {fx.role_a}",
+             f"REVOKE UPDATE (author) ON mem.author_roles FROM {fx.role_a}; "
+             f"REVOKE SELECT (role), UPDATE (created_at) ON mem.author_roles FROM hm_app",
+             "a column hm_app does not have, while hm_app has another one"),
+            # privileges reachable only through SET ROLE to a non-inherited role
+            (f"CREATE ROLE rlst_audit_{fx.tag}; GRANT USAGE ON SCHEMA mem TO rlst_audit_{fx.tag}; "
+             f"GRANT SELECT ON mem.all_active_memories TO rlst_audit_{fx.tag}; "
+             f"GRANT rlst_audit_{fx.tag} TO {fx.role_a} WITH INHERIT FALSE, SET TRUE",
+             f"DROP OWNED BY rlst_audit_{fx.tag}; DROP ROLE rlst_audit_{fx.tag}",
+             "a SET-only role holding SELECT on the maintenance view")):
         must(OWNER_URL, grant + ";")
         mode = scalar(fx.url_a, "SELECT mode FROM mem.whoami();")
         must(OWNER_URL, revoke + ";")

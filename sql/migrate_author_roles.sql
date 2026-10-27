@@ -77,35 +77,47 @@ SET search_path = pg_catalog, pg_temp AS $$
     -- An author login inherits hm_app's privileges and must hold nothing beyond them anywhere
     -- in schema mem: a direct SELECT on the owner-run maintenance view reads every author, a
     -- TRUNCATE skips row-level security, a column UPDATE on the author map rewrites identity.
-    -- Compared privilege by privilege, table and column level, so no list of "dangerous"
-    -- objects has to be kept in step with the schema.
+    -- Compared privilege by privilege -- and column by column, since "some column" of a table
+    -- is not "the same column" -- for the login AND every role it is a member of in any way
+    -- (inherited or only SET-able: SET ROLE to it brings that role's privileges), so no list of
+    -- "dangerous" objects has to be kept in step with the schema.
     WHEN EXISTS (
-           SELECT 1 FROM pg_catalog.pg_class c
+           SELECT 1 FROM pg_catalog.pg_roles g
+             JOIN pg_catalog.pg_class c ON true
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
             CROSS JOIN unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE','TRUNCATE',
                                     'REFERENCES','TRIGGER']) pr(p)
-            WHERE n.nspname = 'mem' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
-              AND pg_catalog.has_table_privilege(r, c.oid, pr.p)
+            WHERE pg_catalog.pg_has_role(r, g.oid, 'MEMBER') AND g.rolname <> 'hm_app'
+              AND n.nspname = 'mem' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+              AND pg_catalog.has_table_privilege(g.oid, c.oid, pr.p)
               AND NOT pg_catalog.has_table_privilege('hm_app', c.oid, pr.p))
       OR EXISTS (
-           SELECT 1 FROM pg_catalog.pg_class c
+           SELECT 1 FROM pg_catalog.pg_roles g
+             JOIN pg_catalog.pg_class c ON true
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+             JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+                                           AND a.attnum > 0 AND NOT a.attisdropped
             CROSS JOIN unnest(ARRAY['SELECT','INSERT','UPDATE','REFERENCES']) pr(p)
-            WHERE n.nspname = 'mem' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
-              AND pg_catalog.has_any_column_privilege(r, c.oid, pr.p)
-              AND NOT pg_catalog.has_any_column_privilege('hm_app', c.oid, pr.p))
+            WHERE pg_catalog.pg_has_role(r, g.oid, 'MEMBER') AND g.rolname <> 'hm_app'
+              AND n.nspname = 'mem' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+              AND pg_catalog.has_column_privilege(g.oid, c.oid, a.attnum, pr.p)
+              AND NOT pg_catalog.has_column_privilege('hm_app', c.oid, a.attnum, pr.p))
       OR EXISTS (
-           SELECT 1 FROM pg_catalog.pg_class c
+           SELECT 1 FROM pg_catalog.pg_roles g
+             JOIN pg_catalog.pg_class c ON true
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
             CROSS JOIN unnest(ARRAY['USAGE','SELECT','UPDATE']) pr(p)
-            WHERE n.nspname = 'mem' AND c.relkind = 'S'
-              AND pg_catalog.has_sequence_privilege(r, c.oid, pr.p)
+            WHERE pg_catalog.pg_has_role(r, g.oid, 'MEMBER') AND g.rolname <> 'hm_app'
+              AND n.nspname = 'mem' AND c.relkind = 'S'
+              AND pg_catalog.has_sequence_privilege(g.oid, c.oid, pr.p)
               AND NOT pg_catalog.has_sequence_privilege('hm_app', c.oid, pr.p))
       OR EXISTS (
-           SELECT 1 FROM pg_catalog.pg_proc f
+           SELECT 1 FROM pg_catalog.pg_roles g
+             JOIN pg_catalog.pg_proc f ON true
              JOIN pg_catalog.pg_namespace n ON n.oid = f.pronamespace
-            WHERE n.nspname = 'mem'
-              AND pg_catalog.has_function_privilege(r, f.oid, 'EXECUTE')
+            WHERE pg_catalog.pg_has_role(r, g.oid, 'MEMBER') AND g.rolname <> 'hm_app'
+              AND n.nspname = 'mem'
+              AND pg_catalog.has_function_privilege(g.oid, f.oid, 'EXECUTE')
               AND NOT pg_catalog.has_function_privilege('hm_app', f.oid, 'EXECUTE'))
       THEN 'it holds privileges in schema mem beyond those of hm_app'
     WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_roles g

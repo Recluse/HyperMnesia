@@ -1374,6 +1374,13 @@ def do_page_upsert(cur, p):
                      AND author = %s
                    ORDER BY id DESC""", (proj, (p.get("_identity") or "").strip() or None))
     prior = [r[0] for r in cur.fetchall()]
+    # Every prior page locked BEFORE the new page is written: they all retire at its created_at
+    # (below), and that instant must fall after any reactivation of theirs -- the supersede
+    # target alone was locked, by do_write, so an extra page reactivated meanwhile got an
+    # earlier retirement than its own comeback. Ascending ids: one lock order for every caller.
+    if prior:
+        cur.execute("SELECT id FROM mem.memories WHERE id = ANY(%s) ORDER BY id "
+                    "FOR NO KEY UPDATE", (prior,))
     # Explicitly project-scoped, never inherited from a default: a page exists to be read by
     # the project and is mirrored into the unscoped document corpus, so "private page" is not a
     # state this should be able to reach by accident in either direction.
