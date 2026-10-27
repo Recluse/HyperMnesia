@@ -83,7 +83,7 @@ END $$;
 
 CREATE OR REPLACE FUNCTION mem.guard_derivation() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER
-SET search_path=pg_catalog,mem AS $$
+SET search_path=pg_catalog,mem, pg_temp AS $$
 DECLARE e record; d_author text; cycle_found boolean;
 BEGIN
   -- Serialize edge additions: two concurrent acyclic inserts must not jointly form a cycle.

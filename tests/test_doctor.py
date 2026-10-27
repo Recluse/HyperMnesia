@@ -47,6 +47,9 @@ if os.environ.get("STUB_FAIL"):
     sys.exit(2)
 for needle, rows in answers.items():
     if needle in sql:
+        if rows == "ERROR":      # this one query fails, the rest of the store answers
+            sys.stderr.write("ERROR:  permission denied for table pg_class\n")
+            sys.exit(1)
         for r in rows:
             print("\x1f".join(r))
         sys.exit(0)
@@ -257,6 +260,12 @@ def main():
     f, _ = run(off, env_extra={"MEM_AUTHOR": "alice"})
     check("row-level security switched off on a memory table is a failure, not 'enforced'",
           (by_title(f, "switched off") or {}).get("level") == "fail"
+          and not by_title(f, "Identity enforced"), str([x["title"] for x in f]))
+    broken = dict(app)
+    broken["NOT c.relrowsecurity"] = "ERROR"
+    f, _ = run(broken, env_extra={"MEM_AUTHOR": "alice"})
+    check("a failed row-level-security inspection is reported, not certified 'enforced'",
+          (by_title(f, "Row-level security not checked") or {}).get("level") == "warn"
           and not by_title(f, "Identity enforced"), str([x["title"] for x in f]))
     app["FROM mem.whoami()"] = [["hm_ghost", "", "unmapped"]]
     f, _ = run(app)

@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS mem.peer_cards (
 
 CREATE OR REPLACE FUNCTION mem.refresh_peer_card(p_author text, p_peer bigint)
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER
-SET search_path=pg_catalog,mem AS $$
+SET search_path=pg_catalog,mem, pg_temp AS $$
 BEGIN
   -- Serialize refreshes for one card. The trigger visits multi-card changes in stable order,
   -- so concurrent writes cannot overwrite a newer aggregate or deadlock on swapped endpoints.
@@ -72,7 +72,7 @@ BEGIN
 END $$;
 
 CREATE OR REPLACE FUNCTION mem.refresh_memory_peer_cards() RETURNS trigger
-LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,mem AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,mem, pg_temp AS $$
 DECLARE v_author text; v_peer bigint;
 BEGIN
   IF TG_OP = 'INSERT' THEN

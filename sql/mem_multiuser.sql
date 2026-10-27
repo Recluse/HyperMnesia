@@ -92,14 +92,42 @@ COMMENT ON TABLE mem.author_roles IS
   'Postgres login -> author. A session whose login is listed here reads and writes as that '
   'author whatever it sets mem.reader to. Owner-only; see mem.whoami() for the caller''s row.';
 
+-- May this login name itself through the `mem.reader` setting? Rule 2 of mem.reader() below,
+-- shared with mem.whoami() so the two can never disagree about a login's mode.
+--
+-- Counted are memberships the login can USE: inherited (USAGE) or SET ROLE-able (SET, from
+-- PostgreSQL 16; before 16 every membership is SET-able, which is what MEMBER means there). A
+-- grant WITH INHERIT FALSE, SET FALSE confers nothing and must not buy the filter mode.
+--
+-- An ordinary (invoker) function: it reads only catalogs every role may read, so it needs no
+-- privileges of its own -- which also keeps it callable from mem.reader() whichever role owns
+-- that one after an upgrade run by a different superuser. Catalogs are schema-qualified and
+-- pg_temp is searched last, so a caller's temporary `pg_roles` cannot answer for the catalog.
+CREATE OR REPLACE FUNCTION mem.trusts_reader_setting(r name) RETURNS boolean
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp AS $$
+  SELECT r = 'hm_app'
+      OR EXISTS (
+           SELECT 1 FROM pg_catalog.pg_roles g
+            WHERE (g.rolsuper OR g.rolbypassrls
+                   OR g.oid = (SELECT c.relowner FROM pg_catalog.pg_class c
+                                WHERE c.oid = 'mem.memories'::regclass))
+              AND (pg_catalog.pg_has_role(r, g.oid, 'USAGE')
+                   OR CASE WHEN pg_catalog.current_setting('server_version_num')::int >= 160000
+                           THEN pg_catalog.pg_has_role(r, g.oid, 'SET')
+                           ELSE pg_catalog.pg_has_role(r, g.oid, 'MEMBER') END));
+$$;
+-- Restated, because CREATE OR REPLACE keeps the grants of an earlier definition that revoked it.
+GRANT EXECUTE ON FUNCTION mem.trusts_reader_setting(name) TO PUBLIC;
+
 -- The identity every rule below compares against.
 --
 --   1. The authenticated login is listed in mem.author_roles: its author. `session_user`, not
 --      `current_user`: the latter changes inside SECURITY DEFINER functions and after SET ROLE,
 --      the former only by SET SESSION AUTHORIZATION, which needs a superuser.
---   2. The login IS hm_app, or could bypass row-level security anyway (a superuser, a
---      BYPASSRLS role, or a member -- by any route, inherited or SET-only -- of the role that
---      owns mem.memories): the `mem.reader` session setting. That is the shared-login filter
+--   2. The login IS hm_app, or could bypass row-level security anyway (it can use -- inherit
+--      or SET ROLE to -- a superuser, a BYPASSRLS role or the role that owns mem.memories; see
+--      mem.trusts_reader_setting above): the `mem.reader` session setting. That is the shared-login filter
 --      mode, unchanged from before this function existed; for the bypassing roles the setting
 --      only narrows what the views show.
 --   3. Anything else: NULL, which reads nothing. That covers a login whose mapping was removed
@@ -110,23 +138,9 @@ COMMENT ON TABLE mem.author_roles IS
 --
 -- SECURITY DEFINER because rule 1 reads a table the application roles cannot; the search_path
 -- is pinned so the definer context cannot be steered through a caller-created object.
--- May this login name itself through the `mem.reader` setting? Rule 2 of mem.reader() below,
--- shared with mem.whoami() so the two can never disagree about a login's mode.
-CREATE OR REPLACE FUNCTION mem.trusts_reader_setting(r name) RETURNS boolean
-LANGUAGE sql STABLE SECURITY DEFINER
-SET search_path = pg_catalog, mem AS $$
-  SELECT r = 'hm_app'
-      OR EXISTS (SELECT 1 FROM pg_roles g
-                  WHERE (g.rolsuper OR g.rolbypassrls
-                         OR g.oid = (SELECT relowner FROM pg_class
-                                      WHERE oid = 'mem.memories'::regclass))
-                    AND pg_has_role(r, g.oid, 'MEMBER'));
-$$;
-REVOKE ALL ON FUNCTION mem.trusts_reader_setting(name) FROM PUBLIC;
-
 CREATE OR REPLACE FUNCTION mem.reader() RETURNS text
 LANGUAGE plpgsql STABLE SECURITY DEFINER
-SET search_path = pg_catalog, mem AS $$
+SET search_path = pg_catalog, mem, pg_temp AS $$
 DECLARE mapped text;
 BEGIN
   SELECT ar.author INTO mapped FROM mem.author_roles ar WHERE ar.role = session_user;
@@ -144,7 +158,7 @@ REVOKE ALL ON FUNCTION mem.reader() FROM PUBLIC;
 -- need no SELECT on mem.project_members: they learn their own memberships, never the table.
 CREATE OR REPLACE FUNCTION mem.reader_projects() RETURNS text[]
 LANGUAGE sql STABLE SECURITY DEFINER
-SET search_path = pg_catalog, mem AS $$
+SET search_path = pg_catalog, mem, pg_temp AS $$
   SELECT coalesce(array_agg(pm.project ORDER BY pm.project), '{}')
     FROM mem.project_members pm
    WHERE pm.author = mem.reader();

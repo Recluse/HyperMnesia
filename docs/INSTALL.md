@@ -686,7 +686,10 @@ application login learns its own mapping (`mem.whoami()`) and its own projects
 (`mem.reader_projects()`), never the list of who else uses the store.
 
 This holds only while people hold only their own password. Keep the `hm_app` password away from
-them (or set `ALTER ROLE hm_app NOLOGIN` once nothing connects as it), and the owner's too.
+them (or set `ALTER ROLE hm_app NOLOGIN` once nothing connects as it), and the owner's too. The
+same goes for the predefined `pg_read_all_data` and `pg_write_all_data` roles: they do not bypass
+row-level security as such, but a holder of the first reads the owner-run maintenance view —
+every author's rows — and a holder of the second can rewrite the author map.
 
 ### The owner
 

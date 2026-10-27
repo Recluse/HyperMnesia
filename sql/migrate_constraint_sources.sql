@@ -48,7 +48,7 @@ UPDATE constraints c
 CREATE INDEX IF NOT EXISTS constraints_source_idx ON constraints (source_repo, source_path);
 
 CREATE OR REPLACE FUNCTION public.hm_constraint_source_fill() RETURNS trigger
-LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$
+LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$
 DECLARE d_repo text; d_path text; d_hash text;
 BEGIN
   IF NEW.source_doc_id IS NULL THEN
@@ -80,7 +80,7 @@ CREATE TRIGGER constraints_source_fill
   FOR EACH ROW EXECUTE FUNCTION public.hm_constraint_source_fill();
 
 CREATE OR REPLACE FUNCTION public.hm_constraint_source_relink() RETURNS trigger
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
 BEGIN
   UPDATE public.constraints c
      SET source_doc_id = NEW.id,

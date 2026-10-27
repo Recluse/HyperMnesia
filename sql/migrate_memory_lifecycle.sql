@@ -99,7 +99,7 @@ CREATE INDEX IF NOT EXISTS mem_memories_retired_idx
 DO $$ BEGIN
   IF to_regprocedure('mem.reader()') IS NULL THEN
     EXECUTE $f$CREATE FUNCTION mem.reader() RETURNS text
-      LANGUAGE sql STABLE SET search_path = pg_catalog
+      LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp
       AS 'SELECT current_setting(''mem.reader'', true)'$f$;
   END IF;
 END $$;
@@ -107,7 +107,7 @@ END $$;
 -- A timestamp from stored JSON (metadata.retired_intervals), or NULL when it is not one. A
 -- malformed entry is then ignored by `as_of` rather than failing the whole search.
 CREATE OR REPLACE FUNCTION mem.try_timestamptz(value text) RETURNS timestamptz
-LANGUAGE plpgsql STABLE SET search_path = pg_catalog AS $$
+LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
   IF value IS NULL OR value !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' THEN
     RETURN NULL;
@@ -153,7 +153,7 @@ CREATE OR REPLACE VIEW mem.all_active_memories AS
 -- boolean about a row the caller may already read.
 CREATE OR REPLACE FUNCTION mem.premises_live(derived_id bigint) RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER
-SET search_path = pg_catalog, mem AS $$
+SET search_path = pg_catalog, mem, pg_temp AS $$
   WITH target AS (
     SELECT m.id, m.metadata FROM mem.memories m
      WHERE m.id = derived_id AND mem.may_read(m.author, m.scope, m.project)

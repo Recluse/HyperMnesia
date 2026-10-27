@@ -337,7 +337,13 @@ def check_identity(out):
                   "WHERE n.nspname = 'mem' AND c.relkind = 'r' AND NOT c.relrowsecurity "
                   "AND c.relname = ANY (ARRAY['memories','entities','assertions','sources',"
                   "'review_queue','derivations','dream_runs','peer_cards']) ORDER BY 1")
-    if not err and rows and rows[0] and rows[0][0]:
+    if err:
+        # Not knowing is not a pass: everything below would certify policies nobody looked at.
+        out.append(finding(WARN, "Row-level security not checked",
+                           f"could not read pg_class.relrowsecurity: {err}",
+                           "Run ./hm doctor as a role that can read the catalog."))
+        return
+    if rows and rows[0] and rows[0][0]:
         out.append(finding(FAIL, "Row-level security is switched off",
                            "on mem." + ", mem.".join(r[0] for r in rows) +
                            " -- every login that can read these tables reads every row",

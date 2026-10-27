@@ -87,9 +87,13 @@ class Fixture:
         # to the table owner without inheriting it.
         self.role_g, self.role_y = f"hm_rlst_g{t}", f"hm_rlst_y{t}"
         self.role_r, self.role_s = f"hm_rlst_r{t}", f"hm_rlst_s{t}"
+        # t: a member of hm_app that shadows pg_roles with a temp table; n: a member of hm_app
+        # holding the owner role WITH INHERIT FALSE, SET FALSE (a grant that confers nothing);
+        # d: a login holding pg_read_all_data.
+        self.role_t, self.role_n, self.role_d = f"hm_rlst_t{t}", f"hm_rlst_n{t}", f"hm_rlst_d{t}"
         self.pw = {r: secrets.token_hex(12)
                    for r in (self.role_a, self.role_b, self.role_x, self.role_y, self.role_r,
-                             self.role_s)}
+                             self.role_s, self.role_t, self.role_n, self.role_d)}
         self.ids = {}
 
     def setup(self):
@@ -111,6 +115,12 @@ class Fixture:
           GRANT {self.role_g} TO {self.role_y};
           SELECT mem.add_author_role('{self.a}', '{self.role_r}');
           ALTER ROLE {self.role_r} PASSWORD '{self.pw[self.role_r]}';
+          CREATE ROLE {self.role_t} LOGIN INHERIT PASSWORD '{self.pw[self.role_t]}';
+          GRANT hm_app TO {self.role_t};
+          CREATE ROLE {self.role_n} LOGIN INHERIT PASSWORD '{self.pw[self.role_n]}';
+          GRANT hm_app TO {self.role_n};
+          CREATE ROLE {self.role_d} LOGIN INHERIT PASSWORD '{self.pw[self.role_d]}';
+          GRANT pg_read_all_data TO {self.role_d};
         """)
         rows = must(OWNER_URL, f"""
           INSERT INTO mem.memories (memory_type, content, author, scope, project, metadata)
@@ -133,6 +143,8 @@ class Fixture:
         self.url_x = as_login(OWNER_URL, self.role_x, self.pw[self.role_x])
         self.url_y = as_login(OWNER_URL, self.role_y, self.pw[self.role_y])
         self.url_r = as_login(OWNER_URL, self.role_r, self.pw[self.role_r])
+        self.url_t = as_login(OWNER_URL, self.role_t, self.pw[self.role_t])
+        self.url_n = as_login(OWNER_URL, self.role_n, self.pw[self.role_n])
 
     def teardown(self):
         authors = f"'{self.a}','{self.b}','{self.c}'"
@@ -152,6 +164,9 @@ class Fixture:
           DROP ROLE IF EXISTS {self.role_y};
           DROP ROLE IF EXISTS {self.role_g};
           DROP ROLE IF EXISTS {self.role_s};
+          DROP ROLE IF EXISTS {self.role_t};
+          DROP ROLE IF EXISTS {self.role_n};
+          DROP ROLE IF EXISTS {self.role_d};
         """)
 
 
@@ -258,6 +273,18 @@ def per_author(fx):
     check("and is reported unmapped, not filter",
           scalar(fx.url_y, "SELECT mode FROM mem.whoami();", fx.b) == "unmapped")
     revoked_mid_session(fx)
+    seen = visible(fx, fx.url_t, prefix="CREATE TEMP TABLE pg_roles AS SELECT oid, true AS rolsuper, "
+                                       "true AS rolbypassrls, rolname FROM pg_catalog.pg_roles "
+                                       f"WHERE rolname = session_user; SET mem.reader = '{fx.b}'; ")
+    check("a temporary pg_roles claiming superuser does not buy the filter mode",
+          seen == set(), str(seen))
+    owner = scalar(OWNER_URL, "SELECT relowner::regrole FROM pg_class "
+                              "WHERE oid = 'mem.memories'::regclass;")
+    if scalar(OWNER_URL, "SELECT current_setting('server_version_num')::int >= 160000;") == "t":
+        must(OWNER_URL, f'GRANT "{owner}" TO {fx.role_n} WITH INHERIT FALSE, SET FALSE;')
+        seen = visible(fx, fx.url_n, fx.b)
+        check("an owner membership with neither INHERIT nor SET does not buy the filter mode",
+              seen == set(), str(seen))
 
     print("== per-author login: another author's provenance ==")
     src = (f"SELECT (SELECT count(*) FROM mem.sources WHERE memory_id = {fx.ids['b_proj']}) "
@@ -386,6 +413,9 @@ def admin_helpers(fx):
     ok, err = refused(OWNER_URL, f"SELECT mem.add_author_role('{fx.c}', '{fx.role_s}');", None,
                       "bypasses row-level security")
     check("nor a role that can only SET ROLE to the owner (no inherited privileges)", ok, err)
+    ok, err = refused(OWNER_URL, f"SELECT mem.add_author_role('{fx.c}', '{fx.role_d}');", None,
+                      "bypasses row-level security")
+    check("nor a pg_read_all_data member (it reads the owner-run maintenance view)", ok, err)
     ok, err = refused(OWNER_URL, f"SELECT mem.add_author_role('{fx.c}', '{fx.role_a}');", None,
                       "already mapped")
     check("a login cannot be remapped to a second author", ok, err)

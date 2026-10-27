@@ -99,7 +99,7 @@ EXCEPTION WHEN insufficient_privilege OR undefined_object THEN NULL; END $$;
 -- definer function performs the telemetry update only after rechecking visibility.
 CREATE OR REPLACE FUNCTION mem.touch_memory_access(memory_ids bigint[]) RETURNS bigint
 LANGUAGE plpgsql SECURITY DEFINER
-SET search_path=pg_catalog,mem AS $$
+SET search_path=pg_catalog,mem, pg_temp AS $$
 DECLARE touched bigint;
 BEGIN
   UPDATE mem.memories m

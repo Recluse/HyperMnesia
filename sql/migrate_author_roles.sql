@@ -38,7 +38,7 @@ CREATE INDEX IF NOT EXISTS author_roles_author_idx ON mem.author_roles(author);
 --               until it is mapped.
 CREATE OR REPLACE FUNCTION mem.whoami(OUT login name, OUT author text, OUT mode text)
 LANGUAGE plpgsql STABLE SECURITY DEFINER
-SET search_path = pg_catalog, mem AS $$
+SET search_path = pg_catalog, mem, pg_temp AS $$
 BEGIN
   login := session_user;
   author := mem.reader();
@@ -54,11 +54,11 @@ REVOKE ALL ON FUNCTION mem.whoami() FROM PUBLIC;
 
 -- Create (or adopt) a login for an author and map it. Returns the role name. Refuses a role
 -- that would bypass row-level security -- a superuser, a BYPASSRLS role, the memory table's
--- owner, or a member of any of them -- because mapping it would announce an enforcement that
--- does not happen.
+-- owner, pg_read_all_data or pg_write_all_data, or a member of any of them -- because mapping
+-- it would announce an enforcement that does not happen.
 CREATE OR REPLACE FUNCTION mem.add_author_role(p_author text, p_role name DEFAULT NULL)
 RETURNS name LANGUAGE plpgsql
-SET search_path = pg_catalog, mem AS $$
+SET search_path = pg_catalog, mem, pg_temp AS $$
 DECLARE
   r name;
   existing text;
@@ -86,11 +86,14 @@ BEGIN
     -- 'MEMBER', not 'USAGE': a membership granted WITH INHERIT FALSE, SET TRUE gives no
     -- inherited privileges but still lets the login SET ROLE to the owner, or to any
     -- superuser or BYPASSRLS role it can reach, and skip every policy from there.
-    IF EXISTS (SELECT 1 FROM pg_roles g
-                WHERE (g.rolsuper OR g.rolbypassrls OR g.oid = tbl_owner)
-                  AND pg_has_role(r, g.oid, 'MEMBER')) THEN
-      RAISE EXCEPTION 'role % bypasses row-level security (superuser, BYPASSRLS or table '
-                      'owner) and cannot be an author login', r;
+    -- pg_read_all_data / pg_write_all_data do not bypass row-level security, but they read
+    -- the owner-run maintenance view (every author's rows) and write the author map itself.
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles g
+                WHERE (g.rolsuper OR g.rolbypassrls OR g.oid = tbl_owner
+                       OR g.rolname IN ('pg_read_all_data', 'pg_write_all_data'))
+                  AND pg_catalog.pg_has_role(r, g.oid, 'MEMBER')) THEN
+      RAISE EXCEPTION 'role % bypasses row-level security (superuser, BYPASSRLS, table owner, '
+                      'or pg_read_all_data/pg_write_all_data) and cannot be an author login', r;
     END IF;
     EXECUTE format('ALTER ROLE %I LOGIN INHERIT', r);
   END IF;
@@ -105,7 +108,7 @@ REVOKE ALL ON FUNCTION mem.add_author_role(text, name) FROM PUBLIC;
 -- already reads nothing (mem.reader() returns NULL for it), and this makes that two locks.
 CREATE OR REPLACE FUNCTION mem.remove_author_role(p_role name)
 RETURNS boolean LANGUAGE plpgsql
-SET search_path = pg_catalog, mem AS $$
+SET search_path = pg_catalog, mem, pg_temp AS $$
 BEGIN
   DELETE FROM mem.author_roles WHERE role = p_role;
   IF NOT FOUND THEN

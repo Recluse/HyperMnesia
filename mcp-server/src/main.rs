@@ -990,7 +990,11 @@ fn knob(key: &str) -> Option<String> {
 fn mem_author() -> Option<String> {
     let ok = |v: &str| !v.is_empty() && v.len() <= 64
         && v.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c));
-    if let Some(v) = std::env::var("MEM_AUTHOR").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+    // The raw value decides whether the environment set it, exactly as the Python loader does:
+    // a blank-only value is set (and invalid), not unset -- trimming first would hand the
+    // decision back to the file.
+    if let Some(raw) = std::env::var("MEM_AUTHOR").ok().filter(|v| !v.is_empty()) {
+        let v = raw.trim().to_string();
         if ok(&v) { return Some(v); }
         eprintln!("hypermnesia-mcp: MEM_AUTHOR {v:?} is not a plain name ([A-Za-z0-9._-], up to \
                    64) -- no identity for this session (the env file is NOT consulted): reads \
@@ -1561,7 +1565,9 @@ mod tests {
         std::env::set_var("MEM_AUTHOR", "not a name");
         assert_eq!(mem_author(), None, "invalid env identity must not fall back to the file");
         std::env::set_var("MEM_AUTHOR", "  ");
-        assert_eq!(mem_author().as_deref(), Some("alice"), "blank env counts as unset");
+        assert_eq!(mem_author(), None, "blank-only env is set and invalid, as in Python");
+        std::env::set_var("MEM_AUTHOR", " bob ");
+        assert_eq!(mem_author().as_deref(), Some("bob"), "surrounding blanks are trimmed");
         std::env::set_var("MEM_AUTHOR", "bob");
         assert_eq!(mem_author().as_deref(), Some("bob"));
         std::env::remove_var("MEM_AUTHOR");
