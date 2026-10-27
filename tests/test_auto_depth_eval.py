@@ -25,7 +25,7 @@ def context(request):
     if selected != "minimal" and ids:
         ids.append(42)
     result = {
-        "version": 4, "depth": selected, "token_budget": request["token_budget"],
+        "version": 5, "depth": selected, "token_budget": request["token_budget"],
         "estimated_tokens": 500 + len(ids) * 100, "truncated": False,
         "scope": {"requested_depth": requested,
                   "depth_selection": {"selected": selected, "reason": reason}},

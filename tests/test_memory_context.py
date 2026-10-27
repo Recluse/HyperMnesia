@@ -98,7 +98,7 @@ def main():
     assert packed["estimated_tokens"] == mem_ops.estimate_tokens(
         json.dumps(packed, ensure_ascii=False, separators=(",", ":")))
     assert packed["truncated"] is False
-    assert packed["version"] == 4 and packed["depth"] == "low"
+    assert packed["version"] == 5 and packed["depth"] == "low"
 
     tiny = mem_ops.pack_context(sections, 512,
                                 {"global": True, "project": "sample-project",

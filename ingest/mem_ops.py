@@ -930,7 +930,9 @@ def pack_context(sections, token_budget, scope):
                      min(CONTEXT_MAX_BUDGET, int(token_budget or CONTEXT_DEFAULT_BUDGET)))
     except (TypeError, ValueError):
         raise SystemExit("token_budget must be an integer from 512 to 8192")
-    result = {"version": 4, "notice": CONTEXT_NOTICE,
+    # Version 5: every item carries query_match. memory_ask abstains on its absence, so a
+    # consumer must be able to tell "no item matched" from "this producer predates the flag".
+    result = {"version": 5, "notice": CONTEXT_NOTICE,
               "depth": scope.get("depth", "low"),
               "token_budget": budget, "estimated_tokens": 0,
               "truncated": False, "scope": scope, "sections": []}

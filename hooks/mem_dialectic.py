@@ -216,6 +216,13 @@ def answer(payload, generator=None):
     if raw is None:
         raise RuntimeError("memory context unavailable")
     context = json.loads(raw)
+    version = context.get("version") if isinstance(context, dict) else None
+    if not isinstance(version, int) or version < CONTEXT_VERSION:
+        # An older store answers with version 4, whose items carry no query_match: read as
+        # "nothing matched", every question would abstain and look like an empty memory.
+        raise RuntimeError(f"memory context is version {version!r}, this memory_ask needs "
+                           f"{CONTEXT_VERSION} (per-item query_match): the store's mem_ops.py is "
+                           f"older than this client -- update it")
     if not _items(context):
         return build_result(query, depth, context, [], "no grounded memories matched")
     if not any(item.get("query_match") for item in _items(context).values()):
@@ -230,6 +237,10 @@ def answer(payload, generator=None):
         return build_result(query, depth, context, [],
                             f"model output failed grounding validation: {exc}")
     return build_result(query, depth, context, claims, reason)
+
+
+# The context format this module reads (ingest/mem_ops.py pack_context).
+CONTEXT_VERSION = 5
 
 
 def _on_deadline(signum, frame):

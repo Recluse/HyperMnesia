@@ -662,6 +662,19 @@ def main():
         for c in (pa_conn, pb_conn):
             c.close()
 
+        # A writer that predates the lifecycle migration (an old search image during a rolling
+        # deploy) changes status and nothing else. The database keeps belief time for it.
+        ow = write(ac, alice, type="semantic", content="the vpn gateway is in rack two")
+        owner_sql("UPDATE mem.memories SET status='retracted' WHERE id=%s", (ow,))
+        r1 = row(ow)
+        check("an old writer's retraction still gets a retired_at", r1[5] is not None, str(r1[5]))
+        owner_sql("UPDATE mem.memories SET status='active' WHERE id=%s", (ow,))
+        r2 = row(ow)
+        iv = (r2[6].get("retired_intervals") or [{}])[-1]
+        check("and its reactivation clears it and records the interval it closes",
+              r2[5] is None and bool(iv) and iv.get("reactivated_at", "") > iv.get("retired_at", ""),
+              f"{r2[5]} {iv}")
+
         print("\n== the pinned profile holds explicit rows only ==")
         q1 = write(ac, alice, type="semantic", content="printer jams on thick paper")
         q2 = write(ac, alice, type="semantic", content="printer jams when the tray is full")

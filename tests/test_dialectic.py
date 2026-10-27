@@ -16,7 +16,7 @@ spec.loader.exec_module(mod)
 
 
 CONTEXT = {
-    "version": 2, "depth": "high", "token_budget": 4000, "estimated_tokens": 1200,
+    "version": 5, "depth": "high", "token_budget": 4000, "estimated_tokens": 1200,
     "truncated": False, "scope": {"project": "sample-project"},
     "sections": [
         {"name": "global", "items": [
@@ -114,6 +114,21 @@ def main():
         mod.mem_ops = original
     assert abstained["abstained"] is True and not asked, abstained
     assert "matched the query" in abstained["reason"]
+
+    # An older store's context (version 4, no query_match at all) is an error, not an
+    # abstention: read as "nothing matched", every question would look like an empty memory.
+    old_store = json.loads(json.dumps(profile_only))
+    old_store["version"] = 4
+    try:
+        mod.mem_ops = lambda cmd, payload, timeout=0: json.dumps(old_store)
+        try:
+            mod.answer({"query": "Anything?"}, generator=lambda q, c: asked.append(q) or valid)
+            raise AssertionError("a version-4 context was answered")
+        except RuntimeError as exc:
+            assert "older than this client" in str(exc), exc
+    finally:
+        mod.mem_ops = original
+    assert not asked
 
     # R4: a conclusion the context reports as stale cannot be cited, even if an item slipped in.
     stale_ctx = json.loads(json.dumps(CONTEXT))

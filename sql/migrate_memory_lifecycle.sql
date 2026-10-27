@@ -181,6 +181,35 @@ SET search_path = pg_catalog, mem, pg_temp AS $$
 $$;
 REVOKE ALL ON FUNCTION mem.premises_live(bigint) FROM PUBLIC;
 
+-- Belief time kept by the database, whoever writes. The code in this repository stamps
+-- retired_at itself (mem_ops mark/supersede/merge); a writer that predates this migration --
+-- an old search image still running during a rolling deploy, a hand UPDATE -- changes status
+-- and leaves retired_at alone, and as_of would then call a retracted row believed. Leaving the
+-- active set without a retired_at stamps it; returning to it with one still set records the
+-- interval it closes (as mark does) and clears it. A writer that already did either is untouched.
+CREATE OR REPLACE FUNCTION mem.keep_belief_time() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, mem, pg_temp AS $$
+DECLARE now_ts timestamptz := clock_timestamp();
+BEGIN
+  IF OLD.status = 'active' AND NEW.status <> 'active' AND NEW.retired_at IS NULL THEN
+    NEW.retired_at := now_ts;
+  ELSIF OLD.status <> 'active' AND NEW.status = 'active' AND NEW.retired_at IS NOT NULL THEN
+    IF NEW.retired_at < now_ts THEN
+      NEW.metadata := coalesce(NEW.metadata, '{}'::jsonb) || jsonb_build_object(
+        'retired_intervals',
+        coalesce(CASE WHEN jsonb_typeof(NEW.metadata->'retired_intervals') = 'array'
+                      THEN NEW.metadata->'retired_intervals' END, '[]'::jsonb)
+        || jsonb_build_array(jsonb_build_object('retired_at', NEW.retired_at,
+                                                'reactivated_at', now_ts)));
+    END IF;
+    NEW.retired_at := NULL;
+  END IF;
+  RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS memories_keep_belief_time ON mem.memories;
+CREATE TRIGGER memories_keep_belief_time BEFORE UPDATE OF status ON mem.memories
+  FOR EACH ROW EXECUTE FUNCTION mem.keep_belief_time();
+
 -- The app role is granted in mem_app_role.sql. Also here when it already exists, so re-running
 -- this file on a live store leaves the function callable.
 DO $$ BEGIN
