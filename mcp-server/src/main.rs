@@ -933,9 +933,14 @@ fn tool_search_docs(query: &str, k: u32) -> Result<String, String> {
 /// line syntax as the Python loader (hooks/_mem_common.py): two readers of one file must not
 /// disagree about whether to trust it, and that file decides who you are.
 fn env_file_value(key: &str) -> Option<String> {
-    let path = std::env::var("HYPERMNESIA_ENV_FILE").unwrap_or_else(|_| {
-        format!("{}/.claude/hypermnesia.env", std::env::var("HOME").unwrap_or_default())
-    });
+    let home = std::env::var("HOME").unwrap_or_default();
+    // os.path.expanduser on the Python side: a leading `~` (alone or before `/`) is HOME.
+    let path = match std::env::var("HYPERMNESIA_ENV_FILE") {
+        Ok(p) if p == "~" => home.clone(),
+        Ok(p) if p.starts_with("~/") => format!("{home}{}", &p[1..]),
+        Ok(p) => p,
+        Err(_) => format!("{home}/.claude/hypermnesia.env"),
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1582,6 +1587,16 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::env::set_var("HYPERMNESIA_ENV_FILE", &file);
         std::env::remove_var("MEM_AUTHOR");
+        {
+            // `~/...` resolves against HOME, as Python's expanduser does.
+            let saved_home = std::env::var("HOME").ok();
+            std::env::set_var("HOME", &dir);
+            std::env::set_var("HYPERMNESIA_ENV_FILE", "~/hypermnesia.env");
+            assert_eq!(mem_author().as_deref(), Some("alice"), "~ must expand to HOME");
+            match saved_home { Some(h) => std::env::set_var("HOME", h),
+                               None => std::env::remove_var("HOME") }
+            std::env::set_var("HYPERMNESIA_ENV_FILE", &file);
+        }
         std::env::remove_var("MEM_DIALECTIC_TIMEOUT");
         std::env::remove_var("HM_DIALECTIC_TIMEOUT_SECS");
         assert_eq!(mem_author().as_deref(), Some("alice"));

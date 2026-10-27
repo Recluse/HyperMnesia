@@ -472,7 +472,17 @@ def admin_helpers(fx):
             (f"GRANT SELECT ON mem.author_roles TO {fx.role_a}",
              f"REVOKE SELECT ON mem.author_roles FROM {fx.role_a}", "a privilege on the author map"),
             (f"ALTER TABLE mem.sources OWNER TO {fx.role_a}",
-             f"ALTER TABLE mem.sources OWNER TO \"{owner}\"", "ownership of mem.sources")):
+             f"ALTER TABLE mem.sources OWNER TO \"{owner}\"", "ownership of mem.sources"),
+            (f"GRANT SELECT (role), UPDATE (author) ON mem.author_roles TO {fx.role_a}",
+             f"REVOKE SELECT (role), UPDATE (author) ON mem.author_roles FROM {fx.role_a}",
+             "a column privilege on the author map"),
+            (f"GRANT SELECT ON mem.all_active_memories TO {fx.role_a}",
+             f"REVOKE SELECT ON mem.all_active_memories FROM {fx.role_a}",
+             "SELECT on the owner-run maintenance view"),
+            (f"GRANT TRUNCATE ON mem.sources TO {fx.role_a}",
+             f"REVOKE TRUNCATE ON mem.sources FROM {fx.role_a}", "TRUNCATE on mem.sources"),
+            (f"GRANT pg_execute_server_program TO {fx.role_a}",
+             f"REVOKE pg_execute_server_program FROM {fx.role_a}", "pg_execute_server_program")):
         must(OWNER_URL, grant + ";")
         mode = scalar(fx.url_a, "SELECT mode FROM mem.whoami();")
         must(OWNER_URL, revoke + ";")

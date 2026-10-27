@@ -74,15 +74,47 @@ SET search_path = pg_catalog, pg_temp AS $$
                   WHERE d.datname = pg_catalog.current_database()
                     AND pg_catalog.pg_has_role(r, d.datdba, 'MEMBER'))
       THEN 'it owns this database (and with it schema public)'
-    WHEN EXISTS (SELECT 1 FROM unnest(ARRAY['mem.author_roles', 'mem.project_members']) t(tbl)
-                  WHERE pg_catalog.to_regclass(t.tbl) IS NOT NULL
-                    AND pg_catalog.has_table_privilege(r, t.tbl,
-                          'SELECT, INSERT, UPDATE, DELETE, TRUNCATE'))
-      THEN 'it has privileges on the author map or the project membership table'
+    -- An author login inherits hm_app's privileges and must hold nothing beyond them anywhere
+    -- in schema mem: a direct SELECT on the owner-run maintenance view reads every author, a
+    -- TRUNCATE skips row-level security, a column UPDATE on the author map rewrites identity.
+    -- Compared privilege by privilege, table and column level, so no list of "dangerous"
+    -- objects has to be kept in step with the schema.
+    WHEN EXISTS (
+           SELECT 1 FROM pg_catalog.pg_class c
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            CROSS JOIN unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE','TRUNCATE',
+                                    'REFERENCES','TRIGGER']) pr(p)
+            WHERE n.nspname = 'mem' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+              AND pg_catalog.has_table_privilege(r, c.oid, pr.p)
+              AND NOT pg_catalog.has_table_privilege('hm_app', c.oid, pr.p))
+      OR EXISTS (
+           SELECT 1 FROM pg_catalog.pg_class c
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            CROSS JOIN unnest(ARRAY['SELECT','INSERT','UPDATE','REFERENCES']) pr(p)
+            WHERE n.nspname = 'mem' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+              AND pg_catalog.has_any_column_privilege(r, c.oid, pr.p)
+              AND NOT pg_catalog.has_any_column_privilege('hm_app', c.oid, pr.p))
+      OR EXISTS (
+           SELECT 1 FROM pg_catalog.pg_class c
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            CROSS JOIN unnest(ARRAY['USAGE','SELECT','UPDATE']) pr(p)
+            WHERE n.nspname = 'mem' AND c.relkind = 'S'
+              AND pg_catalog.has_sequence_privilege(r, c.oid, pr.p)
+              AND NOT pg_catalog.has_sequence_privilege('hm_app', c.oid, pr.p))
+      OR EXISTS (
+           SELECT 1 FROM pg_catalog.pg_proc f
+             JOIN pg_catalog.pg_namespace n ON n.oid = f.pronamespace
+            WHERE n.nspname = 'mem'
+              AND pg_catalog.has_function_privilege(r, f.oid, 'EXECUTE')
+              AND NOT pg_catalog.has_function_privilege('hm_app', f.oid, 'EXECUTE'))
+      THEN 'it holds privileges in schema mem beyond those of hm_app'
     WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_roles g
-                  WHERE g.rolname IN ('pg_read_all_data', 'pg_write_all_data')
+                  WHERE g.rolname IN ('pg_read_all_data', 'pg_write_all_data',
+                                      'pg_execute_server_program', 'pg_read_server_files',
+                                      'pg_write_server_files')
                     AND pg_catalog.pg_has_role(r, g.oid, 'MEMBER'))
-      THEN 'it holds pg_read_all_data or pg_write_all_data'
+      THEN 'it holds a predefined role that reads or writes all data, or the server''s files '
+           'and programs'
     WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_roles g
                   WHERE g.rolcreaterole AND (g.rolname = r OR mem.can_become(r, g.oid)))
       THEN 'it has CREATEROLE'
