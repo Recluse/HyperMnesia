@@ -11,12 +11,16 @@ database, no embedder and no network are needed.
 
     python3 tests/test_doctor.py
 """
+import contextlib
+import hashlib
+import http.server
 import json
 import os
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOCTOR = os.path.join(ROOT, "ci", "doctor.py")
@@ -50,6 +54,34 @@ sys.exit(0)                      # unknown query -> empty result, like a real em
 '''
 
 failures, ran = [], 0
+TEI_SEEN = []
+
+
+@contextlib.contextmanager
+def tei(vector):
+    """A one-vector TEI stand-in: /health answers, /embed returns `vector` for every input."""
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            TEI_SEEN.append(body["inputs"])
+            out = json.dumps([vector for _ in body["inputs"]]).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(out)
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}"
+    finally:
+        srv.shutdown()
 
 
 def check(name, ok, detail=""):
@@ -60,7 +92,7 @@ def check(name, ok, detail=""):
         failures.append(name)
 
 
-def run(answers, env_extra=None, fail=False):
+def run(answers, env_extra=None, fail=False, queue=None):
     """Run the doctor against a stubbed store; returns (findings, exit_code)."""
     with tempfile.TemporaryDirectory() as tmp:
         shim = os.path.join(tmp, "psql")
@@ -80,6 +112,15 @@ def run(answers, env_extra=None, fail=False):
                    EMBED_BACKEND="ollama")
         env.pop("HM_REPO", None)
         env.pop("HM_RERANK_URL", None)
+        # A private HOME: no settings file, no identity and no extraction queue leak in from
+        # the machine running the test.
+        env.pop("MEM_AUTHOR", None)
+        env["HOME"] = tmp
+        if queue is not None:
+            os.makedirs(os.path.join(tmp, ".claude"), exist_ok=True)
+            with open(os.path.join(tmp, ".claude", "mem-queue.jsonl"), "w") as f:
+                for i in range(queue):
+                    f.write(json.dumps({"transcript_path": f"/nonexistent/t{i}.jsonl"}) + "\n")
         if fail:
             env["STUB_FAIL"] = "1"
         env.update(env_extra or {})
@@ -142,6 +183,117 @@ def main():
     check("skips the checks that depend on it", by_title(f, "ANN index") is None)
     check("still checks the embedder", by_title(f, "Embedder") is not None)
     check("exit code is non-zero", code == 1)
+
+    print("== migrations ==")
+    order = subprocess.run(["sh", os.path.join(ROOT, "hm"), "migrate", "--list"],
+                           capture_output=True, text=True).stdout.split()
+    sums = {}
+    for name in order:
+        path = os.path.join(ROOT, "sql", name)
+        if os.path.isfile(path):
+            sums[name] = hashlib.sha256(open(path, "rb").read()).hexdigest()
+    tracked = dict(HEALTHY)
+    tracked["to_regclass('public.hm_schema_migrations')"] = [["t"]]
+    tracked["FROM public.hm_schema_migrations"] = [[n, c] for n, c in sums.items()]
+    f, _ = run(tracked)
+    check("every file recorded with its checksum is reported current",
+          (by_title(f, "migration(s) current") or {}).get("level") == "ok", str(f)[:300])
+    gap = dict(tracked)
+    gap["FROM public.hm_schema_migrations"] = [[n, c] for n, c in sums.items()
+                                               if n != "migrate_dreamer.sql"]
+    f, code = run(gap)
+    miss = by_title(f, "not applied")
+    check("a missing migration is a failure that names it",
+          (miss or {}).get("level") == "fail" and "migrate_dreamer.sql" in miss.get("detail", ""),
+          str(miss))
+    edited = dict(tracked)
+    edited["FROM public.hm_schema_migrations"] = [[n, "0" * 64 if n == "schema.sql" else c]
+                                                  for n, c in sums.items()]
+    f, _ = run(edited)
+    check("a file changed since it was applied is a warning that names it",
+          "schema.sql" in (by_title(f, "changed since applied") or {}).get("detail", ""))
+    untracked = dict(HEALTHY)
+    untracked["to_regclass('public.hm_schema_migrations')"] = [["f"]]
+    f, _ = run(untracked)
+    check("a store with no version table says migrations are untracked",
+          (by_title(f, "not tracked") or {}).get("level") == "warn")
+
+    print("== who the connection is ==")
+    owner = dict(HEALTHY)
+    owner["FROM pg_roles r"] = [["hm", "t", "f", "t"]]
+    owner["count(DISTINCT author)"] = [["2"]]
+    f, _ = run(owner)
+    rls = by_title(f, "Row-level security is bypassed")
+    check("a superuser connection on a two-author store is a failure",
+          (rls or {}).get("level") == "fail", str(rls))
+    owner["count(DISTINCT author)"] = [["1"]]
+    f, _ = run(owner)
+    check("on a one-author store it is a warning",
+          (by_title(f, "Row-level security is bypassed") or {}).get("level") == "warn")
+    app = dict(HEALTHY)
+    app["FROM pg_roles r"] = [["hm_alice", "f", "f", "f"]]
+    app["FROM mem.whoami()"] = [["hm_alice", "alice", "enforced"]]
+    f, _ = run(app, env_extra={"MEM_AUTHOR": "alice"})
+    check("an enforced login is reported as enforced",
+          (by_title(f, "Identity enforced") or {}).get("level") == "ok")
+    f, _ = run(app, env_extra={"MEM_AUTHOR": "bob"})
+    check("MEM_AUTHOR disagreeing with the mapped author is a failure",
+          (by_title(f, "disagrees") or {}).get("level") == "fail")
+    app["FROM mem.whoami()"] = [["hm_ghost", "", "unmapped"]]
+    f, _ = run(app)
+    check("an unmapped member of hm_app is a failure",
+          (by_title(f, "no author mapping") or {}).get("level") == "fail")
+    app["FROM pg_roles r"] = [["hm_app", "f", "f", "f"]]
+    app["FROM mem.whoami()"] = [["hm_app", "alice", "filter"]]
+    f, _ = run(app, env_extra={"MEM_AUTHOR": "alice"})
+    shared = by_title(f, "Shared login")
+    check("the shared login is reported honestly: claimed, not enforced",
+          (shared or {}).get("level") == "ok" and "does not tell people apart"
+          in shared.get("detail", ""), str(shared))
+
+    print("== unembedded chunks, per scope ==")
+    ans = dict(HEALTHY)
+    ans["FILTER (WHERE embedding IS NULL)"] = [["1680", "12"]]
+    ans["WHERE c.embedding IS NULL"] = [["api", "9"], ["notes", "3"]]
+    f, _ = run(ans)
+    detail = (by_title(f, "have no embedding") or {}).get("detail", "")
+    check("the count is broken down by scope", "api (9)" in detail and "notes (3)" in detail,
+          detail)
+
+    print("== embedding fingerprint ==")
+    stored = [0.6, 0.8, 0.0]
+    fp = dict(HEALTHY)
+    fp["json_build_object('p'"] = [[json.dumps({"p": "Doc > H", "c": "text",
+                                                "e": json.dumps(stored)})]]
+    for vec, level, title in ((stored, "ok", "matches the stored"),
+                              ([0.8, 0.6, 0.0], "warn", "differs from the stored")):
+        with tei(vec) as url:
+            f, _ = run(fp, env_extra={"EMBED_BACKEND": "tei", "TEI_URL": url})
+        got = by_title(f, title)
+        check(f"re-embedding stored text: {title} -> {level}",
+              (got or {}).get("level") == level, str([x["title"] for x in f]))
+        if vec is stored:
+            check("the embedder saw the stored text with its context prefix",
+                  TEI_SEEN and TEI_SEEN[-1] == ["Doc > H\ntext"], str(TEI_SEEN[-1:]))
+    f, _ = run(fp)
+    check("an unreachable embedder skips the check and says so",
+          (by_title(f, "fingerprint not checked") or {}).get("level") == "ok",
+          str([x["title"] for x in f]))
+
+    print("== extraction pipeline ==")
+    ext = dict(HEALTHY)
+    ext["channel = 'extractor'"] = [[str(10 * 24 * 3600)]]
+    f, _ = run(ext, env_extra={"MEM_AUTHOR": "alice"}, queue=4)
+    stall = by_title(f, "stalled")
+    check("a ten-day-old newest extraction with a queue is flagged",
+          (stall or {}).get("level") == "warn" and "4 transcript(s) queued"
+          in stall.get("detail", ""), str(stall))
+    ext["channel = 'extractor'"] = [["600"]]
+    f, _ = run(ext, env_extra={"MEM_AUTHOR": "alice"}, queue=0)
+    check("a fresh one is current", (by_title(f, "Extraction is current") or {}).get("level") == "ok")
+    f, _ = run(HEALTHY, queue=3)
+    check("a queue with no identity to write it is flagged",
+          (by_title(f, "wait for extraction") or {}).get("level") == "warn")
 
     print(f"\n{ran - len(failures)}/{ran} checks passed"
           + (f"; FAILED: {', '.join(failures)}" if failures else ""))

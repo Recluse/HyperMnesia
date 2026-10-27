@@ -12,16 +12,29 @@ tells you until you go looking. This is the going-looking.
     python3 ci/doctor.py --json     # same findings as JSON (what the MCP `status` tool serves)
 
 Reads the same env as everything else: DATABASE_URL, EMBED_BACKEND/OLLAMA_URL/TEI_URL,
-HM_RERANK_URL, HM_REPO. Checks are read-only and each one is bounded by a short timeout, so a
-dead dependency costs seconds, not a hang.
+HM_RERANK_URL, HM_REPO, MEM_AUTHOR (and the shared settings file). Checks are read-only and each
+one is bounded by a short timeout, so a dead dependency costs seconds, not a hang.
+HM_EXTRACT_MAX_AGE_HOURS (default 72) is how old the newest extracted memory may be before it
+counts as a stalled pipeline.
 """
+import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
 import urllib.error
 import urllib.request
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The settings file and the identity rule, from the one module that defines them. Optional: a
+# doctor that cannot import the hooks still checks everything that does not need an identity.
+sys.path.insert(0, os.path.join(ROOT, "hooks"))
+try:
+    import _mem_common                          # noqa: E402  (applies the settings file)
+except Exception:                               # pragma: no cover - a partial deployment
+    _mem_common = None
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://hm@localhost:5432/hypermnesia")
 BACKEND = os.environ.get("EMBED_BACKEND", "ollama").lower()
@@ -50,13 +63,24 @@ def finding(level, title, detail="", fix=""):
 # missing would be a doctor for the wrong patient. ON_ERROR_STOP matters just as much here --
 # without it psql prints an error to stderr, exits 0, and an SQL failure reads as an empty
 # result, which is the exact class of bug this file exists to catch.
+def identity():
+    return _mem_common.identity() if _mem_common else None
+
+
 def q(sql, timeout=10):
-    """Run one query. Returns (rows, error): rows is a list of column-lists."""
+    """Run one query. Returns (rows, error): rows is a list of column-lists.
+
+    As the identity the hooks use, through the same connection option: on the shared login a
+    doctor with no identity would see an empty memory store and call that a finding."""
     if not shutil.which("psql"):
         return None, "psql is not on PATH"
+    env = dict(os.environ)
+    who = identity()
+    if who:
+        env["PGOPTIONS"] = f"-c mem.reader={who}"
     try:
         p = subprocess.run(["psql", DATABASE_URL, "-tAX", "-F", "\x1f", "-v", "ON_ERROR_STOP=1"],
-                           input=sql.encode(), capture_output=True, timeout=timeout)
+                           input=sql.encode(), capture_output=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         return None, f"timed out after {timeout}s"
     except OSError as e:
@@ -142,10 +166,17 @@ def check_embeddings(out):
                            "Run ingest/ingest_repo.py, load the SQL, then ingest/embed_chunks.py."))
         return
     if nulls:
+        # Per scope: a count with no scope sends you to re-embed everything, and the chunks
+        # without a vector are usually the newest edits of one repo.
+        rows, err = q("SELECT d.repo, count(*) FROM chunks c JOIN documents d "
+                      "ON d.id = c.document_id WHERE c.embedding IS NULL "
+                      "GROUP BY d.repo ORDER BY 2 DESC, 1")
+        by_repo = ", ".join(f"{r[0]} ({r[1]})" for r in rows or []) if not err else ""
         out.append(finding(FAIL if nulls == total else WARN,
                            f"{nulls} of {total} chunks have no embedding",
-                           "those chunks can only ever be found by the lexical leg",
-                           "python3 ingest/embed_chunks.py"))
+                           "those chunks can only ever be found by the lexical leg"
+                           + (f"; by scope: {by_repo}" if by_repo else ""),
+                           "python3 ingest/embed_chunks.py  (EMBED_REPO=<scope> for one scope)"))
     else:
         out.append(finding(OK, f"All {total} chunks embedded"))
 
@@ -168,6 +199,223 @@ def check_embedding_model(out):
         out.append(finding(FAIL, "Mixed embedding models in one store", detail,
                            "Vectors from different models are not comparable. Re-embed the "
                            "minority rows with the model you serve queries from."))
+
+
+def check_embedding_fingerprint(out):
+    # `embedding_model` is a string from the config, not a fingerprint of the model: an upstream
+    # image re-published under the same tag, a changed pooling or normalisation, a quantised
+    # build -- all keep the label and move the vectors. Queries then embed into a slightly
+    # different space than the corpus and recall degrades with no error. The only real test is
+    # to embed stored text again and compare with what is stored.
+    rows, err = q("SELECT json_build_object('p', coalesce(context_prefix, ''), 'c', content, "
+                  "'e', embedding::text) FROM chunks WHERE embedding IS NOT NULL "
+                  "ORDER BY random() LIMIT 3")
+    if err or not rows:
+        return
+    try:
+        sample = [json.loads(r[0]) for r in rows]
+        stored = [json.loads(x["e"]) for x in sample]
+        texts = [f"{x['p']}\n{x['c']}" if x["p"] else x["c"] for x in sample]
+    except (ValueError, KeyError, TypeError) as e:
+        out.append(finding(WARN, "Embedding fingerprint not checked", f"unreadable sample: {e}"))
+        return
+    try:
+        sys.path.insert(0, os.path.join(ROOT, "ingest"))
+        from _common import embed_texts         # noqa: E402  (the embedder ingest uses)
+        fresh = embed_texts(texts, timeout=20)
+    except Exception as e:                      # unreachable, refused, timed out, no module
+        out.append(finding(OK, "Embedding fingerprint not checked",
+                           f"the embedder did not answer ({type(e).__name__}: {e})"))
+        return
+
+    def cos_dist(a, b):
+        na = math.sqrt(sum(x * x for x in a)) or 1.0
+        nb = math.sqrt(sum(x * x for x in b)) or 1.0
+        return 1.0 - sum(x * y for x, y in zip(a, b)) / (na * nb)
+
+    if len(fresh) != len(stored) or any(len(a) != len(b) for a, b in zip(fresh, stored)):
+        out.append(finding(FAIL, "Embedder returns vectors of another shape than the stored ones",
+                           "", "The configured embedder is not the one the corpus was built with."))
+        return
+    worst = max(cos_dist(a, b) for a, b in zip(fresh, stored))
+    if worst > 1e-3:
+        out.append(finding(WARN, "Embedder output differs from the stored vectors",
+                           f"max cosine distance {worst:.2e} over {len(stored)} re-embedded "
+                           f"chunk(s); threshold 1e-3",
+                           "The model behind the configured name changed (or another backend "
+                           "serves it). Queries and corpus no longer share one space: re-embed, or "
+                           "point the embedder back at the model the corpus was built with."))
+    else:
+        out.append(finding(OK, "Embedder matches the stored vectors",
+                           f"max cosine distance {worst:.1e} over {len(stored)} chunk(s)"))
+
+
+def check_migrations(out):
+    # The apply order lives in ./hm (one copy); ask it rather than keep a second list here.
+    try:
+        p = subprocess.run(["sh", os.path.join(ROOT, "hm"), "migrate", "--list"],
+                           capture_output=True, text=True, timeout=10)
+        order = p.stdout.split() if p.returncode == 0 else []
+    except (OSError, subprocess.TimeoutExpired):
+        order = []
+    if not order:
+        out.append(finding(WARN, "Migrations not checked", "./hm migrate --list gave no order"))
+        return
+    rows, err = q("SELECT to_regclass('public.hm_schema_migrations') IS NOT NULL")
+    if err or not rows:
+        return
+    if rows[0][0] != "t":
+        out.append(finding(WARN, "Migrations are not tracked",
+                           "no hm_schema_migrations table -- nothing can say which sql/ files "
+                           "this store has had applied",
+                           "./hm migrate  (as the table owner: HM_ADMIN_URL)"))
+        return
+    rows, err = q("SELECT name, checksum FROM public.hm_schema_migrations")
+    if err:
+        out.append(finding(WARN, "Cannot read hm_schema_migrations", err,
+                           "Re-run ./hm migrate so sql/mem_app_role.sql grants SELECT on it."))
+        return
+    recorded = {r[0]: r[1] for r in rows}
+    missing, changed = [], []
+    for name in order:
+        path = os.path.join(ROOT, "sql", name)
+        if not os.path.isfile(path):
+            continue
+        with open(path, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+        if name not in recorded:
+            missing.append(name)
+        elif recorded[name] != digest:
+            changed.append(name)
+    if missing:
+        out.append(finding(FAIL, f"{len(missing)} migration(s) not applied",
+                           ", ".join(missing),
+                           "./hm migrate  (as the table owner: HM_ADMIN_URL)"))
+    if changed:
+        out.append(finding(WARN, f"{len(changed)} migration(s) changed since applied",
+                           ", ".join(changed),
+                           "./hm migrate --status, then ./hm migrate --reapply <file> after "
+                           "reading the change"))
+    if not missing and not changed:
+        out.append(finding(OK, f"All {len(recorded)} recorded migration(s) current"))
+
+
+def check_identity(out):
+    # Which trust mode this connection is in -- and whether it is in one at all. A connection as
+    # the table owner, a superuser or a BYPASSRLS role skips every policy: it answers every
+    # query, correctly, with everybody's rows.
+    rows, err = q("SELECT r.rolname, r.rolsuper, r.rolbypassrls, "
+                  "coalesce(pg_has_role(current_user, c.relowner, 'USAGE'), false) "
+                  "FROM pg_roles r LEFT JOIN pg_class c ON c.oid = to_regclass('mem.memories') "
+                  "WHERE r.rolname = current_user")
+    if err or not rows or len(rows[0]) < 4:
+        return
+    role, sup, bypass, owner = rows[0][0], rows[0][1] == "t", rows[0][2] == "t", rows[0][3] == "t"
+    if sup or bypass or owner:
+        why = "superuser" if sup else ("BYPASSRLS" if bypass else "owner of mem.memories")
+        n = q("SELECT count(DISTINCT author) FROM mem.memories")[0] or [["0"]]
+        authors = int(n[0][0]) if n and n[0] and n[0][0].isdigit() else 0
+        out.append(finding(FAIL if authors > 1 else WARN,
+                           f"Row-level security is bypassed for this connection ({role}: {why})",
+                           f"every memory policy is skipped; the store holds {authors} author(s)",
+                           "Fine for migrations and restores. The application must connect as "
+                           "hm_app or a per-author login (docs/INSTALL.md, \"Two people, one "
+                           "store\"); keep this one in HM_ADMIN_URL."))
+        return
+    rows, err = q("SELECT login, coalesce(author, ''), mode FROM mem.whoami()")
+    if err or not rows or len(rows[0]) < 3:
+        return
+    login, author, mode = rows[0]
+    who = identity()
+    if mode == "enforced":
+        if who and who != author:
+            out.append(finding(FAIL, "MEM_AUTHOR disagrees with the database",
+                               f"login {login} is author {author!r}, MEM_AUTHOR is {who!r}",
+                               "Every write under MEM_AUTHOR will be refused. Set MEM_AUTHOR to "
+                               "the mapped author."))
+        else:
+            out.append(finding(OK, "Identity enforced by the database",
+                               f"login {login} is author {author!r}; mem.reader is ignored"))
+    elif mode == "unmapped":
+        out.append(finding(FAIL, "This login has no author mapping",
+                           f"{login} is a member of hm_app but not in mem.author_roles: it reads "
+                           f"nothing and every write is refused",
+                           "./hm author add <author> <login>, as the table owner"))
+    else:
+        out.append(finding(OK, "Shared login: identity is claimed, not enforced",
+                           f"login {login} reads as {author or '(nobody)'}; row-level security "
+                           f"filters by that claim, it does not tell people apart",
+                           "One login per author makes the database enforce it: ./hm author add"))
+
+
+QUEUE = os.path.expanduser("~/.claude/mem-queue.jsonl")
+DONE = os.path.expanduser("~/.claude/mem-queue.done")
+REEXTRACT_BYTES = 10 * 1024 * 1024              # hooks/mem_extract.py: done_key()
+
+
+def queue_depth():
+    """Transcripts the extractor has not finished, counted the way it counts them."""
+    if not os.path.exists(QUEUE):
+        return 0
+    try:
+        with open(DONE, encoding="utf-8") as fh:
+            done = set(fh.read().splitlines())
+    except OSError:
+        done = set()
+    pending = set()
+    with open(QUEUE, encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                tp = json.loads(line).get("transcript_path")
+            except (ValueError, AttributeError):
+                continue
+            if not tp:
+                continue
+            try:
+                key = f"{tp}#{os.path.getsize(tp) // REEXTRACT_BYTES}"
+            except OSError:
+                key = tp
+            if key not in done:
+                pending.add(key)
+    return len(pending)
+
+
+def check_extraction(out):
+    # The extractor runs from a timer, so it can stop for good and say so nowhere: the console
+    # judges it by its exit code and the store keeps answering from what it already holds.
+    try:
+        depth = queue_depth()
+    except OSError as e:
+        depth = None
+        out.append(finding(WARN, "Extraction queue unreadable", f"{QUEUE}: {e}"))
+    who = identity()
+    if not who:
+        if depth:
+            out.append(finding(WARN, f"{depth} transcript(s) wait for extraction",
+                               "and MEM_AUTHOR is unset, so the extractor cannot write any of them",
+                               "Set MEM_AUTHOR (~/.claude/hypermnesia.env)."))
+        return
+    lit = "'" + who.replace("'", "''") + "'"
+    rows, err = q("SELECT coalesce(extract(epoch FROM now() - max(m.created_at))::bigint, -1) "
+                  "FROM mem.memories m JOIN mem.sources s ON s.memory_id = m.id "
+                  f"WHERE s.channel = 'extractor' AND m.author = {lit}")
+    if err or not rows or not rows[0][0].lstrip("-").isdigit():
+        return
+    age = int(rows[0][0])
+    limit_h = float(os.environ.get("HM_EXTRACT_MAX_AGE_HOURS", "72") or 72)
+    queued = "" if depth is None else f"; {depth} transcript(s) queued"
+    if age < 0:
+        out.append(finding(WARN if depth else OK, "No extracted memories yet",
+                           f"nothing written by the extractor for {who}{queued}",
+                           "Run hooks/mem_extract.py, or check its timer." if depth else ""))
+    elif age > limit_h * 3600:
+        out.append(finding(WARN, "Extraction looks stalled",
+                           f"newest extracted memory for {who} is {age / 3600:.0f} h old "
+                           f"(limit {limit_h:g} h){queued}",
+                           "Run hooks/mem_extract.py by hand and read its output; check its timer."))
+    else:
+        out.append(finding(OK, "Extraction is current",
+                           f"newest extracted memory {age / 3600:.1f} h old{queued}"))
 
 
 def check_map(out):
@@ -231,7 +479,8 @@ def check_reranker(out):
                            "search with quietly worse ranking rather than an error."))
 
 
-CHECKS = [check_schema, check_ann_index, check_embeddings, check_embedding_model, check_map]
+CHECKS = [check_schema, check_migrations, check_identity, check_ann_index, check_embeddings,
+          check_embedding_model, check_map, check_extraction]
 
 
 def run():
@@ -240,6 +489,8 @@ def run():
         for c in CHECKS:
             c(out)
     check_embedder(out)
+    if out and out[0]["title"] == "Postgres reachable":
+        check_embedding_fingerprint(out)
     check_reranker(out)
     return out
 

@@ -65,6 +65,25 @@ def run(env_text, mode=0o600, extra_env=None, dir_mode=0o700):
         return out, p.stderr
 
 
+def ident(env_text, mem_author=None, code="print(repr(_mem_common.identity()))"):
+    """(stdout, stderr, exit code) of a fresh process that loaded the settings file and asked
+    who it is. mem_author=None removes the variable from the environment entirely."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "hypermnesia.env")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(env_text)
+        os.chmod(path, 0o600)
+        os.chmod(tmp, 0o700)
+        env = dict(os.environ, HYPERMNESIA_ENV_FILE=path)
+        env.pop("MEM_AUTHOR", None)
+        if mem_author is not None:
+            env["MEM_AUTHOR"] = mem_author
+        p = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); "
+                            "import _mem_common; " % os.path.join(ROOT, "hooks") + code],
+                           capture_output=True, text=True, env=env, timeout=60)
+        return p.stdout.strip(), p.stderr, p.returncode
+
+
 def main():
     print("== the file is applied ==")
     seen, _ = run("# комментарий\nMEM_REFLECT_MIN=9\n\nMEM_STALE_DAYS = 42\n")
@@ -126,6 +145,30 @@ def main():
                        capture_output=True, text=True, env=env, timeout=60)
     check("importing the hooks works with no settings file", p.returncode == 0 and "ok" in p.stdout,
           p.stderr[-200:])
+
+    print("\n== MEM_AUTHOR: a non-empty environment value decides, the same rule as Rust ==")
+    out, _, _ = ident("MEM_AUTHOR=alice\n")
+    check("the file supplies it when the environment does not", out == "'alice'", out)
+    out, _, _ = ident("MEM_AUTHOR=alice\n", mem_author="")
+    check("an EMPTY variable counts as unset, so the file applies", out == "'alice'", out)
+    out, _, _ = ident("MEM_AUTHOR=alice\n", mem_author=" bob ")
+    check("the environment beats the file, surrounding blanks trimmed", out == "'bob'", out)
+    out, err, _ = ident("MEM_AUTHOR=alice\n", mem_author="not a name!")
+    check("an INVALID environment value is no identity -- not a fall back to the file",
+          out == "None", out)
+    check("and it says the value came from the environment", "environment" in err, err[:200])
+    out, err, _ = ident("MEM_AUTHOR=alice\n", mem_author="   ")
+    check("a blank-only value is invalid too, not 'unset'", out == "None" and "NO identity" in err,
+          out + err[:200])
+    out, err, _ = ident("MEM_AUTHOR=no way\n")
+    check("an invalid file value is no identity, and names the file",
+          out == "None" and "hypermnesia.env" in err, out + err[:200])
+    _, err, code = ident("", code="_mem_common.require_identity('mem_extract')")
+    check("a scheduled pass with no identity refuses to start, exit 2",
+          code == 2 and "refusing to start" in err, f"{code} {err[:200]}")
+    out, _, code = ident("", mem_author="carol",
+                         code="print(_mem_common.require_identity('mem_extract'))")
+    check("and starts with one", code == 0 and out == "carol", f"{code} {out}")
 
     print(f"\n{ran - len(failures)}/{ran} checks passed"
           + (f"; FAILED: {', '.join(failures)}" if failures else ""))

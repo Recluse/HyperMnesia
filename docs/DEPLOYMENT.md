@@ -109,8 +109,18 @@ Mac deployment, Ollama is simpler. For sustained NVIDIA GPU serving, vLLM is the
 
 Treat the four network surfaces differently:
 
-1. **Postgres** holds the durable corpus and personal memory. Use a scoped application role,
-   SCRAM credentials, network isolation and backups.
+1. **Postgres** holds the durable corpus and personal memory. Use SCRAM credentials, network
+   isolation and backups, and never let the application connect as the table owner (it
+   bypasses every row-level policy). Which application login matters as much:
+   - the shared `hm_app` login makes row-level security a **filter** — each caller names itself
+     through `mem.reader`, so whoever holds that one password can read and write as any author;
+   - one login per author (`./hm author add`) makes the **database enforce** who is reading:
+     a login cannot read another author's private memory or write in their name;
+   - in both modes the document corpus (`documents`, `chunks`) is shared and writable by every
+     application login, by design.
+
+   Nothing in this repository authenticates remote callers; the MCP server is a local stdio
+   process. See [Trust](DESIGN.md#trust).
 2. **Embedder** receives document chunks and search queries. TEI and Ollama are normally placed
    on a trusted network rather than exposed directly.
 3. **Reranker** receives queries and candidate passages and has no built-in authentication.

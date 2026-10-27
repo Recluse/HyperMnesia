@@ -8,7 +8,23 @@
 # full ingest over an existing scope and it deletes the documents first, taking every embedding
 # with them. Neither raises an error.
 #
-#   ./hm init                  bring up the docker stack, load schemas/migrations, print exports
+#   ./hm init                  bring up the docker stack, apply the migrations, print exports
+#   ./hm migrate [--owner <author>] [--reapply <file>]... [--list | --status]
+#                              apply sql/ in the one order that works, recording each file's
+#                              SHA-256 in hm_schema_migrations. An applied file with the same
+#                              checksum is skipped, so a second run is a no-op. A file that
+#                              CHANGED after it was applied stops the run before anything is
+#                              applied; --reapply <file> says you read the change and want it
+#                              re-run. --owner claims unreferenced legacy entities (default:
+#                              MEM_AUTHOR, else your login). --list prints the order, --status
+#                              what is applied, pending or changed. Connects as HM_ADMIN_URL,
+#                              else DATABASE_URL: it must be the role that owns the tables.
+#   ./hm author add <author> [<role>]
+#                              create a login the DATABASE maps to <author> (enforced identity:
+#                              it cannot read or write as anyone else, whatever it sets
+#                              mem.reader to) and print how to set its password
+#   ./hm author remove <role>  unmap a login, revoke hm_app from it and disable it
+#   ./hm author list           which logins are mapped to which author (owner only)
 #   ./hm ingest <dir> <scope> [--walk]
 #                              ingest -> embed -> index, incrementally if the scope already exists.
 #                              --walk enumerates the tree instead of asking git, for a directory
@@ -27,6 +43,7 @@
 #   ./hm latency               where the time goes: hook, embedder, database, reranker
 #
 # Env: DATABASE_URL (required by ingest/doctor; init prints the one it just set up).
+#      HM_ADMIN_URL (migrate, author: the table owner's connection; default DATABASE_URL).
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -42,6 +59,274 @@ need() { command -v "$1" >/dev/null 2>&1 || die "$1 is not on PATH"; }
 usage() {
     awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
     exit "${1:-1}"
+}
+
+# -- migrations -------------------------------------------------------------------------------
+# THE apply order, and the only copy of it. CI, the docs and ci/doctor.py read it from here
+# (`./hm migrate --list`) instead of keeping their own: there used to be four copies, and nothing
+# noticed when one fell behind.
+#
+#   schema.sql                      documents, chunks, the component map
+#   migrate_schema_version.sql      hm_schema_migrations: what has been applied, with checksums
+#   schema_mem.sql .. dreamer       personal memory, then its migrations in dependency order
+#   migrate_author_roles.sql        per-author logins (enforced identity)
+#   mem_app_role.sql                LAST: grants on, and re-states the policies for, all of it
+MIGRATIONS="schema.sql
+migrate_schema_version.sql
+schema_mem.sql
+mem_multiuser.sql
+migrate_entity_ownership.sql
+migrate_memory_perspectives.sql
+migrate_memory_evidence.sql
+migrate_peer_cards.sql
+migrate_dreamer.sql
+migrate_memory_lifecycle.sql
+migrate_constraint_sources.sql
+migrate_author_roles.sql
+mem_app_role.sql"
+
+# Re-applied whenever anything before it was applied in the same run, and whenever it changed:
+# it grants on everything above it, so a table added without re-running it is unreachable to the
+# application -- which looks like an empty store, not like an error.
+REPEATABLE="mem_app_role.sql"
+
+# Tolerated when absent, with a note. Every other missing file is an error.
+MAY_BE_ABSENT="migrate_memory_lifecycle.sql migrate_constraint_sources.sql"
+
+SQL_DIR=${HM_SQL_DIR:-$ROOT/sql}
+
+# How migrate reaches the database: `psql "$MIGRATE_URL"` from this host by default; `hm init`
+# switches it to the psql inside the compose container, which needs nothing installed here.
+MIGRATE_VIA=url
+MIGRATE_URL=
+mpsql() {
+    if [ "$MIGRATE_VIA" = compose ]; then
+        docker compose -f "$ROOT/deploy/docker/docker-compose.yml" exec -T postgres \
+            psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" "$@"
+    else
+        psql "$MIGRATE_URL" "$@"
+    fi
+}
+
+in_list() {   # in_list <word> <space-separated list>
+    case " $2 " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then s=$(sha256sum < "$1")
+    elif command -v shasum >/dev/null 2>&1; then s=$(shasum -a 256 < "$1")
+    else s=$(openssl dgst -sha256 -r < "$1"); fi
+    s=${s%% *}
+    case "$s" in ''|*[!0-9a-f]*) die "could not checksum $1" ;; esac
+    [ "${#s}" -eq 64 ] || die "could not checksum $1"
+    printf %s "$s"
+}
+
+recorded_sum() {   # the checksum recorded for <file>, or nothing
+    awk -v n="$1" '$1 == n { print $2 }' "$mtmp/recorded"
+}
+
+record_applied() {   # record_applied <file> <sha256>
+    # Both values are safe to interpolate: the name comes from MIGRATIONS, the sum is 64 hex.
+    mpsql -tAX -q -v ON_ERROR_STOP=1 -c "INSERT INTO public.hm_schema_migrations (name, checksum)
+        VALUES ('$1', '$2') ON CONFLICT (name)
+        DO UPDATE SET checksum = EXCLUDED.checksum, applied_at = now()" >/dev/null \
+        || die "sql/$1 was applied but could not be recorded -- re-run ./hm migrate"
+}
+
+cmd_migrate() {
+    owner=${MEM_AUTHOR:-$(id -un)}
+    reapply=""
+    mode=apply
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --list)      mode=list ;;
+            --status)    mode=status ;;
+            --owner)     [ $# -ge 2 ] || usage; owner=$2; shift ;;
+            --owner=*)   owner=${1#--owner=} ;;
+            --reapply)   [ $# -ge 2 ] || usage; reapply="$reapply ${2##*/}"; shift ;;
+            --reapply=*) v=${1#--reapply=}; reapply="$reapply ${v##*/}" ;;
+            *) usage ;;
+        esac
+        shift
+    done
+    if [ "$mode" = list ]; then
+        printf '%s\n' $MIGRATIONS
+        return 0
+    fi
+    all=$(printf '%s ' $MIGRATIONS)
+    for r in $reapply; do
+        in_list "$r" "$all" || die "--reapply $r: not a migration (see ./hm migrate --list)"
+    done
+    # The owner value lands in a psql variable that one migration interpolates as a literal.
+    case "$owner" in
+        *[!A-Za-z0-9._-]*|"") die "--owner must match [A-Za-z0-9._-]+ (got: $owner)" ;;
+    esac
+    if [ "$MIGRATE_VIA" = url ]; then
+        need psql
+        MIGRATE_URL=${HM_ADMIN_URL:-${DATABASE_URL:-}}
+        [ -n "$MIGRATE_URL" ] || die "set HM_ADMIN_URL (or DATABASE_URL) to the table owner's connection string"
+    fi
+
+    mtmp=$(mktemp -d); trap 'rm -rf "$mtmp"' EXIT
+    if ! has=$(mpsql -tAX -v ON_ERROR_STOP=1 \
+                -c "SELECT to_regclass('public.hm_schema_migrations') IS NOT NULL" 2>&1); then
+        die "could not reach the database: $has"
+    fi
+    : > "$mtmp/recorded"
+    if [ "$has" = t ]; then
+        mpsql -tAX -v ON_ERROR_STOP=1 -F ' ' \
+            -c "SELECT name, checksum FROM public.hm_schema_migrations ORDER BY name" \
+            > "$mtmp/recorded" || die "could not read hm_schema_migrations"
+    fi
+
+    # Pass 1: decide everything before applying anything. A changed file found halfway through
+    # would leave this run half applied and half refused.
+    changed=""
+    for f in $MIGRATIONS; do
+        path="$SQL_DIR/$f"
+        if [ ! -f "$path" ]; then
+            in_list "$f" "$MAY_BE_ABSENT" || die "sql/$f is missing -- this checkout is incomplete"
+            [ "$mode" != status ] || printf '%-32s absent from this checkout\n' "$f"
+            continue
+        fi
+        sum=$(sha256_of "$path")
+        rec=$(recorded_sum "$f")
+        state=pending
+        if [ -n "$rec" ] && [ "$rec" = "$sum" ]; then
+            state=applied
+        elif [ -n "$rec" ]; then
+            if in_list "$f" "$REPEATABLE"; then
+                state="changed (re-applied by the next run)"
+            elif in_list "$f" "$reapply"; then
+                state="changed (--reapply)"
+            else
+                state=CHANGED
+                changed="$changed $f"
+            fi
+        fi
+        [ "$mode" != status ] || printf '%-32s %s\n' "$f" "$state"
+    done
+    [ "$mode" != status ] || return 0
+    if [ -n "$changed" ]; then
+        printf '!! changed since they were applied:%s\n' "$changed" >&2
+        printf '!! An applied migration is not replayed silently. Read the change, then run\n' >&2
+        printf '!!     ./hm migrate --reapply <file>\n' >&2
+        printf '!! for each one (every file in sql/ is written to be re-runnable).\n' >&2
+        die "refusing to migrate: nothing was applied"
+    fi
+
+    # Pass 2: apply. hm_schema_migrations does not exist until migrate_schema_version.sql has
+    # run, so the files applied before it are recorded as soon as it has.
+    recordable=$has
+    unrecorded=""
+    applied=0
+    current=0
+    for f in $MIGRATIONS; do
+        path="$SQL_DIR/$f"
+        if [ ! -f "$path" ]; then
+            printf -- '-- sql/%s is not in this checkout -- skipped\n' "$f"
+            continue
+        fi
+        sum=$(sha256_of "$path")
+        rec=$(recorded_sum "$f")
+        # Current, unless it was named in --reapply, or it is the grant file and something
+        # before it has just been applied.
+        if [ "$rec" = "$sum" ] && ! in_list "$f" "$reapply" \
+           && { ! in_list "$f" "$REPEATABLE" || [ "$applied" -eq 0 ]; }; then
+            current=$((current + 1))
+            continue
+        fi
+        printf -- '-- applying sql/%s\n' "$f"
+        # From stdin, so the same call works against the compose container, which sees the
+        # files under another path. The output is shown only on failure: an idempotent re-run
+        # prints a page of "already exists, skipping" notices that hide the line that matters.
+        if ! mpsql -X -q -v ON_ERROR_STOP=1 -v owner="$owner" < "$path" > "$mtmp/out" 2>&1; then
+            cat "$mtmp/out" >&2
+            die "sql/$f failed -- nothing after it was applied"
+        fi
+        applied=$((applied + 1))
+        [ "$f" != migrate_schema_version.sql ] || recordable=t
+        unrecorded="$unrecorded $f:$sum"
+        if [ "$recordable" = t ]; then
+            for u in $unrecorded; do
+                record_applied "${u%%:*}" "${u#*:}"
+            done
+            unrecorded=""
+        fi
+    done
+    [ -z "$unrecorded" ] || die "applied but not recorded (no hm_schema_migrations):$unrecorded"
+    if [ "$applied" -eq 0 ]; then
+        printf -- '-- nothing to apply: all %s migration(s) are recorded with their current checksum\n' "$current"
+    else
+        printf '\nmigrations: %s applied, %s already current\n' "$applied" "$current"
+    fi
+}
+
+# -- per-author logins ------------------------------------------------------------------------
+cmd_author() {
+    [ $# -ge 1 ] || usage
+    sub=$1; shift
+    # Arguments first, the database second: a bad name is refused before anything connects.
+    case "$sub" in
+        add)
+            [ $# -ge 1 ] && [ $# -le 2 ] || usage
+            case "$1" in *[!A-Za-z0-9._-]*|"") die "author must match [A-Za-z0-9._-]+ (got: $1)" ;; esac
+            case "${2:-}" in *[!a-z0-9_]*) die "role must match [a-z0-9_]+ (got: $2)" ;; esac ;;
+        remove)
+            [ $# -eq 1 ] || usage
+            case "$1" in *[!a-z0-9_]*|"") die "role must match [a-z0-9_]+ (got: $1)" ;; esac ;;
+        list) ;;
+        *) usage ;;
+    esac
+    need psql
+    url=${HM_ADMIN_URL:-${DATABASE_URL:-}}
+    [ -n "$url" ] || die "set HM_ADMIN_URL (or DATABASE_URL) to the table owner's connection string"
+    atmp=$(mktemp -d); trap 'rm -rf "$atmp"' EXIT
+    case "$sub" in
+        add)
+            name=$1; role=${2:-}
+            if ! r=$(printf "SELECT mem.add_author_role(:'a', NULLIF(:'r', '')::name);\n" \
+                     | psql "$url" -X -tA -q -v ON_ERROR_STOP=1 -v a="$name" -v r="$role" \
+                       2> "$atmp/err"); then
+                die "could not create a login for $name: $(cat "$atmp/err")"
+            fi
+            cat <<MSG
+Login '$r' now reads and writes as '$name'. The database fixes that identity: the mem.reader
+setting is ignored for this login, so it cannot read or write as anyone else.
+
+Set its password (prompted; nothing lands in a file or in shell history):
+
+    psql "\${HM_ADMIN_URL:-\$DATABASE_URL}" -c '\\password $r'
+
+Then, on $name's machine and in every job that runs as $name:
+
+    DATABASE_URL=postgresql://$r:<password>@<host>:<port>/<database>
+    MEM_AUTHOR=$name     # must match: a write under any other name is refused
+
+and check what the database says from there:
+
+    psql "\$DATABASE_URL" -tAXc 'SELECT * FROM mem.whoami()'     # $r|$name|enforced
+
+Project membership is separate:
+    INSERT INTO mem.project_members (author, project) VALUES ('$name', '<tag>');
+The boundary holds only while nobody else uses the shared hm_app password (docs/DESIGN.md).
+MSG
+            ;;
+        remove)
+            if ! r=$(printf "SELECT mem.remove_author_role(:'r');\n" \
+                     | psql "$url" -X -tA -q -v ON_ERROR_STOP=1 -v r="$1" 2> "$atmp/err"); then
+                die "could not remove $1: $(cat "$atmp/err")"
+            fi
+            [ "$r" = t ] || die "$1 is not a mapped author login"
+            printf 'Unmapped %s, revoked hm_app from it and disabled its login.\n' "$1"
+            ;;
+        list)
+            psql "$url" -X -v ON_ERROR_STOP=1 \
+                -c "SELECT role, author, created_at FROM mem.author_roles ORDER BY author, role"
+            ;;
+    esac
 }
 
 cmd_init() {
@@ -82,23 +367,12 @@ cmd_init() {
         sleep 1
     done
 
-    # Every file here is part of the current memory contract. Loading only the base schema leaves
-    # the MCP catalog advertising perspectives, evidence and grounded context against tables that
-    # do not exist. The owner value is used only to claim unreferenced rows from an older store.
-    memory_owner=${MEM_AUTHOR:-$(id -un)}
-    step "Loading the schema and memory migrations (all files are idempotent)"
-    docker compose -f "$ROOT/deploy/docker/docker-compose.yml" exec -T postgres \
-        psql -v ON_ERROR_STOP=1 -v owner="$memory_owner" \
-        -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-        -f /sql/schema.sql \
-        -f /sql/schema_mem.sql \
-        -f /sql/mem_multiuser.sql \
-        -f /sql/migrate_entity_ownership.sql \
-        -f /sql/migrate_memory_perspectives.sql \
-        -f /sql/migrate_memory_evidence.sql \
-        -f /sql/migrate_peer_cards.sql \
-        -f /sql/migrate_dreamer.sql \
-        -f /sql/mem_app_role.sql >/dev/null
+    # Every file is part of the current memory contract. Loading only the base schema leaves the
+    # MCP catalog advertising perspectives, evidence and grounded context against tables that do
+    # not exist. The owner value is used only to claim unreferenced rows from an older store.
+    step "Applying the migrations (./hm migrate, through the container's psql)"
+    MIGRATE_VIA=compose
+    cmd_migrate --owner "${MEM_AUTHOR:-$(id -un)}"
 
     url="postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@localhost:$PG_PORT/$POSTGRES_DB"
     cat <<EOF
@@ -171,7 +445,11 @@ cmd_ingest() {
     psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$tmp/out.sql"
 
     step "Embedding what has no vector yet"
-    EMBED_REPO="$scope" "$PY" "$ROOT/ingest/embed_chunks.py"
+    # Not fatal here, and not ignored either. The documents are in and the index should still be
+    # built, so the run carries on -- but a batch the embedder refused leaves chunks that only the
+    # lexical leg can ever find, and the run must end non-zero saying so.
+    embed_rc=0
+    EMBED_REPO="$scope" "$PY" "$ROOT/ingest/embed_chunks.py" || embed_rc=$?
 
     # After the rows exist, never before: building HNSW on an empty table then filling it is far
     # slower than the other way round. IF NOT EXISTS makes the re-run a no-op.
@@ -181,6 +459,7 @@ cmd_ingest() {
 
     step "Checking the result"
     HM_REPO="$scope" "$PY" "$ROOT/ci/doctor.py" || true
+    [ "$embed_rc" -eq 0 ] || die "embedding failed: some chunks of '$scope' were not embedded (embed_chunks exit $embed_rc); they are found by exact words only until './hm ingest' is re-run with the embedder up"
     cat <<EOF
 
 Documents are in. What is NOT in is the part that pays: the Tier 0/1 map -- which files belong to
@@ -294,6 +573,8 @@ case "$sub" in
     init)   cmd_init "$@" ;;
     ingest) cmd_ingest "$@" ;;
     refresh) cmd_refresh "$@" ;;
+    migrate) cmd_migrate "$@" ;;
+    author)  cmd_author "$@" ;;
     doctor)  exec "$PY" "$ROOT/ci/doctor.py" "$@" ;;
     latency) exec "$PY" "$ROOT/ci/latency.py" "$@" ;;
     -h|--help|help) usage 0 ;;

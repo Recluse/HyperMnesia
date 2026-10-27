@@ -24,8 +24,6 @@ try:
 except Exception:                            # a deployment that ships ingest/ without hooks/
     pass                                     # keeps working on its own environment
 
-import psycopg2
-
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://hm@localhost:5432/hypermnesia")
 BACKEND = os.environ.get("EMBED_BACKEND", "ollama").lower()
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
@@ -34,6 +32,10 @@ EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
 
 
 def connect():
+    # Imported here, not at the top: the embedder half of this module is also used by
+    # ci/doctor.py's embedding fingerprint check, which talks to Postgres through psql and must
+    # not need a database driver to tell you the embedder drifted.
+    import psycopg2
     return psycopg2.connect(DATABASE_URL)
 
 

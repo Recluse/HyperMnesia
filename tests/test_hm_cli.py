@@ -49,6 +49,8 @@ with open(log, "a") as f:
 for a in sys.argv[1:]:
     if a.endswith(".sql"):
         open(a, "w").write("-- stub\n")
+if os.environ.get("STUB_EMBED_FAIL") and any(a.endswith("embed_chunks.py") for a in sys.argv):
+    sys.exit(3)
 sys.exit(0)
 '''
 
@@ -69,7 +71,7 @@ def write_stub(path, body):
     os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def run_ingest(doccount, extra=(), dirname="src"):
+def run_ingest(doccount, extra=(), dirname="src", env_extra=None):
     """Run `hm ingest` against stubs; returns the recorded argv lines."""
     with tempfile.TemporaryDirectory() as tmp:
         write_stub(os.path.join(tmp, "psql"), PSQL_STUB)
@@ -82,7 +84,7 @@ def run_ingest(doccount, extra=(), dirname="src"):
                    HM_PYTHON=os.path.join(tmp, "pystub"),
                    STUB_LOG=log,
                    STUB_DOCCOUNT=str(doccount),
-                   DATABASE_URL="postgresql://stub/stub")
+                   DATABASE_URL="postgresql://stub/stub", **(env_extra or {}))
         p = subprocess.run(["sh", HM, "ingest", src, "myrepo", *extra],
                            capture_output=True, timeout=120, env=env)
         lines = [json.loads(l) for l in open(log, encoding="utf-8")] if os.path.exists(log) else []
@@ -161,6 +163,39 @@ def main():
           "building HNSW on an empty table then filling it is far slower")
     doctor = next((l for l in lines if any("doctor.py" in a for a in l)), None)
     check("finishes by checking the result", doctor is not None)
+
+    print("== a failed embed is not hidden ==")
+    # embed_chunks.py exits non-zero when a batch failed. The index and the doctor still run --
+    # the documents are in -- but the command must not report success over chunks with no vector.
+    lines, p = run_ingest(0, env_extra={"STUB_EMBED_FAIL": "1"})
+    check("hm ingest exits non-zero", p.returncode != 0, p.stderr.decode()[-200:])
+    check("and says embedding failed", b"embedding failed" in p.stderr, p.stderr.decode()[-200:])
+    check("after still building the index and running the doctor",
+          any(any("CREATE INDEX" in a for a in l) for l in lines)
+          and any(any("doctor.py" in a for a in l) for l in lines))
+
+    print("== hm migrate: one order, and every migration in it ==")
+    p = subprocess.run(["sh", HM, "migrate", "--list"], capture_output=True, text=True, timeout=30)
+    order = p.stdout.split()
+    check("--list prints the documented apply order", order == [
+        "schema.sql", "migrate_schema_version.sql", "schema_mem.sql", "mem_multiuser.sql",
+        "migrate_entity_ownership.sql", "migrate_memory_perspectives.sql",
+        "migrate_memory_evidence.sql", "migrate_peer_cards.sql", "migrate_dreamer.sql",
+        "migrate_memory_lifecycle.sql", "migrate_constraint_sources.sql",
+        "migrate_author_roles.sql", "mem_app_role.sql"], str(order))
+    on_disk = sorted(f for f in os.listdir(os.path.join(ROOT, "sql")) if f.endswith(".sql"))
+    check("every sql/*.sql file is in the order (a new one cannot be forgotten)",
+          set(on_disk) <= set(order), str(sorted(set(on_disk) - set(order))))
+    check("the grant file comes last", order[-1] == "mem_app_role.sql")
+    env = dict(os.environ, DATABASE_URL="postgresql://stub/stub")
+    for args, needle in ((["migrate", "--owner", "o'brien"], b"--owner must match"),
+                         (["migrate", "--reapply", "nope.sql"], b"not a migration"),
+                         (["author", "add", "bad name"], b"author must match"),
+                         (["author", "add", "alice", "Bad-Role"], b"role must match"),
+                         (["author", "remove", "x;drop"], b"role must match")):
+        p = subprocess.run(["sh", HM, *args], capture_output=True, timeout=30, env=env)
+        check(f"refuses {' '.join(args)!r} before touching the database",
+              p.returncode != 0 and needle in p.stderr, p.stderr.decode()[-160:])
 
     print(f"\n{ran - len(failures)}/{ran} checks passed"
           + (f"; FAILED: {', '.join(failures)}" if failures else ""))
