@@ -158,9 +158,12 @@ class MergeCursor:
             self.row = ("2026-01-01 00:00:00+00", "2026-02-01 00:00:00+00")
         elif "UPDATE mem.memories SET status='superseded'" in sql:
             # Belief time only: a merge must not claim the fact stopped holding today.
-            assert "retired_at=(SELECT r.created_at" in sql and "valid_to" not in sql, sql
+            # A merge hands over at its replacement's instant; a supersede verdict's winner
+            # already existed, so its losers retire now.
+            assert ("retired_at=(SELECT r.created_at" in sql
+                    or "retired_at=clock_timestamp()" in sql) and "valid_to" not in sql, sql
             assert "author=%s" in sql and "RETURNING id" in sql, sql
-            member = params[2]
+            member = params[2] if "r.created_at" in sql else params[1]
             if member not in self.refuse_retire:
                 self.retired.append(member)
                 self.row = (member,)

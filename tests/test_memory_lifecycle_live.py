@@ -617,6 +617,19 @@ def main():
         lag = min((row(g)[5] - began).total_seconds() for g in (g1, g2)) if res["applied"] else -1
         check("and so does a merge", lag >= 0.3, f"{lag:.3f}s {res['message']}")
 
+        # A supersede VERDICT names a winner that already existed, possibly long before the
+        # loser: retiring the loser at the winner's created_at would end it before it began.
+        w = write(ac, alice, type="semantic", content="router firmware is pinned to 7.1")
+        lo = write(ac, alice, type="semantic", content="router firmware pinned at 7.1 now")
+        owner_sql("UPDATE mem.memories SET created_at = now() - interval '5 days' WHERE id=%s",
+                  (w,))
+        res = m.apply_proposal_result(ac, "supersede", [w, lo], {"winner_id": w}, who="alice",
+                                      channel="consolidator")
+        alice.commit()
+        span = owner_sql("SELECT retired_at >= created_at FROM mem.memories WHERE id=%s", (lo,))
+        check("a supersede verdict with an older winner retires its loser after it began",
+              res["applied"] and span and span[0][0] is True, f"{res['message']} {span}")
+
         print("\n== the pinned profile holds explicit rows only ==")
         q1 = write(ac, alice, type="semantic", content="printer jams on thick paper")
         q2 = write(ac, alice, type="semantic", content="printer jams when the tray is full")

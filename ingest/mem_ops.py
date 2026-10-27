@@ -1609,7 +1609,7 @@ def apply_proposal_result(cur, action, member_ids, proposal, who=None, channel="
     return {"applied": True, "action": action, "message": message, "id": new_id}
 
 
-def _retire_members(cur, member_ids, by, author):
+def _retire_members(cur, member_ids, by, author, handover):
     """Retire every member in favour of `by`, or refuse the whole proposal.
 
     One UPDATE per member, each required to hit exactly its row: still active, still the
@@ -1618,14 +1618,19 @@ def _retire_members(cur, member_ids, by, author):
     Belief time only: retired_at is set, the EVENT window (valid_to) is left as it was -- two
     duplicates being merged says nothing about when the fact stopped holding.
     """
+    # handover: `by` was written in this transaction (a merge's replacement), and the members
+    # retire at the instant it was learned -- they are locked before it is written, so no
+    # reactivation of theirs can fall after it. Otherwise `by` is a row that already existed (a
+    # supersede verdict's winner), possibly days older than the loser: retiring at ITS created_at
+    # would end the loser before it began. Those retire now, after the member locks.
+    when = ("(SELECT r.created_at FROM mem.memories r WHERE r.id=%s)" if handover
+            else "clock_timestamp()")
     for m in member_ids:
-        # Retired at the instant the replacement was written (see do_write); the members are
-        # locked before it is, so no reactivation of theirs can fall after that instant.
         cur.execute("UPDATE mem.memories SET status='superseded', "
-                    "retired_at=(SELECT r.created_at FROM mem.memories r WHERE r.id=%s), "
+                    f"retired_at={when}, "
                     "metadata = metadata || jsonb_build_object('superseded_by', %s::bigint) "
                     "WHERE id=%s AND status='active' AND author=%s RETURNING id",
-                    (by, by, m, author))
+                    ((by,) if handover else ()) + (by, m, author))
         if not cur.fetchone():
             raise Refused(f"not applied: #{m} could not be retired (no longer active, or not "
                           f"{author}'s) -- nothing was changed")
@@ -1796,7 +1801,7 @@ def _apply(cur, action, member_ids, proposal, who, channel="review"):
             "_identity": author, "scope": scope, "project": project,
             "source": {"source_type": "consolidation", "channel": channel,
                        "excerpt": f"merged from {member_ids}"}})
-        _retire_members(cur, member_ids, mid, author)
+        _retire_members(cur, member_ids, mid, author, handover=True)
         return f"merged {member_ids} -> [#{mid}]", mid
     if action == "supersede":
         try:
@@ -1807,7 +1812,7 @@ def _apply(cur, action, member_ids, proposal, who, channel="review"):
             raise Refused(f"not applied: winner {proposal.get('winner_id')!r} is not one of "
                           f"{member_ids}")
         losers = [m for m in member_ids if m != win]
-        _retire_members(cur, losers, win, author)
+        _retire_members(cur, losers, win, author, handover=False)
         return f"superseded {losers} (winner #{win})", win
     raise Refused(f"no-op: unknown action {action!r} -- not applied")
 
