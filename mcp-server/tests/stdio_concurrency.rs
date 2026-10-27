@@ -64,10 +64,16 @@ case "$payload" in
 esac
 "#, dir = dir.display()));
         // "big" answers with a 100 KB line -- more than a pipe buffer -- and every call is
-        // counted, so a test can see how many workers really started.
+        // counted, so a test can see how many workers really started. "escape" leaves a
+        // descendant in a session of its own (out of reach of the group kill) that still holds
+        // stdout and stderr, and records its pid so the test can clean it up. It answers only
+        // once the descendant has written its pid from inside the new session: answering
+        // earlier races the group kill against setsid().
         let mem_ops = write_exec("mem_ops.sh", &format!(r#"payload=$(cat); echo x >> {dir}/memops.calls
 case "$payload" in
   *big*) head -c 100000 /dev/zero | tr '\0' 'a'; echo ;;
+  *escape*) f={dir}/esc.$$; setsid sh -c "echo \$\$ > $f; exec sleep 60" &
+            while [ ! -s $f ]; do sleep 0.05; done; cat $f >> {dir}/escaped; echo "op $1" ;;
   *) echo "op $1" ;;
 esac
 "#, dir = dir.display()));
@@ -266,8 +272,8 @@ fn closing_stdin_stops_children_past_the_grace() {
 }
 
 /// A client that stops reading must not get more workers than HM_MAX_INFLIGHT: a call stays in
-/// flight until its answer is written, so the second call is refused (and that refusal waits
-/// for stdout) instead of piling up workers blocked on the same pipe.
+/// flight until its answer is written, so the second call is refused (the refusal is queued for
+/// the writer thread) instead of piling up workers blocked on the same pipe.
 #[test]
 fn a_non_reading_client_cannot_exceed_the_inflight_cap() {
     let mut s = Session::start_with("cap", &[("HM_MAX_INFLIGHT", "1")]);
@@ -329,4 +335,100 @@ fn default_scope_comes_from_the_repo_root() {
     assert!(text.contains("src/api/x.py -> api"), "{text}");
     assert!(text.contains("guessed from the repo root's folder name (\"myapp\")"), "{text}");
     assert!(!text.contains("nothing is mapped"), "{text}");
+}
+
+/// Threads of the server process, from /proc.
+fn threads(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/task")).map_or(0, |d| d.count())
+}
+
+/// A worker blocked writing a large answer to a client that has stopped reading holds the stdout
+/// lock. The input thread used to write its own replies -- here the HM_MAX_INFLIGHT refusal --
+/// under that same lock, so it blocked too, and never got to the cancellation or the EOF behind
+/// them: the cancelled call ran on, and the server never exited.
+#[test]
+fn a_stuck_stdout_does_not_block_the_input_thread() {
+    let mut s = Session::start_with("stuck-out",
+        &[("HM_MAX_INFLIGHT", "2"), ("HM_SHUTDOWN_GRACE_SECS", "1")]);
+    s.send(Session::call(1, "memory_search", json!({"query":"big"})));
+    let until = Instant::now() + Duration::from_secs(10);
+    while s.calls() < 1 {
+        assert!(Instant::now() < until, "the big call never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Let the 100 KB answer fill the pipe; nobody reads it.
+    std::thread::sleep(Duration::from_millis(500));
+    s.send(Session::call(2, "memory_ask", json!({"query":"slow question"})));
+    let pids = wait_for_pids(&s.dir);
+    s.send(Session::call(3, "memory_search", json!({"query":"anything"})));   // over the cap
+    s.send(json!({"jsonrpc":"2.0","id":4,"method":"ping"}));
+    s.send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}));
+    let until = Instant::now() + Duration::from_secs(8);
+    while !pids.iter().all(|p| dead(*p)) {
+        assert!(Instant::now() < until,
+                "the cancellation never reached the call behind a stuck stdout: {pids:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(s.stdin.take());
+    // 1 s grace + CANCEL_GRACE + 1 s, then exit -- with the client still not reading.
+    let until = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(st) = s.child.try_wait().unwrap() {
+            assert!(st.success(), "server exit: {st:?}");
+            break;
+        }
+        assert!(Instant::now() < until, "the server never exited after EOF behind a stuck stdout");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A helper that leaves a descendant in a session of its own, holding stdout and stderr. The
+/// group kill cannot reach it, so the pipes never close. The two reader threads per child used
+/// to stay blocked on them after the call had answered and released its HM_MAX_INFLIGHT slot:
+/// two threads more per call, for as long as the descendant lived.
+#[test]
+fn an_escaped_pipe_holder_does_not_leak_threads() {
+    struct Reap(std::path::PathBuf);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            for p in std::fs::read_to_string(&self.0).unwrap_or_default().split_whitespace() {
+                let _ = Command::new("kill").arg("-9").arg(p).status();
+            }
+        }
+    }
+    let mut s = Session::start("escape");
+    let _reap = Reap(s.dir.join("escaped"));
+    let server = s.child.id();
+    // Warm up: one ordinary call and a ping, so every thread the server keeps exists.
+    s.send(Session::call(1, "memory_search", json!({"query":"plain"})));
+    s.send(json!({"jsonrpc":"2.0","id":2,"method":"ping"}));
+    for _ in 0..2 { s.next(Duration::from_secs(10)).expect("warm-up answered"); }
+    std::thread::sleep(Duration::from_millis(500));
+    let baseline = threads(server);
+    assert!(baseline > 0, "cannot read /proc/{server}/task");
+
+    for id in 10..14 {
+        s.send(Session::call(id, "memory_search", json!({"query":"escape"})));
+    }
+    for _ in 10..14 {
+        let v = s.next(Duration::from_secs(20)).expect("each escape call answered");
+        let text = v["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(v["result"]["isError"] == true && text.contains("never arrived"),
+                "the held pipe must be reported, not read as output: {v}");
+    }
+    let escaped = std::fs::read_to_string(s.dir.join("escaped")).unwrap_or_default();
+    assert_eq!(escaped.split_whitespace().count(), 4, "{escaped:?}");
+    assert!(escaped.split_whitespace().all(|p| !dead(p.parse().unwrap())),
+            "the escaped descendants should still be alive, holding the pipes");
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        let now = threads(server);
+        if now <= baseline { break; }
+        assert!(Instant::now() < until,
+                "threads grew from {baseline} to {now} across four calls whose pipes are still held");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Still serving.
+    s.send(json!({"jsonrpc":"2.0","id":20,"method":"ping"}));
+    assert_eq!(s.next(Duration::from_secs(5)).expect("ping")["id"], 20);
 }

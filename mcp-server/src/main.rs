@@ -13,7 +13,9 @@
 //! Concurrency: the stdin loop only parses and dispatches. Every `tools/call` runs on a worker
 //! thread of its own, so a `memory_ask` that thinks for minutes does not hold up the
 //! `get_constraints` that arrives behind it. Responses go out as one whole line under the stdout
-//! lock. Every child runs in its own process group, and `notifications/cancelled` signals that
+//! lock; the stdin thread never takes that lock itself, it queues its replies for a writer
+//! thread, so a client that stops reading cannot stall the reading of its own cancellations or
+//! EOF. Every child runs in its own process group, and `notifications/cancelled` signals that
 //! group (SIGALRM first, which the Python passes turn into an orderly shutdown of their own
 //! backends; SIGKILL after a grace).
 //!
@@ -28,8 +30,8 @@ use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::cell::RefCell;
-use std::io::{BufRead, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::{BufRead, Write};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -98,7 +100,7 @@ fn inflight() -> &'static Mutex<HashMap<String, Arc<Job>>> {
 }
 
 thread_local! {
-    /// The job the current worker thread is serving; None on the main thread and in tests.
+    /// The job the current worker thread is serving; None on the stdin thread and in tests.
     static CURRENT_JOB: RefCell<Option<Arc<Job>>> = const { RefCell::new(None) };
 }
 
@@ -131,6 +133,44 @@ mod sig {
     pub fn group_unchecked(pgid: i32, signal: i32) {
         unsafe { if pgid > 1 { kill(-pgid, signal); } }
     }
+
+    /// Has our child `pid` exited? Asked with waitid(WNOWAIT), which leaves it an unreaped
+    /// zombie: until the caller reaps it, the kernel keeps its pid reserved, and with it the id
+    /// of the process group it leads, so a signal to that group still reaches only what we
+    /// started. Some(true): exited, not yet reaped. Some(false): still running (or the wait was
+    /// interrupted). None: no answer -- waitid failed, or this platform is not one where the
+    /// probe is known to work -- and the caller falls back to plain reaping. `block` waits for
+    /// the exit instead of asking once.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn exited_unreaped(pid: i32, block: bool) -> Option<bool> {
+        /// Room for a siginfo_t (128 bytes on Linux), suitably aligned.
+        #[repr(C, align(8))]
+        struct SigInfo([u8; 256]);
+        extern "C" { fn waitid(idtype: i32, id: u32, info: *mut SigInfo, options: i32) -> i32; }
+        const P_PID: i32 = 1;
+        const WNOHANG: i32 = 1;
+        const WEXITED: i32 = 4;
+        const WNOWAIT: i32 = 0x0100_0000;
+        if pid <= 1 { return None; }
+        loop {
+            let mut info = SigInfo([0; 256]);
+            let opts = WEXITED | WNOWAIT | if block { 0 } else { WNOHANG };
+            if unsafe { waitid(P_PID, pid as u32, &mut info, opts) } == 0 {
+                // si_signo is the first int of siginfo_t: SIGCHLD for an exited child, left 0
+                // when WNOHANG found nothing to report.
+                let signo = i32::from_ne_bytes([info.0[0], info.0[1], info.0[2], info.0[3]]);
+                return Some(signo != 0);
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return None;
+            }
+            if !block { return Some(false); }
+        }
+    }
+    /// macOS and the BSDs: waitid's constants and WNOWAIT behaviour differ there and are not
+    /// exercised by anything in this repo's tests, so they keep the reap-then-signal order.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub fn exited_unreaped(_pid: i32, _block: bool) -> Option<bool> { None }
 }
 #[cfg(not(unix))]
 mod sig {
@@ -139,6 +179,7 @@ mod sig {
     pub fn group(_pgid: i32, _signal: i32) {}
     pub fn leads_group(_pid: i32) -> bool { false }
     pub fn group_unchecked(_pgid: i32, _signal: i32) {}
+    pub fn exited_unreaped(_pid: i32, _block: bool) -> Option<bool> { None }
 }
 
 /// How long a cancelled child gets to exit on SIGALRM before the group is SIGKILLed.
@@ -268,66 +309,254 @@ fn env_secs(key: &str, default: u64) -> u64 {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or(default)
 }
 
+// -- child output ------------------------------------------------------------
+// A child's stdout and stderr are drained ON THE WORKER THREAD, between its exit, deadline and
+// cancel checks. They used to be drained by two reader threads per child, each blocked in
+// read_to_end until EOF -- and EOF never comes while anything still holds the write end. A
+// descendant that left the process group (setsid, start_new_session) is out of reach of the
+// group kill and keeps both pipes open for as long as it lives, so both threads stayed blocked
+// long after the call had answered and given back its HM_MAX_INFLIGHT slot: a helper that leaves
+// such a process behind grew the server by two threads per call, without bound. A worker that
+// polls its own pipes simply drops them when it is done with them.
+
+#[cfg(unix)]
+mod pipes {
+    use std::fs::File;
+    use std::io::{ErrorKind, Read};
+    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::process::{ChildStderr, ChildStdout};
+    use std::time::Duration;
+
+    #[repr(C)]
+    struct PollFd { fd: i32, events: i16, revents: i16 }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    type NFds = std::os::raw::c_ulong;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    type NFds = std::os::raw::c_uint;
+    extern "C" {
+        fn poll(fds: *mut PollFd, nfds: NFds, timeout: i32) -> i32;
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    const POLLIN: i16 = 0x1;
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+    /// O_NONBLOCK is not one number everywhere. Where it is not known here the pipe stays
+    /// blocking and is read once per readiness report from poll(), which a pipe always answers
+    /// without blocking (with data, or 0 at EOF).
+    const O_NONBLOCK: Option<i32> =
+        if cfg!(any(target_vendor = "apple", target_os = "freebsd", target_os = "netbsd",
+                    target_os = "openbsd", target_os = "dragonfly")) { Some(0x4) }
+        else if cfg!(all(any(target_os = "linux", target_os = "android"),
+                         not(any(target_arch = "mips", target_arch = "mips64",
+                                 target_arch = "mips32r6", target_arch = "mips64r6",
+                                 target_arch = "sparc", target_arch = "sparc64")))) { Some(0o4000) }
+        else { None };
+    /// Reads per pipe per pump. A child writing as fast as we read must not keep the worker
+    /// from its deadline and cancel checks.
+    const MAX_READS: usize = 16;
+
+    struct Pipe { file: Option<File>, nonblocking: bool, buf: Vec<u8> }
+
+    impl Pipe {
+        fn new(fd: Option<OwnedFd>) -> Pipe {
+            let nonblocking = match (&fd, O_NONBLOCK) {
+                (Some(fd), Some(flag)) => unsafe {
+                    let fl = fcntl(fd.as_raw_fd(), F_GETFL);
+                    fl >= 0 && fcntl(fd.as_raw_fd(), F_SETFL, fl | flag) == 0
+                },
+                _ => false,
+            };
+            Pipe { file: fd.map(File::from), nonblocking, buf: Vec::new() }
+        }
+
+        /// Read what the pipe has; drop it at EOF or on an error.
+        fn read_ready(&mut self, chunk: &mut [u8]) {
+            let rounds = if self.nonblocking { MAX_READS } else { 1 };
+            for _ in 0..rounds {
+                let Some(f) = self.file.as_mut() else { return };
+                match f.read(chunk) {
+                    Ok(0) => { self.file = None; return; }
+                    Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => return,
+                    Err(_) => { self.file = None; return; }
+                }
+            }
+        }
+    }
+
+    /// Both pipes of one child.
+    pub struct Drain { pipes: [Pipe; 2], chunk: Vec<u8> }
+
+    impl Drain {
+        pub fn new(out: Option<ChildStdout>, err: Option<ChildStderr>) -> Drain {
+            Drain { pipes: [Pipe::new(out.map(OwnedFd::from)), Pipe::new(err.map(OwnedFd::from))],
+                    chunk: vec![0; 64 * 1024] }
+        }
+
+        pub fn any_open(&self) -> bool { self.pipes.iter().any(|p| p.file.is_some()) }
+
+        /// Wait up to `timeout` for either pipe to have something, and read it. Returns as soon
+        /// as there is output, so a fast writer is read at its own pace, not 20 ms at a time;
+        /// with nothing open it just sleeps.
+        pub fn pump(&mut self, timeout: Duration) {
+            let mut fds: Vec<PollFd> = Vec::with_capacity(2);
+            let mut which: Vec<usize> = Vec::with_capacity(2);
+            for (i, p) in self.pipes.iter().enumerate() {
+                if let Some(f) = &p.file {
+                    fds.push(PollFd { fd: f.as_raw_fd(), events: POLLIN, revents: 0 });
+                    which.push(i);
+                }
+            }
+            if fds.is_empty() { std::thread::sleep(timeout); return; }
+            let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+            let n = unsafe { poll(fds.as_mut_ptr(), fds.len() as NFds, ms) };
+            if n < 0 {
+                // EINTR: the caller's loop comes straight back. Anything else would come back
+                // every time, so do not let it turn the wait into a spin.
+                if std::io::Error::last_os_error().kind() != ErrorKind::Interrupted {
+                    std::thread::sleep(timeout);
+                }
+                return;
+            }
+            // revents also carries POLLHUP / POLLERR, which a read turns into EOF or an error.
+            for (pfd, &i) in fds.iter().zip(&which) {
+                if pfd.revents != 0 { self.pipes[i].read_ready(&mut self.chunk); }
+            }
+        }
+
+        /// [(stdout, reached EOF), (stderr, reached EOF)]. Whatever is still open is closed
+        /// here; a process still holding the other end gets EPIPE if it ever writes.
+        pub fn finish(self) -> [(Vec<u8>, bool); 2] {
+            self.pipes.map(|p| { let eof = p.file.is_none(); (p.buf, eof) })
+        }
+    }
+}
+
+/// Without poll() on anonymous pipes (Windows), the pipes are still read by one thread each.
+/// That keeps the leak described above for a process that inherited the handles; this platform
+/// has no process groups here either (`sig` is a no-op), so its process handling is weaker
+/// across the board.
+#[cfg(not(unix))]
+mod pipes {
+    use std::io::Read;
+    use std::sync::mpsc::{channel, Receiver, TryRecvError};
+    use std::time::Duration;
+
+    pub struct Drain { rx: [Option<Receiver<Vec<u8>>>; 2], got: [Option<Vec<u8>>; 2] }
+
+    fn reader<R: Read + Send + 'static>(h: Option<R>) -> (Option<Receiver<Vec<u8>>>, Option<Vec<u8>>) {
+        let Some(mut h) = h else { return (None, Some(Vec::new())) };
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = h.read_to_end(&mut b);
+            let _ = tx.send(b);
+        });
+        (Some(rx), None)
+    }
+
+    impl Drain {
+        pub fn new(out: Option<std::process::ChildStdout>, err: Option<std::process::ChildStderr>) -> Drain {
+            let (ro, go) = reader(out);
+            let (re, ge) = reader(err);
+            Drain { rx: [ro, re], got: [go, ge] }
+        }
+
+        pub fn any_open(&self) -> bool { self.got.iter().any(Option::is_none) }
+
+        pub fn pump(&mut self, timeout: Duration) {
+            std::thread::sleep(timeout);
+            for i in 0..2 {
+                if self.got[i].is_some() { continue; }
+                if let Some(rx) = &self.rx[i] {
+                    match rx.try_recv() {
+                        Ok(b) => self.got[i] = Some(b),
+                        Err(TryRecvError::Empty) => {}
+                        // The reader died without a word: nothing more will come.
+                        Err(TryRecvError::Disconnected) => self.rx[i] = None,
+                    }
+                }
+            }
+        }
+
+        pub fn finish(self) -> [(Vec<u8>, bool); 2] {
+            self.got.map(|g| match g { Some(b) => (b, true), None => (Vec::new(), false) })
+        }
+    }
+}
+
+/// Reap `child` if it has exited, taking down what is left of its group FIRST: a descendant
+/// that ignored SIGALRM, or a background job left holding our pipes, must not outlive the call.
+/// Ok(None) while it is still running. `block` waits for the exit (the caller has just
+/// SIGKILLed it).
+///
+/// The order is the point. Reaping releases the leader's pid and with it the group id; if the
+/// leader was the group's last member, an unrelated new group leader can be handed that id at
+/// once, and a killpg sent after the reap lands on it. So the exit is detected with
+/// waitid(WNOWAIT), which leaves a zombie holding the id, the group is signalled, and only then
+/// is the leader reaped. Where that probe gives no answer (not Linux, or waitid failed) this
+/// falls back to the old order, reap then signal, window included.
+///
+/// The job's pgid slot is held across the reap and cleared with it, so a cancel arriving from
+/// the stdin thread sees either the live group or nothing, never a stale pid. A blocking wait
+/// for the exit happens before the slot is taken: the stdin thread takes that slot to cancel,
+/// and must never end up waiting on a child.
+fn reap_leader(child: &mut std::process::Child, pid: i32, own_group: bool, job: Option<&Arc<Job>>,
+               block: bool, kill_group: &dyn Fn(i32))
+    -> std::io::Result<Option<std::process::ExitStatus>> {
+    let probed = match sig::exited_unreaped(pid, block) {
+        Some(false) if block => None,           // a blocking wait cannot say "still running"
+        p => p,
+    };
+    if probed == Some(false) { return Ok(None); }
+    let mut slot = job.map(|j| lock(&j.pgid));
+    if probed == Some(true) && own_group { kill_group(pid); }
+    let r = if block { child.wait().map(Some) } else { child.try_wait() };
+    if let Ok(Some(_)) = &r {
+        if probed.is_none() && own_group { kill_group(pid); }
+        if let Some(s) = slot.as_mut() { **s = None; }
+    }
+    r
+}
+
+/// SIGKILL what is left of a group whose leader we created and have not yet reaped (see
+/// reap_leader for why that is the only safe moment).
+fn kill_rest(pgid: i32) { sig::group_unchecked(pgid, sig::HARD); }
+
 /// Wait for a child with a deadline, draining both pipes. Returns (ok, stdout, stderr).
 ///
-/// The pipes are drained on their own threads, and that is not decoration. Polling try_wait()
-/// while the child writes more than a pipe buffer (64 KiB) deadlocks: the child blocks in
-/// write(), the parent never reads, and the timeout then kills a perfectly HEALTHY process --
-/// a "safety" feature that manufactures the failure it was added to prevent. Read first, wait
-/// second.
+/// The pipes are read WHILE waiting, and that is not decoration. Polling for the exit while
+/// the child writes more than a pipe buffer (64 KiB) deadlocks: the child blocks in write(), the
+/// parent never reads, and the timeout then kills a perfectly HEALTHY process -- a "safety"
+/// feature that manufactures the failure it was added to prevent. Read first, wait second.
 fn wait_with_timeout(mut child: std::process::Child, secs: u64, what: &str)
     -> Result<(bool, String, String), String> {
-    // Channels, not join handles: the reader must never be something we WAIT on past the
-    // deadline. Killing the child does not necessarily close the pipe -- anything it spawned
-    // inherits the same handle, so a `psql` wrapper or a script with a background job keeps
-    // stdout open after its parent dies, and a join() here would sit there for as long as the
-    // grandchild lives. That turned a 3s timeout into a 30s one, measured.
-    let (tx_out, rx_out) = std::sync::mpsc::channel();
-    let (tx_err, rx_err) = std::sync::mpsc::channel();
-    let mut so = child.stdout.take();
-    let mut se = child.stderr.take();
-    std::thread::spawn(move || {
-        let mut b = Vec::new();
-        if let Some(h) = so.as_mut() { let _ = h.read_to_end(&mut b); }
-        let _ = tx_out.send(String::from_utf8_lossy(&b).into_owned());
-    });
-    std::thread::spawn(move || {
-        let mut b = Vec::new();
-        if let Some(h) = se.as_mut() { let _ = h.read_to_end(&mut b); }
-        let _ = tx_err.send(String::from_utf8_lossy(&b).into_owned());
-    });
+    // Nothing here waits for EOF without a clock. Killing the child does not necessarily close
+    // the pipe -- anything it spawned inherits the same handle, so a `psql` wrapper or a script
+    // with a background job keeps stdout open after its parent dies, and a wait for EOF would
+    // sit there for as long as the grandchild lives. That turned a 3s timeout into a 30s one,
+    // measured.
+    let mut drain = pipes::Drain::new(child.stdout.take(), child.stderr.take());
     let deadline = Instant::now() + Duration::from_secs(secs);
     let job = current_job();
     let pid = child.id() as i32;
     let mut cancelled_at: Option<Instant> = None;
     // Decided before the first reap: a group we created (spawn_child) is torn down whole.
     let own_group = sig::leads_group(pid);
-    // Reap while holding the job's pgid slot. When the leader is gone, SIGKILL whatever is left
-    // of its group in the same breath, then clear the slot: a descendant that ignored SIGALRM, or
-    // a background job the child left behind holding our pipes, must not outlive the call --
-    // and once the slot is clear nothing else could reach it. A cancel arriving from the main
-    // thread sees either the live group or nothing, never a stale pid.
-    let reap = |child: &mut std::process::Child| -> std::io::Result<Option<std::process::ExitStatus>> {
-        let mut slot = job.as_ref().map(|j| lock(&j.pgid));
-        let r = child.try_wait();
-        if let Ok(Some(_)) = &r {
-            if own_group { sig::group_unchecked(pid, sig::HARD); }
-            if let Some(s) = slot.as_mut() { **s = None; }
-        }
-        r
-    };
     let status = loop {
-        match reap(&mut child) {
+        match reap_leader(&mut child, pid, own_group, job.as_ref(), false, &kill_rest) {
             Ok(Some(st)) => break Some(st),
             Ok(None) => {
                 if Instant::now() >= deadline { break None; }
                 if job.as_ref().is_some_and(|j| j.cancelled.load(Ordering::SeqCst)) {
-                    // The main thread has already sent SIGALRM. Give it a moment to unwind, then
-                    // take the whole group down.
+                    // The stdin thread has already sent SIGALRM. Give it a moment to unwind,
+                    // then take the whole group down.
                     let at = *cancelled_at.get_or_insert_with(Instant::now);
                     if at.elapsed() >= CANCEL_GRACE { break None; }
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                // Doubles as the poll interval: returns early whenever output arrives.
+                drain.pump(Duration::from_millis(20));
             }
             Err(e) => return Err(format!("{what}: wait failed: {e}")),
         }
@@ -337,39 +566,46 @@ fn wait_with_timeout(mut child: std::process::Child, secs: u64, what: &str)
         return Err(format!("{what}: cancelled by the client"));
     }
     let Some(st) = status else {
-        {
-            let mut slot = job.as_ref().map(|j| lock(&j.pgid));
-            // The group first, then the leader: anything the child started (a backend, a pipe
-            // holder) goes too, where a kill of the leader alone used to orphan it.
-            if own_group { sig::group(pid, sig::HARD); }
-            let _ = child.kill();
-            let _ = child.wait();
-            if own_group { sig::group_unchecked(pid, sig::HARD); }
-            if let Some(s) = slot.as_mut() { **s = None; }
-        }
+        // The group first, then the leader, both before it is reaped (its pid and group id are
+        // still ours): anything the child started (a backend, a pipe holder) goes too, where a
+        // kill of the leader alone used to orphan it. reap_leader signals the group once more
+        // while the leader is a zombie, then reaps it.
+        if own_group { sig::group(pid, sig::HARD); }
+        let _ = child.kill();
+        let _ = reap_leader(&mut child, pid, own_group, job.as_ref(), true, &kill_rest);
         if was_cancelled {
             return Err(format!("{what}: cancelled by the client, process group killed"));
         }
-        // Return NOW, without collecting output: we are reporting a timeout, and the reader
-        // threads may be stuck on a pipe held by something we did not spawn. They end when it
-        // does. Say the timeout plainly -- one surfacing as an empty result is exactly the
-        // failure mode this project is about.
+        // Return NOW, without collecting output: we are reporting a timeout, and the pipes may
+        // be held by something we did not spawn. Dropping the drain closes our ends. Say the
+        // timeout plainly -- one surfacing as an empty result is exactly the failure mode this
+        // project is about.
         return Err(format!("{what}: no answer within {secs}s, process killed"));
     };
-    // The child is gone, so EOF is normally immediate. The grace covers the same inherited-pipe
-    // case: take what arrived rather than block the caller on a process we no longer control.
+    // The child is gone and its group with it, so EOF is normally immediate. The grace covers
+    // the same inherited-pipe case: take what arrived rather than block the caller on a process
+    // we no longer control.
     let grace = Duration::from_secs(5);
-    // NOT unwrap_or_default(). Substituting "" for output that never arrived tells the caller
-    // the child exited 0 and printed nothing, which is a different fact and a plausible one:
-    // get_document would return an empty document as the file's full text, memory_search would
-    // read as "no memories on this topic". If we could not read it, say so.
-    let out = rx_out.recv_timeout(grace).map_err(|_| {
-        format!("{what}: exited {} but its output never arrived within {}s -- something that \
-                 inherited its stdout is still holding the pipe",
-                if st.success() { "0" } else { "non-zero" }, grace.as_secs())
-    })?;
-    // stderr is only ever used to explain a failure, so a missing one is not worth failing over.
-    Ok((st.success(), out, rx_err.recv_timeout(grace).unwrap_or_default()))
+    let until = Instant::now() + grace;
+    while drain.any_open() {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() { break; }
+        drain.pump(left.min(Duration::from_millis(50)));
+    }
+    let [(out, out_eof), (err, _)] = drain.finish();
+    // NOT whatever partial output there is. Substituting it (or "") for output that never
+    // finished arriving tells the caller the child exited 0 and printed that, which is a
+    // different fact and a plausible one: get_document would return an empty document as the
+    // file's full text, memory_search would read as "no memories on this topic". If we could
+    // not read it, say so.
+    if !out_eof {
+        return Err(format!("{what}: exited {} but its output never arrived within {}s -- something \
+                            that inherited its stdout is still holding the pipe",
+                           if st.success() { "0" } else { "non-zero" }, grace.as_secs()));
+    }
+    // stderr is only ever used to explain a failure, so a missing end is not worth failing over.
+    Ok((st.success(), String::from_utf8_lossy(&out).into_owned(),
+        String::from_utf8_lossy(&err).into_owned()))
 }
 
 fn db_query(sql: &str) -> Result<String, String> {
@@ -544,8 +780,18 @@ fn same_dir(a: &str, b: &str) -> bool {
             _ => false,
         }
     }
+    // No stable volume-serial / file-index accessor in std here. canonicalize() resolves both
+    // to the final path the filesystem reports (on Windows, GetFinalPathNameByHandle, which
+    // carries the on-disk case), so one directory reached through two spellings compares equal.
+    // This used to be a constant `false`: on case-insensitive Windows storage a root and a path
+    // differing only in case were "outside" each other, and the path lost every rule.
     #[cfg(not(unix))]
-    { let _ = (a, b); false }
+    {
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
+    }
 }
 
 /// (repo-relative path, true) for a path inside the root, (resolved path, false) for one
@@ -929,18 +1175,124 @@ fn tool_search_docs(query: &str, k: u32) -> Result<String, String> {
     Ok(if s.is_empty() { "(search returned nothing at all -- check the search process's stderr)".to_string() } else { s })
 }
 
+/// Home directories from the passwd database (getpwuid_r / getpwnam_r), for `~` expansion.
+/// Only where `struct passwd` has a layout known here; elsewhere every lookup is "unknown",
+/// which leaves the `~` literal -- what Python does when it cannot look a user up.
+#[cfg(unix)]
+mod pw {
+    use std::ffi::{c_char, CStr, CString};
+    #[cfg(target_os = "linux")]
+    #[repr(C)]
+    struct Passwd {
+        pw_name: *mut c_char, pw_passwd: *mut c_char, pw_uid: u32, pw_gid: u32,
+        pw_gecos: *mut c_char, pw_dir: *mut c_char, pw_shell: *mut c_char,
+        _spare: [u8; 64],
+    }
+    #[cfg(target_vendor = "apple")]
+    #[repr(C)]
+    struct Passwd {
+        pw_name: *mut c_char, pw_passwd: *mut c_char, pw_uid: u32, pw_gid: u32,
+        pw_change: std::ffi::c_long, pw_class: *mut c_char, pw_gecos: *mut c_char,
+        pw_dir: *mut c_char, pw_shell: *mut c_char, pw_expire: std::ffi::c_long,
+        _spare: [u8; 64],
+    }
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    extern "C" {
+        fn getuid() -> u32;
+        fn getpwuid_r(uid: u32, pwd: *mut Passwd, buf: *mut c_char, len: usize,
+                      result: *mut *mut Passwd) -> i32;
+        fn getpwnam_r(name: *const c_char, pwd: *mut Passwd, buf: *mut c_char, len: usize,
+                      result: *mut *mut Passwd) -> i32;
+    }
+
+    /// One lookup, growing the buffer on ERANGE. None: no such entry, or the lookup failed.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    fn lookup(call: &dyn Fn(*mut Passwd, *mut c_char, usize, *mut *mut Passwd) -> i32)
+        -> Option<(String, String)> {
+        const ERANGE: i32 = 34;
+        let mut len = 1024;
+        while len <= 1 << 20 {
+            let mut buf = vec![0 as c_char; len];
+            let mut ent: Passwd = unsafe { std::mem::zeroed() };
+            let mut out: *mut Passwd = std::ptr::null_mut();
+            let rc = call(&mut ent, buf.as_mut_ptr(), len, &mut out);
+            if rc == ERANGE { len *= 4; continue; }
+            if rc != 0 || out.is_null() || ent.pw_dir.is_null() || ent.pw_name.is_null() {
+                return None;
+            }
+            // Non-UTF-8 entries are refused rather than mangled: a lossy home is another path.
+            let name = unsafe { CStr::from_ptr(ent.pw_name) }.to_str().ok()?.to_string();
+            let dir = unsafe { CStr::from_ptr(ent.pw_dir) }.to_str().ok()?.to_string();
+            return Some((name, dir));
+        }
+        None
+    }
+
+    /// (name, home) of the current uid.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    pub fn current() -> Option<(String, String)> {
+        let uid = unsafe { getuid() };
+        lookup(&|e, b, l, r| unsafe { getpwuid_r(uid, e, b, l, r) })
+    }
+    /// The home of user `name`.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    pub fn home_of(name: &str) -> Option<String> {
+        let c = CString::new(name).ok()?;
+        lookup(&|e, b, l, r| unsafe { getpwnam_r(c.as_ptr(), e, b, l, r) }).map(|(_, d)| d)
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    pub fn current() -> Option<(String, String)> { None }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    pub fn home_of(_name: &str) -> Option<String> { None }
+}
+
+/// Python's posixpath.expanduser, rule for rule, with `home` standing for $HOME (None = unset):
+/// `~` and `~/...` take $HOME when it is SET -- even set to "" -- and the passwd home of the
+/// current uid only when it is unset; `~user/...` takes that user's passwd home, and stays
+/// literal for an unknown user, as does `~` when the lookup fails. The home loses its trailing
+/// slashes, and an empty result is "/". The Python loader (hooks/_mem_common.py) runs exactly
+/// this on HYPERMNESIA_ENV_FILE, so anything else here means two readers opening two files.
+#[cfg(unix)]
+fn expand_user(path: &str, home: Option<&str>) -> String {
+    if !path.starts_with('~') { return path.to_string(); }
+    let i = path[1..].find('/').map_or(path.len(), |j| j + 1);
+    let userhome = if i == 1 {
+        match home {
+            Some(h) => h.to_string(),
+            None => match pw::current() { Some((_, d)) => d, None => return path.to_string() },
+        }
+    } else {
+        match pw::home_of(&path[1..i]) { Some(d) => d, None => return path.to_string() }
+    };
+    let out = format!("{}{}", userhome.trim_end_matches('/'), &path[i..]);
+    if out.is_empty() { "/".to_string() } else { out }
+}
+
+/// Elsewhere: the leading `~` (alone or before `/`) is HOME, as before. Python's ntpath rules
+/// (USERPROFILE, HOMEDRIVE/HOMEPATH) are not reproduced.
+#[cfg(not(unix))]
+fn expand_user(path: &str, home: Option<&str>) -> String {
+    let home = home.unwrap_or("");
+    if path == "~" { home.to_string() }
+    else if let Some(rest) = path.strip_prefix('~').filter(|r| r.starts_with('/')) { format!("{home}{rest}") }
+    else { path.to_string() }
+}
+
+/// The settings file's path, as hooks/_mem_common.py resolves it:
+/// `expanduser(HYPERMNESIA_ENV_FILE or "~/.claude/hypermnesia.env")` -- the default goes
+/// through the same expansion, so it too follows the passwd home when HOME is unset.
+fn env_file_path() -> String {
+    let raw = std::env::var("HYPERMNESIA_ENV_FILE")
+        .unwrap_or_else(|_| "~/.claude/hypermnesia.env".to_string());
+    let home = std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned());
+    expand_user(&raw, home.as_deref())
+}
+
 /// One value from the shared settings file, or None. The same file, the same gate and the same
 /// line syntax as the Python loader (hooks/_mem_common.py): two readers of one file must not
 /// disagree about whether to trust it, and that file decides who you are.
 fn env_file_value(key: &str) -> Option<String> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    // os.path.expanduser on the Python side: a leading `~` (alone or before `/`) is HOME.
-    let path = match std::env::var("HYPERMNESIA_ENV_FILE") {
-        Ok(p) if p == "~" => home.clone(),
-        Ok(p) if p.starts_with("~/") => format!("{home}{}", &p[1..]),
-        Ok(p) => p,
-        Err(_) => format!("{home}/.claude/hypermnesia.env"),
-    };
+    let path = env_file_path();
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1294,26 +1646,79 @@ fn call_tool(name: &str, args: &Value) -> Result<String, String> {
     }
 }
 
-/// Write one JSON-RPC message as ONE line. Workers answer concurrently now, so the whole line
-/// goes out in a single write under the stdout lock: two responses can never interleave, and a
-/// line is never split. serde_json escapes every newline inside strings, so the message itself
-/// cannot contain one.
-fn write_msg(msg: &Value) {
-    let mut line = msg.to_string();
-    line.push('\n');
+/// Write one line. Workers answer concurrently, so the whole line goes out in a single write
+/// under the stdout lock: two responses can never interleave, and a line is never split.
+/// serde_json escapes every newline inside strings, so a message itself cannot contain one.
+fn write_line(line: &str) {
     let out = std::io::stdout();
     let mut h = out.lock();
     let _ = h.write_all(line.as_bytes());
     let _ = h.flush();
 }
 
-fn reply(id: &Value, result: Value) {
-    write_msg(&json!({"jsonrpc":"2.0","id":id,"result":result}));
+fn line_of(msg: &Value) -> String {
+    let mut line = msg.to_string();
+    line.push('\n');
+    line
 }
 
-fn reply_err(id: &Value, code: i64, message: &str) {
-    write_msg(&json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}));
+/// Write one JSON-RPC message synchronously. For WORKERS only: a worker's call stays in flight
+/// until this returns, which is what bounds a non-reading client to HM_MAX_INFLIGHT workers.
+fn write_msg(msg: &Value) { write_line(&line_of(msg)); }
+
+/// Lines the stdin thread has queued and the writer thread has not finished writing.
+static QUEUED: AtomicUsize = AtomicUsize::new(0);
+
+/// The writer thread's queue, started on first use (main starts it before reading stdin).
+/// Unbounded on purpose: what the stdin thread queues is small (refusals, initialize,
+/// tools/list, ping), and a bound would just be another place for it to block.
+fn out_queue() -> &'static Option<std::sync::mpsc::Sender<String>> {
+    static Q: OnceLock<Option<std::sync::mpsc::Sender<String>>> = OnceLock::new();
+    Q.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::Builder::new().name("stdout-writer".into()).spawn(move || {
+            for line in rx {
+                write_line(&line);
+                QUEUED.fetch_sub(1, Ordering::SeqCst);
+            }
+        }).ok().map(|_| tx)
+    })
 }
+
+/// Send one JSON-RPC message from the STDIN thread. It never writes stdout itself: a worker
+/// blocked writing a large answer to a client that has stopped reading holds the stdout lock,
+/// and the stdin thread used to wait on that lock -- for a refusal as much as for a ping -- and
+/// so never read the cancellation or the EOF behind it. It queues the line for the writer
+/// thread, which takes the same lock, so lines stay whole.
+fn post_msg(msg: &Value) {
+    let line = line_of(msg);
+    match out_queue() {
+        Some(tx) => {
+            QUEUED.fetch_add(1, Ordering::SeqCst);
+            if let Err(e) = tx.send(line) {
+                QUEUED.fetch_sub(1, Ordering::SeqCst);
+                write_line(&e.0);
+            }
+        }
+        // No writer thread could be started: write inline, the old behaviour, rather than drop
+        // the answer.
+        None => write_line(&line),
+    }
+}
+
+fn result_msg(id: &Value, result: Value) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"result":result})
+}
+
+fn error_msg(id: &Value, code: i64, message: &str) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
+}
+
+/// Answer from the stdin thread (queued).
+fn reply(id: &Value, result: Value) { post_msg(&result_msg(id, result)); }
+
+/// Refuse from the stdin thread (queued).
+fn reply_err(id: &Value, code: i64, message: &str) { post_msg(&error_msg(id, code, message)); }
 
 fn structured(r: Result<Value, String>) -> Value {
     match r {
@@ -1367,12 +1772,13 @@ fn dispatch(id: Value, req: Value) {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle_call(&name, &args)));
         // A cancelled request gets no response (MCP: the receiver SHOULD NOT send one); the
         // client has already stopped waiting for it.
+        // Written synchronously from this thread, not queued: see below.
         if !job.cancelled.load(Ordering::SeqCst) {
             match result {
-                Ok(v) => reply(&id2, v),
-                Err(_) => reply(&id2, json!({"content":[{"type":"text",
+                Ok(v) => write_msg(&result_msg(&id2, v)),
+                Err(_) => write_msg(&result_msg(&id2, json!({"content":[{"type":"text",
                     "text":format!("error: {name} panicked inside the server -- see its stderr")}],
-                    "isError":true})),
+                    "isError":true}))),
             }
         }
         // Only now, with the line written and flushed, does the call stop counting. Leaving
@@ -1392,9 +1798,15 @@ fn dispatch(id: Value, req: Value) {
 /// finish and answer for up to HM_SHUTDOWN_GRACE_SECS (default 60), then stop every child still
 /// running -- each sits in its own process group, so simply exiting would leave a memory_ask
 /// thinking for the rest of its 420 s deadline for nobody.
+///
+/// Lines the stdin thread queued for the writer count as answers still owed, under the same
+/// clock. A client that is not reading gets the same bound as before -- the grace, then
+/// CANCEL_GRACE + 1 s -- after which the process exits with whatever is still queued unwritten
+/// (Rust's exit only try_locks stdout, so a writer stuck in write() does not hold it up).
 fn drain_and_stop() {
+    let idle = || lock(inflight()).is_empty() && QUEUED.load(Ordering::SeqCst) == 0;
     let until = Instant::now() + Duration::from_secs(env_secs("HM_SHUTDOWN_GRACE_SECS", 60));
-    while !lock(inflight()).is_empty() && Instant::now() < until {
+    while !idle() && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(20));
     }
     let jobs: Vec<Arc<Job>> = lock(inflight()).values().cloned().collect();
@@ -1403,7 +1815,7 @@ fn drain_and_stop() {
         if let Some(pg) = *lock(&job.pgid) { sig::group(pg, sig::SOFT); }
     }
     let until = Instant::now() + CANCEL_GRACE + Duration::from_secs(1);
-    while !lock(inflight()).is_empty() && Instant::now() < until {
+    while !idle() && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(20));
     }
     for job in &jobs {
@@ -1412,6 +1824,9 @@ fn drain_and_stop() {
 }
 
 fn main() {
+    // Everything the stdin thread sends goes through the writer thread; start it before the
+    // first line is read.
+    let _ = out_queue();
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let line = match line { Ok(l) => l, Err(_) => break };
@@ -1423,7 +1838,7 @@ fn main() {
         // `continue`d -- the client waited for a response that was never coming and reported
         // the server as hung. Refuse it in words instead of in silence.
         if req.is_array() {
-            write_msg(&json!({"jsonrpc": "2.0", "id": Value::Null, "error": {
+            post_msg(&json!({"jsonrpc": "2.0", "id": Value::Null, "error": {
                 "code": -32600,
                 "message": "this server does not implement JSON-RPC batching; send one request \
                             per line (it negotiates protocolVersion 2024-11-05 for that reason)"
@@ -1593,6 +2008,18 @@ mod tests {
             std::env::set_var("HOME", &dir);
             std::env::set_var("HYPERMNESIA_ENV_FILE", "~/hypermnesia.env");
             assert_eq!(mem_author().as_deref(), Some("alice"), "~ must expand to HOME");
+            // HOME unset: `~` is the passwd home of this uid, as os.path.expanduser has it --
+            // for the explicit path and for the default alike.
+            std::env::remove_var("HOME");
+            let (_, pw_home) = pw::current().expect("this uid has a passwd entry");
+            let pw_home = pw_home.trim_end_matches('/').to_string();
+            assert_eq!(env_file_path(), format!("{pw_home}/hypermnesia.env"));
+            std::env::remove_var("HYPERMNESIA_ENV_FILE");
+            assert_eq!(env_file_path(), format!("{pw_home}/.claude/hypermnesia.env"));
+            // Set but empty is NOT unset in Python: `~` becomes "", so the path is root-relative.
+            std::env::set_var("HOME", "");
+            std::env::set_var("HYPERMNESIA_ENV_FILE", "~/hypermnesia.env");
+            assert_eq!(env_file_path(), "/hypermnesia.env");
             match saved_home { Some(h) => std::env::set_var("HOME", h),
                                None => std::env::remove_var("HOME") }
             std::env::set_var("HYPERMNESIA_ENV_FILE", &file);
@@ -1754,6 +2181,101 @@ mod tests {
         assert_eq!(rel_to_root(&format!("{b}/link/src/new/deeper.py"), &format!("{b}/real")),
                    ("src/new/deeper.py".to_string(), true));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// os.path.expanduser and expand_user, case for case, with HOME unset, empty and set --
+    /// against the real interpreter, since matching it is the whole point. The current user's
+    /// own name stands in for `~user`; an unknown name must stay literal.
+    #[cfg(unix)]
+    #[test]
+    fn expand_user_matches_python() {
+        use std::process::Command;
+        let (me, _) = pw::current().expect("this uid has a passwd entry");
+        let inputs = ["~", "~/", "~/a/b", "~//x", "x/~", "/abs/~", "",
+                      &format!("~{me}"), &format!("~{me}/"), &format!("~{me}/x.env"),
+                      "~no-such-user-hm-zz", "~no-such-user-hm-zz/x"];
+        for home in [None, Some(""), Some("/"), Some("/h/"), Some("/h")] {
+            let mut cmd = Command::new("python3");
+            cmd.args(["-I", "-c", "import os,sys\nprint('\\0'.join(os.path.expanduser(a) for a in sys.argv[1:]), end='')"])
+               .args(inputs.iter());
+            match home { Some(h) => { cmd.env("HOME", h); } None => { cmd.env_remove("HOME"); } }
+            let Ok(out) = cmd.output() else { eprintln!("python3 not available; skipped"); return };
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            let want: Vec<String> = String::from_utf8(out.stdout).unwrap()
+                .split('\0').map(str::to_string).collect();
+            for (input, want) in inputs.iter().zip(&want) {
+                assert_eq!(&expand_user(input, home), want, "input {input:?}, HOME {home:?}");
+            }
+        }
+        // And the two rules spelled out, so a failure says which one broke.
+        let (_, pw_home) = pw::current().unwrap();
+        assert_eq!(expand_user("~/x", None), format!("{}/x", pw_home.trim_end_matches('/')));
+        assert_eq!(expand_user(&format!("~{me}/x"), Some("/elsewhere")),
+                   format!("{}/x", pw_home.trim_end_matches('/')));
+        assert_eq!(expand_user("~no-such-user-hm-zz/x", Some("/h")), "~no-such-user-hm-zz/x");
+    }
+
+    /// Unix keeps device + inode: one directory under two spellings is one, two directories
+    /// whose names differ only in case are two (on a case-sensitive filesystem), and anything
+    /// that does not exist is nothing.
+    #[cfg(unix)]
+    #[test]
+    fn same_dir_is_device_and_inode_on_unix() {
+        let base = std::env::temp_dir().join(format!("hm-samedir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("App/sub")).unwrap();
+        std::os::unix::fs::symlink("App", base.join("alias")).unwrap();
+        let b = base.to_string_lossy().into_owned();
+        assert!(same_dir(&format!("{b}/App"), &format!("{b}/App")));
+        assert!(same_dir(&format!("{b}/App"), &format!("{b}/alias")));
+        assert!(same_dir(&format!("{b}/App"), &format!("{b}/App/sub/..")));
+        assert!(!same_dir(&format!("{b}/App"), &format!("{b}/App/sub")));
+        assert!(!same_dir(&format!("{b}/App"), &format!("{b}/missing")));
+        if !base.join("app").exists() {
+            std::fs::create_dir(base.join("app")).unwrap();
+            assert!(!same_dir(&format!("{b}/App"), &format!("{b}/app")));
+            assert_eq!(rel_to_root(&format!("{b}/app/x.py"), &format!("{b}/App")).1, false,
+                       "a case-only difference on a case-sensitive fs is another directory");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn is_zombie(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()
+            .and_then(|st| st.rsplit(')').next().map(|r| r.trim_start().starts_with('Z')))
+            .unwrap_or(false)
+    }
+
+    /// The leader's group is signalled while the leader is still an unreaped zombie -- its pid,
+    /// and so the group id, still reserved -- and only then is it reaped. Reaping first (the old
+    /// order) let the id be handed to an unrelated new group before the killpg. Both paths: the
+    /// polling one after a normal exit, and the blocking one after a timeout's SIGKILL.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_group_is_signalled_before_the_leader_is_reaped() {
+        for (script, killed) in [("exit 3", false), ("sleep 30", true)] {
+            let mut child = own_group_sh(script);
+            let pid = child.id() as i32;
+            let own = sig::leads_group(pid);
+            assert!(own, "spawn_child must make the child a group leader");
+            let seen = std::cell::RefCell::new(Vec::new());
+            let probe = |p: i32| seen.borrow_mut().push((p, is_zombie(p), sig::leads_group(p)));
+            let st = if killed {
+                sig::group(pid, sig::HARD);
+                reap_leader(&mut child, pid, own, None, true, &probe).unwrap()
+            } else {
+                let until = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let Some(st) = reap_leader(&mut child, pid, own, None, false, &probe).unwrap() { break Some(st); }
+                    assert!(Instant::now() < until, "{script}: never exited");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }.expect("reaped");
+            assert_eq!(seen.borrow().as_slice(), &[(pid, true, true)],
+                       "{script}: the group must be signalled exactly once, while the leader is                         an unreaped zombie still leading its group");
+            if killed { assert!(!st.success()); } else { assert_eq!(st.code(), Some(3)); }
+            assert!(!is_zombie(pid), "{script}: the leader must be reaped afterwards");
+        }
     }
 
     #[test]
