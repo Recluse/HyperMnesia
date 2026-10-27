@@ -93,14 +93,41 @@ Any LSP-backed symbol MCP works in place of Serena; HyperMnesia doesn't depend o
 ## Data flow
 
 **Ingest (offline, per doc change):** `ingest_repo.py` enumerates the repo's tracked markdown (`git ls-files`; `--walk` for a tree kept out of git), chunks by
-heading, and emits SQL; `embed_chunks.py` fills `chunks.embedding` via Ollama/TEI. The
+heading, and emits SQL; `embed_chunks.py` fills `chunks.embedding` via Ollama/TEI and exits
+non-zero if any batch could not be embedded (those chunks stay lexical-only, and every search over
+the scope says how many there are). The
 architectural map is seeded once by hand (`examples/seed_example.sql`), refreshed when the
 architecture changes.
 
-**Retrieval (per agent request):** the MCP server resolves a path to its component and returns
+**Retrieval (per agent request):** the MCP server resolves a path to its components and returns
 constraints deterministically (Tier 0/1), or embeds a query and fuses vector + full-text via RRF,
 optionally reranked (Tier 2). Fails open: embedder down → lexical-only; DB down → the tool
-surfaces the error, never blocks the agent.
+surfaces the error, never blocks the agent. Each tool call runs on its own worker thread, so a
+minutes-long `memory_ask` does not delay the `get_constraints` behind it, and an MCP
+`notifications/cancelled` stops the call's child process group.
+
+**Tier 1 semantics, exactly:** resolution is *additive*. A file gets the rules of every
+component whose `key_paths` match it — `src/**` and `src/api/**` both apply to `src/api/x.py` —
+plus the global rules, plus one hop along the relationships of the same repo. That is the
+fail-safe reading for `must` rules: a broad rule is never switched off because a narrower glob
+also matched, so write rules that hold together rather than overrides. Specificity — exact path,
+then the number of literal characters in the glob, then `priority`, then slug — only orders the
+output (`**/migrations/*.sql` lists before `src/**` for a migration file). The hop is undirected
+and ignores `kind`: kinds are free text with no declared direction, and pulling a neighbour's
+rules is the safer mistake. Edges are matched by component id, never by slug, so two repos that
+reuse slugs cannot leak rules into each other; an edge whose endpoints sit in different repos is
+never followed, and freshness reports it as an error. Paths are resolved against the repo root
+(the hook: `CLAUDE_PROJECT_DIR`, else the git top level of the session's cwd, else the cwd; the
+server: `HM_ROOT`, else its own git top level, else its cwd — whose folder name is also the default
+scope on both sides). Resolution is physical: symlinks are followed and `..` steps out of what a
+symlink points at, from the deepest existing ancestor, so a file not created yet still resolves.
+A path outside the root — absolute elsewhere, `../other/x.py`, a drive-qualified path against a
+POSIX root — is reported as outside, matches no component and brings none of the repo's global
+rules; otherwise `**/*.py` would hand one repo's rules to another repo's files. Containment is
+case-sensitive (on Linux `/work/App` and `/work/app` are different trees), except where the
+differently-cased prefix is the very same directory on disk, which is what a case-insensitive
+filesystem reports. The hook and the server are tested against one shared fixture,
+`tests/fixtures/tier1_cases.json`.
 
 **Constraint injection (per edit, unprompted):** a `PreToolUse` hook (`hooks/arch_invariants.py`,
 matcher `Edit|Write|MultiEdit`) resolves the file about to be edited to its component and injects
@@ -110,15 +137,18 @@ architectural-memory counterpart to the personal-memory recall hook; both make d
 storage, the point. Fail-open: no DB / no match → the hook stays silent and the edit proceeds.
 
 **Keeping the map honest:** the hand-authored map is only trustworthy while it tracks the tree.
-`ci/freshness.py` makes decay mechanical — it flags component globs matching no file (a moved file
-that silently unhooked its constraints — the worst case, since the map then lies more confidently
-than search would), docs ingested behind HEAD, and — informational only — how many constraints
-have no source document, since a full re-ingest nulls those links (the FK is `ON DELETE SET NULL`)
-and many seed rows legitimately carry none. Run it in
-CI or on a schedule against each target repo; it exits non-zero on orphaned globs, and refuses
-before any of those checks if no component is mapped under the scope it was given — every check is
-scoped by `repo`, so a mistyped or renamed scope would otherwise report zero of everything and
-pass.
+`ci/freshness.py` makes decay mechanical. It fails on component globs matching no file (a moved
+file that silently unhooked its constraints — the worst case, since the map then lies more
+confidently than search would) and on edges between components of different repos. It reports
+docs whose indexed content differs from disk; constraints whose source document changed since
+the rule was written, or no longer exists (a constraint names its source by
+`source_repo`/`source_path`/`source_hash`, which survives a re-ingest — the row-id link alone was
+cleared by exactly the edit it should have flagged; `--accept-sources` records the new hash once
+someone has re-read the rule); and, for information, components with no constraint, constraints
+that can never be delivered, and tracked files inside a mapped directory that no component
+matches. Run it in CI or on a schedule against each target repo; it refuses before any of those
+checks if no component is mapped under the scope it was given — every check is scoped by `repo`,
+so a mistyped or renamed scope would otherwise report zero of everything and pass.
 
 **Personal memory:** capture hooks enqueue session transcripts; a scheduled job distills them to
 memories via a pluggable LLM; a consolidator merges near-duplicates behind a review gate; and

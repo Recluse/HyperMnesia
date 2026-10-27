@@ -17,7 +17,9 @@ rerank timeout; a cold search just falls open to RRF and the next one is reranke
 Env: RERANK_MODEL (default BAAI/bge-reranker-v2-m3), PORT (8091), HM_RERANK_BIND (127.0.0.1),
      RERANK_MAXLEN (1024, the model card's recommendation),
      RERANK_IDLE_SEC (600; 0 disables idle-unload -> always resident).
-A cross-encoder rerank of the top RRF candidates measurably improves recall@1.
+Why have it: a cross-encoder reads query and passage together, which RRF's two independent legs
+cannot. How much it helps depends on the corpus; this repo ships no doc-retrieval eval to
+measure that (see eval/README.md), so measure it on yours before relying on it.
 """
 import gc, json, os, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

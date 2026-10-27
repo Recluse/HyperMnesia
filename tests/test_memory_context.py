@@ -360,7 +360,7 @@ def main():
     assert '"minimal","low","medium","high","max"' in src
     assert 'tool_memory("context", &payload)' in src
     assert 'obj.insert("project".into(), Value::String(repo()))' in src
-    assert 'if name == "memory_context"' in src
+    assert '"memory_context" => structured(' in src
     assert '"structuredContent":value' in src
     assert "JOIN mem.all_memories m ON m.id=r.memory_id" in (ROOT / "ingest/mem_ops.py").read_text()
     print(json.dumps({"ok": True, "full_ids": ids,

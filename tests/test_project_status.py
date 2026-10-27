@@ -102,7 +102,9 @@ def main():
         run = subprocess.run([str(binary)], input="".join(json.dumps(r) + "\n" for r in requests),
                              text=True, capture_output=True, env=env, cwd=root, timeout=20)
         assert run.returncode == 0, run.stderr
-        responses = [json.loads(line)["result"] for line in run.stdout.splitlines()]
+        # Matched by id: tools/call requests run concurrently, so answers may arrive out of order.
+        by_id = {m["id"]: m["result"] for m in map(json.loads, run.stdout.splitlines())}
+        responses = [by_id[r["id"]] for r in requests]
         tool = next(t for t in responses[0]["tools"] if t["name"] == "project_status")
         assert tool["annotations"]["readOnlyHint"] is True
         assert tool["outputSchema"]["properties"]["version"]["const"] == 1

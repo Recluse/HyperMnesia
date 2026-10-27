@@ -7,6 +7,16 @@ Embeds the query (bge-m3), then fuses:
 RRF score = 1/(60+rank_sem) + 1/(60+rank_lex). OR-conversion + length-norm are deliberate
 (AND is too strict for recall; length-norm stops long docs dominating the lexical leg).
 
+HM_DOC_MAXDIST (optional, default unset = off): a cosine-distance floor for the dense leg. The
+dense leg otherwise returns its 50 nearest chunks for ANY query, so a question the corpus does
+not cover still gets a full page of results and `query_log` never records a miss. Set it (e.g.
+0.5 for bge-m3; calibrate against your own corpus first -- too low and paraphrases go missing)
+and the dense leg keeps only chunks at most that far from the query. The lexical leg is
+unaffected: an exact token match is evidence on its own.
+
+Chunks with no embedding yet (ingested, embedder not run or failed) are reachable by the lexical
+leg only; every search over a scope that has some says how many, in one line.
+
 Usage:  search.py "your query" [k] [repo]      # CLI
         search.py [k] [repo]  <query on stdin>  # MCP mode
         search.py --json <pool> [repo]          # candidate pool for an external reranker
@@ -25,7 +35,8 @@ WITH q AS (
   SELECT %s::vector AS emb,
          (replace(websearch_to_tsquery('{FTS_LANG}',%s)::text,'&','|')::tsquery
           || replace(websearch_to_tsquery('simple', %s)::text,'&','|')::tsquery) AS ts,
-         %s::text AS repo
+         %s::text AS repo,
+         %s::float8 AS maxdist
 ),
 semantic AS (
   SELECT c.id, RANK() OVER (ORDER BY c.embedding <=> (SELECT emb FROM q)) AS rank
@@ -33,6 +44,8 @@ semantic AS (
   WHERE c.embedding IS NOT NULL
     AND (SELECT emb FROM q) IS NOT NULL   -- embedder down -> no query vector -> lexical-only
     AND ((SELECT repo FROM q) IS NULL OR d.repo = (SELECT repo FROM q))
+    AND ((SELECT maxdist FROM q) IS NULL
+         OR c.embedding <=> (SELECT emb FROM q) <= (SELECT maxdist FROM q))
   ORDER BY c.embedding <=> (SELECT emb FROM q) LIMIT 50
 ),
 lexical AS (
@@ -53,6 +66,38 @@ WHERE s.id IS NOT NULL OR l.id IS NOT NULL
 ORDER BY score DESC
 LIMIT %s;
 """
+
+
+def _maxdist():
+    """HM_DOC_MAXDIST as a float, or None (off). A value that does not parse is refused
+    loudly rather than read as "off": the operator asked for a floor."""
+    raw = os.environ.get("HM_DOC_MAXDIST", "").strip()
+    if not raw:
+        return None
+    try:
+        v = float(raw)
+    except ValueError:
+        raise SystemExit(f"HM_DOC_MAXDIST={raw!r} is not a number (cosine distance, 0..2)")
+    if not 0 < v <= 2:
+        raise SystemExit(f"HM_DOC_MAXDIST={raw!r} is outside 0..2 (cosine distance)")
+    return v
+
+
+def _unembedded(cur, repo):
+    """How many chunks in scope have no vector -- lexical-only until embed_chunks runs."""
+    try:
+        cur.execute("SELECT count(*) FROM chunks c JOIN documents d ON d.id = c.document_id "
+                    "WHERE c.embedding IS NULL AND (%s::text IS NULL OR d.repo = %s)",
+                    (repo, repo))
+        return cur.fetchone()[0]
+    except Exception:
+        cur.connection.rollback()
+        return None
+
+
+def _unembedded_line(n):
+    return (f"!! {n} chunk(s) in this scope have no embedding yet -- they are found by exact "
+            f"words only (lexical leg). Run ingest/embed_chunks.py (./hm ingest does).")
 
 
 def _tune(cur):
@@ -138,20 +183,32 @@ def _query_vec(query):
         return None
 
 
-def search(query, k=8, repo=None):
-    emb = _query_vec(query)
-    conn = connect(); cur = conn.cursor()
-    _tune(cur)
-    cur.execute(RRF_SQL, (emb, _no_neg(query), _lex_query(query), repo, max(k * 8, 40)))
-    per_doc, rows = {}, []
-    for r in cur.fetchall():                 # cap 2 chunks/doc so one doc can't monopolise top-k
-        doc = r[0]
+UNEMBEDDED = None   # set by search()/candidates(): chunks in scope with no vector
+
+
+def _cap_per_doc(rows, k, doc_of):
+    """At most 2 chunks per document, at most k in all -- the cut both entry points apply."""
+    per_doc, out = {}, []
+    for r in rows:
+        doc = doc_of(r)
         if per_doc.get(doc, 0) >= 2:
             continue
         per_doc[doc] = per_doc.get(doc, 0) + 1
-        rows.append(r)
-        if len(rows) >= k:
+        out.append(r)
+        if len(out) >= k:
             break
+    return out
+
+
+def search(query, k=8, repo=None):
+    global UNEMBEDDED
+    emb = _query_vec(query)
+    conn = connect(); cur = conn.cursor()
+    _tune(cur)
+    cur.execute(RRF_SQL, (emb, _no_neg(query), _lex_query(query), repo, _maxdist(),
+                          max(k * 8, 40)))
+    rows = _cap_per_doc(cur.fetchall(), k, lambda r: r[0])   # one doc can't monopolise top-k
+    UNEMBEDDED = _unembedded(cur, repo)
     _log_query(conn, cur, query, len(rows), rows[0][0] if rows else None)
     conn.close()
     return rows
@@ -173,8 +230,16 @@ def _log_query(conn, cur, query, n_results, top_doc):
         conn.rollback()
 
 
-def candidates(query, pool, repo):
-    """Raw RRF pool (no per-doc cap, wider text) for an external reranker."""
+def candidates(query, pool, repo, k=None):
+    """Raw RRF pool (no per-doc cap, wider text) for an external reranker.
+
+    `k` is how many results the caller will show. The reranker reorders the pool and then
+    applies the same <=2-per-doc, top-k cut, and the size of that cut does not depend on the
+    order -- so it is known here, and THAT is what query_log records, not the pool size (which
+    made every reranked search look like a 30-result hit). top_doc stays the RRF leader: the
+    reranked one is not known yet.
+    """
+    global UNEMBEDDED
     emb = _query_vec(query)
     conn = connect(); cur = conn.cursor()
     _tune(cur)
@@ -186,12 +251,14 @@ def candidates(query, pool, repo):
     # way to tell that from a working rerank. Let the reranker's own tokenizer do the truncating
     # at RERANK_MAXLEN, where it is at least token-aware and at the model's configured limit.
     cur.execute(RRF_SQL.replace("left(c.content,110)", "left(c.content,3000)"),
-                (emb, _no_neg(query), _lex_query(query), repo, pool))
+                (emb, _no_neg(query), _lex_query(query), repo, _maxdist(), pool))
     out = [{"doc": doc, "heading": heading,
             "score": float(score) if score is not None else None,
             "srank": srank, "lrank": lrank, "text": snippet}
            for doc, heading, score, srank, lrank, snippet in cur.fetchall()]
-    _log_query(conn, cur, query, len(out), out[0]["doc"] if out else None)
+    shown = len(_cap_per_doc(out, k, lambda c: c["doc"])) if k else len(out)
+    UNEMBEDDED = _unembedded(cur, repo)
+    _log_query(conn, cur, query, shown, out[0]["doc"] if out else None)
     conn.close()
     return out
 
@@ -212,13 +279,15 @@ def main():
         repo = args[2] if len(args) > 2 else (os.environ.get("HM_REPO") or None)
         if repo and repo.upper() == "ALL":
             repo = None
+        k = int(args[3]) if len(args) > 3 and args[3].isdigit() else None
         query = _read_query()
         # candidates() is what SETS DEGRADED, and dict values evaluate left to right -- reading
         # DEGRADED in the same literal captured its pre-call value, so the reranked path always
         # received "" and never printed the LEXICAL-ONLY warning. Call first, then build.
-        cands = candidates(query, pool, repo) if query else []
+        cands = candidates(query, pool, repo, k) if query else []
         print(json.dumps({"query": query, "repo": repo, "degraded": DEGRADED,
-                          "candidates": cands}, ensure_ascii=False))
+                          "unembedded": UNEMBEDDED or 0, "candidates": cands},
+                         ensure_ascii=False))
         return
     if args and not args[0].isdigit():
         query = args[0]
@@ -238,6 +307,8 @@ def main():
     if DEGRADED:
         print(f"!! EMBEDDER UNREACHABLE ({DEGRADED}) -- this search was LEXICAL-ONLY: ranking is "
               f"degraded, and few or no results does NOT mean the corpus lacks the topic")
+    if UNEMBEDDED:
+        print(_unembedded_line(UNEMBEDDED))
     if not rows:
         print("(no results)")
     for doc, heading, score, srank, lrank, snippet in rows:

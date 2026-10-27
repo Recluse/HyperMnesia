@@ -29,7 +29,9 @@ CREATE TABLE IF NOT EXISTS components (
     name            TEXT NOT NULL,
     parent_id       BIGINT REFERENCES components(id),
     responsibility  TEXT NOT NULL,
-    key_paths       TEXT[] NOT NULL,      -- globs; resolver = longest-match wins, `priority` breaks ties
+    key_paths       TEXT[] NOT NULL,      -- globs; ADDITIVE: every matching component applies.
+                                          -- Specificity (exact, literal chars, priority, slug)
+                                          -- only orders the output (docs/ARCHITECTURE.md).
     priority        INT NOT NULL DEFAULT 0,
     owner           TEXT,
     UNIQUE (repo, slug)
@@ -47,12 +49,14 @@ CREATE TABLE IF NOT EXISTS constraints (
     rationale     TEXT,
     severity      TEXT DEFAULT 'must',    -- must | should | info
     status        TEXT DEFAULT 'active',  -- active | deprecated | superseded
-    -- ON DELETE SET NULL: a repo reingest deletes+reinserts its documents, so a constraint's
-    -- source link must survive that (the constraint stays; only its doc pointer clears).
+    -- ON DELETE SET NULL: a repo reingest deletes+reinserts its documents, so the row-id link
+    -- alone cannot survive one. sql/migrate_constraint_sources.sql adds source_repo /
+    -- source_path / source_hash, which do, and a trigger that re-links this column on re-insert.
     source_doc_id BIGINT REFERENCES documents(id) ON DELETE SET NULL
 );
 
--- Component dependency graph (1-hop constraint propagation).
+-- Component dependency graph (1-hop constraint propagation: undirected, any kind, and only
+-- between components of the same repo -- an edge across repos is never followed).
 CREATE TABLE IF NOT EXISTS relationships (
     src_component_id BIGINT REFERENCES components(id),
     dst_component_id BIGINT REFERENCES components(id),
@@ -86,7 +90,9 @@ CREATE INDEX IF NOT EXISTS constraints_lookup_idx ON constraints (component_id, 
 -- Build the ANN index AFTER the first bulk embed (faster than maintaining it during load):
 --   CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops);
 
--- Observability -- log searches to find recall gaps (n_results=0 = a miss).
+-- Observability -- log searches to find recall gaps. n_results is what the caller was shown.
+-- A miss (0) is only possible for a query with no lexical match when HM_DOC_MAXDIST is set:
+-- without that floor the dense leg always returns its nearest chunks.
 CREATE TABLE IF NOT EXISTS query_log (
     id         BIGSERIAL PRIMARY KEY,
     ts         TIMESTAMPTZ DEFAULT now(),

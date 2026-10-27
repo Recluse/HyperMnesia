@@ -57,6 +57,7 @@ def run_hook(script, event, extra_env=None, fake_psql_out=None):
     """Run a hook with a canonical event on stdin; optionally stub `psql`."""
     env = dict(os.environ, HM_REPO="myapp", DATABASE_URL="postgresql://stub/stub")
     env.pop("MEM_STALE_DAYS", None)
+    env.pop("CLAUDE_PROJECT_DIR", None)   # arch_invariants resolves paths against it
     env.update(extra_env or {})
     with tempfile.TemporaryDirectory() as tmp:
         # The hooks keep one-notice-per-fault markers under $HOME/.claude. Never let a test

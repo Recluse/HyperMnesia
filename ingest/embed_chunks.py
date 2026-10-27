@@ -14,6 +14,10 @@ a local model and consequential the moment the endpoint is somewhere else -- a h
 borrowed GPU, a tunnel whose far end you do not administer. Scope the run with EMBED_REPO when
 the embedder is not yours; note that a loopback URL proves nothing, since an ssh reverse tunnel
 presents a remote service on 127.0.0.1.
+
+Exit status: 0 when every selected chunk got a vector, 1 when any batch was skipped. A skipped
+batch stays NULL and is retried next run, which is the right recovery -- but those chunks are
+lexical-only until then, so the run must not report success.
 """
 import os, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -75,7 +79,13 @@ def main():
             print(f"  shard{SHARD_I}: {done}/{total} ({done/max(time.time()-t0,1e-6):.1f}/s)", flush=True)
     print(f"done shard {SHARD_I}/{SHARD_N}: {done} embedded, {skipped} skipped, {time.time()-t0:.0f}s",
           flush=True)
+    if skipped:
+        print(f"FAILED: {skipped} of {total} chunk(s) were not embedded -- they stay NULL "
+              f"(found by exact words only) until a later run succeeds", file=sys.stderr,
+              flush=True)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -10,18 +10,28 @@ confidently than search would. This surfaces that mechanically:
   2. STALE DOCS   -- documents whose INDEXED content differs from the file on disk, plus any
      indexed document that is gone from disk, plus markdown on disk that was NEVER indexed
      (that last one walks the DISK: the other two cannot see a file the corpus has no row for).
-  3. CONSTRAINT RE-REVIEW -- constraints whose source_doc link is NULL: the document they were
-     authored from was deleted (a full re-ingest does exactly this, since the FK is
-     ON DELETE SET NULL). Re-apply the repo's seed to restore the links.
+  3. CONSTRAINT SOURCES -- a constraint names the document it was written from by
+     (source_repo, source_path, source_hash) (sql/migrate_constraint_sources.sql). Flagged: the
+     source changed since the rule was written (its hash now differs), and the source is gone.
+     `--accept-sources` records the current hash after you have re-read the rule.
+  4. MAP SHAPE -- edges whose two endpoints are in different repos (an ERROR: Tier 1 never
+     follows them, so whatever they were meant to propagate does not arrive); and, for
+     information, components with no constraint, constraints that can never be delivered (no
+     component, a component in another repo, or one with no key_paths and no edge to a mapped
+     component), and tracked files inside a mapped directory that no component matches -- the
+     file that moved out from under its directory's glob, which check 1 cannot see.
 
 Generic: connects via DATABASE_URL (ingest/_common). Scope is one repo (the map is multi-repo).
 
-Usage: ci/freshness.py <repo_dir> <repo> [--mark]   (--mark sets documents.status='stale')
-Exit 1 if any map orphans.
+Usage: ci/freshness.py <repo_dir> <repo> [--mark] [--accept-sources]
+       (--mark sets documents.status='stale'; --accept-sources stamps changed constraint sources
+        with their current hash)
+Exit 1 if any map orphans or cross-repo edges.
 """
 import fnmatch
 import hashlib
 import os
+import posixpath
 import subprocess
 import sys
 
@@ -63,6 +73,44 @@ def list_tracked(repo_dir):
     return sorted(tracked | walked)
 
 
+def git_tracked(repo_dir):
+    """The git index for this tree, or None when it is not a git checkout."""
+    try:
+        out = subprocess.check_output(["git", "-C", repo_dir, "ls-files", "-z"],
+                                      stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+    return sorted(f for f in out.decode("utf-8", "surrogateescape").split("\0") if f)
+
+
+def mapped_dirs(globs):
+    """Directories a set of key_paths claims: the literal directory part of each glob (before
+    its first wildcard), or an exact path's parent. The repo root is never one -- a root-level
+    exact path (`.gitlab-ci.yml`) does not claim the whole tree."""
+    out = set()
+    for g in globs:
+        if not g:
+            continue
+        cut = min([i for i in (g.find("*"), g.find("?")) if i >= 0] or [len(g)])
+        head = g[:cut] if cut < len(g) else posixpath.dirname(g)
+        d = head.rsplit("/", 1)[0] if cut < len(g) else head
+        d = d.strip("/")
+        if d:
+            out.add(d)
+    return out
+
+
+def file_hash(path):
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+def has_column(cur, table, column):
+    cur.execute("SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass(%s) AND attname = %s "
+                "AND NOT attisdropped", (table, column))
+    return cur.fetchone() is not None
+
+
 def main():
     if len(sys.argv) < 3:
         print(__doc__); return 2
@@ -93,11 +141,76 @@ def main():
     # 1. map orphans -- scope to THIS repo (files is only this repo's tree, so other repos'
     #    components would always "not match" and get falsely flagged under multi-repo).
     cur.execute("SELECT slug, key_paths FROM components WHERE repo=%s AND key_paths <> '{}'", (repo,))
-    orphans = []
+    orphans, blank_globs = [], []
     for slug, kps in cur.fetchall():
         for g in kps or []:
-            if g and not any(_glob_matches(g, f) for f in files):
+            # An empty or whitespace-only glob matches nothing and claims nothing; it is a map
+            # error of its own (flagged below), never an orphan and never "has key_paths".
+            if not (g or "").strip():
+                blank_globs.append(slug)
+                continue
+            if not any(_glob_matches(g, f) for f in files):
                 orphans.append((slug, g))
+
+    # 1b. edges across repos -- an ERROR. GRAPH_SQL names each endpoint's repo and Tier 1
+    #     follows only edges wholly inside the current repo, so such an edge propagates nothing,
+    #     in either repo, while the map reads as if it did.
+    cur.execute("""SELECT s.repo, s.slug, r.kind, d.repo, d.slug
+                     FROM relationships r
+                     JOIN components s ON s.id = r.src_component_id
+                     JOIN components d ON d.id = r.dst_component_id
+                    WHERE (s.repo = %s OR d.repo = %s) AND s.repo <> d.repo
+                    ORDER BY 1, 2, 4, 5""", (repo, repo))
+    cross_edges = cur.fetchall()
+
+    # 1c. components with no active constraint -- informational: a grouping parent normally has
+    #     none, but a leaf with none is a map entry that changes nothing.
+    cur.execute("""SELECT c.slug, NOT EXISTS (SELECT 1 FROM unnest(c.key_paths) g
+                                             WHERE btrim(g) <> '') FROM components c
+                    WHERE c.repo = %s AND NOT EXISTS (
+                          SELECT 1 FROM constraints x
+                           WHERE x.component_id = c.id AND x.status = 'active')
+                    ORDER BY c.slug""", (repo,))
+    ruleless = cur.fetchall()
+
+    # 1d. constraints no path can ever receive -- the static form of what get_constraints
+    #     reports per call as UNDELIVERABLE, plus the case it cannot see from one call: a
+    #     component with no key_paths and no edge to a component that has some.
+    cur.execute("""SELECT x.title,
+                          CASE WHEN x.scope <> 'component' THEN 'scope is ' || quote_literal(x.scope)
+                               WHEN c.id IS NULL THEN 'no component'
+                               WHEN c.repo <> x.repo THEN 'component is in repo ' || c.repo
+                               ELSE 'component ' || c.slug || ' has no key_paths and no edge to a mapped component'
+                          END
+                     FROM constraints x LEFT JOIN components c ON c.id = x.component_id
+                    WHERE x.repo = %s AND x.status = 'active' AND x.scope <> 'global'
+                      AND (x.scope <> 'component' OR c.id IS NULL OR c.repo <> x.repo
+                           OR (NOT EXISTS (SELECT 1 FROM unnest(c.key_paths) g
+                                           WHERE btrim(g) <> '') AND NOT EXISTS (
+                               SELECT 1 FROM relationships r
+                                 JOIN components o ON o.id = CASE WHEN r.src_component_id = c.id
+                                                                  THEN r.dst_component_id
+                                                                  ELSE r.src_component_id END
+                                WHERE (r.src_component_id = c.id OR r.dst_component_id = c.id)
+                                  AND o.repo = c.repo
+                                  AND EXISTS (SELECT 1 FROM unnest(o.key_paths) g
+                                              WHERE btrim(g) <> ''))))
+                    ORDER BY x.id""", (repo,))
+    never = cur.fetchall()
+
+    # 1e. tracked files inside a mapped directory that no component matches. Check 1 asks
+    #     whether each glob still matches SOMETHING; a file that moved out from under its glob
+    #     (src/api/x.py -> src/api/v2/x.py under an exact-path glob) leaves every glob matching
+    #     and the file mapped to nothing. Informational: new files are legitimately unmapped
+    #     until someone decides where they belong.
+    cur.execute("SELECT key_paths FROM components WHERE repo=%s", (repo,))
+    all_globs = [g for (kps,) in cur.fetchall() for g in (kps or []) if (g or "").strip()]
+    dirs = mapped_dirs(all_globs)
+    tracked = git_tracked(repo_dir)
+    universe = tracked if tracked is not None else files
+    unmapped = [f for f in universe
+                if any(f.startswith(d + "/") for d in dirs)
+                and not any(_glob_matches(g, f) for g in all_globs)]
 
     # 2. stale docs -- the INDEXED content against the file as it is now.
     #
@@ -189,17 +302,46 @@ def main():
               and not is_ignored(f)
               and why_skipped(f) is None]
 
-    # 3. constraints with no source document. NOT "dangling pointer": the FK is
-    #    ON DELETE SET NULL (sql/schema.sql), so a deleted document can never leave a pointer to
-    #    a missing row -- that test asks for a state the schema makes unreachable and therefore
-    #    reports 0 forever, which reads as health.
-    #    Read this number as INFORMATIONAL. From the database alone, a link a re-ingest severed
-    #    is indistinguishable from a norm whose seed row deliberately carries no source, and in
-    #    practice most are the latter. The checkable question is whether every document path a
-    #    seed references actually exists in the index: a seed pointing at a file the corpus
-    #    cannot hold (a .yml, say, in a markdown-only corpus) silently resolves to NULL.
-    cur.execute("SELECT count(*) FROM constraints WHERE repo=%s AND source_doc_id IS NULL", (repo,))
-    dangling = cur.fetchone()[0]
+    # 3. constraint sources. The rule names its document by (repo, path, hash), which survives
+    #    the delete-and-reinsert of a re-ingest; source_doc_id alone did not (ON DELETE SET
+    #    NULL), so the edit this check exists to notice used to erase the evidence of itself.
+    #    Same-repo sources are compared with the file ON DISK (the truth the rule must match);
+    #    a source in another repo can only be compared with that repo's indexed copy.
+    src_changed, src_gone, src_unhashed, src_unreadable, unnamed = [], [], [], [], 0
+    sources_migrated = has_column(cur, "constraints", "source_hash")
+    if sources_migrated:
+        cur.execute("""SELECT id, title, source_repo, source_path, source_hash FROM constraints
+                        WHERE repo=%s AND status='active' AND source_path IS NOT NULL
+                        ORDER BY id""", (repo,))
+        for cid, title, srepo, spath, shash in cur.fetchall():
+            if srepo == repo:
+                ap = os.path.join(repo_dir, spath)
+                try:
+                    now = file_hash(ap) if os.path.isfile(ap) else None
+                except OSError as exc:
+                    # Present but unreadable (EACCES, EIO, vanished mid-run): a finding, not a
+                    # crash that takes every other finding down with it.
+                    src_unreadable.append((cid, title, f"{srepo}:{spath}", exc.strerror or str(exc)))
+                    continue
+            else:
+                cur.execute("SELECT content_hash FROM documents WHERE repo=%s AND path=%s",
+                            (srepo, spath))
+                row = cur.fetchone()
+                now = row[0] if row else None
+            where = f"{srepo}:{spath}"
+            if now is None:
+                src_gone.append((cid, title, where))
+            elif shash is None:
+                src_unhashed.append((cid, title, where))
+            elif now != shash:
+                src_changed.append((cid, title, where, now))
+        cur.execute("SELECT count(*) FROM constraints WHERE repo=%s AND status='active' "
+                    "AND source_path IS NULL", (repo,))
+        unnamed = cur.fetchone()[0]
+    else:
+        cur.execute("SELECT count(*) FROM constraints WHERE repo=%s AND source_doc_id IS NULL",
+                    (repo,))
+        unnamed = cur.fetchone()[0]
 
     print(f"-- freshness [{repo} @ {commit[:8]}] --")
     print(f"MAP ORPHANS ({len(orphans)}) -- key_paths matching no file:")
@@ -221,7 +363,41 @@ def main():
               f"confirmed excluded")
         for u in unreadable[:5]:
             print(f"   ? {u}")
-    print(f"CONSTRAINTS w/o source_doc (informational; many are NULL by design): {dangling}")
+    print(f"CROSS-REPO EDGES ({len(cross_edges)}) -- never followed by Tier 1 (error):")
+    for sr, ss, k, dr, ds in cross_edges:
+        print(f"   ! {sr}:{ss} -{k}-> {dr}:{ds}")
+    if sources_migrated:
+        print(f"CONSTRAINT SOURCE CHANGED since the rule was written: {len(src_changed)}")
+        for cid, title, where, _ in src_changed:
+            print(f"   ~ #{cid} {title!r} <- {where}  (re-read the rule; --accept-sources to stamp)")
+        print(f"CONSTRAINT SOURCE GONE (the named document no longer exists): {len(src_gone)}")
+        for cid, title, where in src_gone:
+            print(f"   ! #{cid} {title!r} <- {where}")
+        if src_unhashed:
+            print(f"CONSTRAINT SOURCE NOT YET INGESTED (no hash recorded): {len(src_unhashed)}")
+        if src_unreadable:
+            print(f"CONSTRAINT SOURCE COULD NOT BE READ: {len(src_unreadable)}")
+            for cid, title, where, why in src_unreadable:
+                print(f"   ? #{cid} {title!r} <- {where}: {why}")
+        print(f"CONSTRAINTS naming no source (informational; many have none by design): {unnamed}")
+    else:
+        print("CONSTRAINT SOURCES: not checked -- sql/migrate_constraint_sources.sql is not applied "
+              "(run `hm migrate`)")
+        print(f"CONSTRAINTS w/o source_doc (informational; many are NULL by design): {unnamed}")
+    print(f"COMPONENTS WITH NO CONSTRAINT (informational): {len(ruleless)}"
+          + (f"  e.g. {', '.join(sl + (' (grouping)' if grp else '') for sl, grp in ruleless[:10])}"
+             if ruleless else ""))
+    if blank_globs:
+        print(f"BLANK GLOBS (empty key_paths entries, matching nothing): "
+              f"{', '.join(sorted(set(blank_globs)))}")
+    print(f"NEVER-DELIVERABLE CONSTRAINTS (informational): {len(never)}")
+    for title, why in never[:10]:
+        print(f"   ? {title!r}: {why}")
+    print(f"UNMAPPED FILES inside mapped directories (informational): {len(unmapped)}")
+    for f in unmapped[:10]:
+        print(f"   - {f}")
+    if len(unmapped) > 10:
+        print(f"   ... and {len(unmapped) - 10} more")
 
     if "--mark" in sys.argv:
         # Marks exactly the documents the check above found, by path. The old predicate was the
@@ -233,7 +409,15 @@ def main():
         conn.commit()
         print(f"marked {cur.rowcount} docs status='stale'")
 
-    return 1 if orphans else 0
+    if "--accept-sources" in sys.argv and src_changed:
+        # Only the ones reported as changed above, each to the hash it was just compared with:
+        # stamping is a statement that a person re-read those rules, not a blanket reset.
+        for cid, _, _, now in src_changed:
+            cur.execute("UPDATE constraints SET source_hash=%s WHERE id=%s", (now, cid))
+        conn.commit()
+        print(f"stamped {len(src_changed)} constraint source(s) with their current hash")
+
+    return 1 if orphans or cross_edges else 0
 
 
 if __name__ == "__main__":

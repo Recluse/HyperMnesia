@@ -76,10 +76,12 @@ Markdown only, chunked by heading. Things to know before you trust the result:
   scratch docs, typically. The ingester refuses to write an empty corpus rather than emitting
   one that would delete what is already stored; pass `--walk` to index the tree directly.
   `./hm ingest` has no `--walk`, so that corpus has to go through the manual path.
-- A full re-ingest **deletes and re-inserts** the repo's documents, so `constraints.source_doc_id`
-  is reset to NULL (the FK is `ON DELETE SET NULL`). Re-apply the seed afterwards if you care
-  about those links. It also drops every chunk (that FK cascades) and chunks carry the
-  embeddings — so a re-ingest for one edited file re-embeds the whole corpus.
+- A full re-ingest **deletes and re-inserts** the repo's documents. A constraint that names its
+  source by `source_repo`/`source_path` (sql/migrate_constraint_sources.sql) is re-linked to the
+  new row automatically; one that sets only `source_doc_id` loses the link (the FK is
+  `ON DELETE SET NULL`), so name sources by path in the seed. A full re-ingest also drops every
+  chunk (that FK cascades) and chunks carry the embeddings — so a re-ingest for one edited file
+  re-embeds the whole corpus.
 - **Re-ingesting by hand? Use `--known-hashes`** (`./hm ingest` already does this for you).
   Hand the ingester what the DB already holds and
   only new and changed files are rewritten; unchanged documents keep their chunks, their
