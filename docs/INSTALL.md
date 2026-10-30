@@ -328,7 +328,7 @@ binary path to your home. This enables the reading tools:
 [mcp_servers.hypermnesia]
 command = "/home/you/.HyperMnesia/current/bin/hypermnesia-mcp"
 env_vars = ["DATABASE_URL", "EMBED_BACKEND", "MEM_AUTHOR"]
-enabled_tools = ["get_project_map", "get_constraints", "locate", "get_document", "search_docs", "memory_search", "memory_perspectives", "memory_evidence", "memory_peer_card", "memory_context", "memory_ask", "memory_get", "status", "project_status"]
+enabled_tools = ["get_project_map", "get_constraints", "locate", "get_document", "search_docs", "memory_search", "memory_perspectives", "memory_evidence", "memory_peer_card", "memory_context", "memory_ask", "memory_get", "memory_timeline", "status", "project_status"]
 tool_timeout_sec = 130
 ```
 
@@ -340,10 +340,11 @@ HM_REPO = "myrepo"
 ```
 
 `memory_search` accepts a natural-language query, result count `k`, memory-type, project, and
-perspective filters. `memory_context` returns a bounded, auditable selection with fixed or
+perspective filters, and `brief` for one compact line per hit. `memory_context` returns a bounded, auditable selection with fixed or
 evidence-selected depth; `memory_ask` adds grounded claims and structured citations. The graph
 tools expose perspectives, evidence, and peer cards without a model. `memory_get` returns the
-full memory with provenance and replacement history. `search_docs` searches the project's
+full memory with provenance and replacement history, for one `id` or up to 20 `ids`;
+`memory_timeline` lists the same author's memories around one of them. `search_docs` searches the project's
 document corpus. Identity comes from
 `MEM_AUTHOR` or the shared settings file, not a tool argument.
 

@@ -91,6 +91,17 @@ returns the selected level and reason; it does not ask a model to choose. Routin
 server's project or every RLS-visible workspace. Global routing reports ranked
 observer-to-observed routes backed by materialized peer cards.
 
+**Reading cheaply.** Every body an agent is shown costs tokens, and most search hits are not
+worth reading in full. `memory_search` with `brief: true` returns one line per hit -- id, type,
+status when not active, project, date, an estimate of the tokens the whole row costs, and its
+first hundred characters -- followed by the ids to fetch. `memory_get` takes `ids` (up to 20)
+as well as `id`, so the hits worth reading come back in one call; as JSON a batch is a list, with
+`null` for a row the reader may not see, the same answer as a missing id. `memory_timeline` shows
+the same author's memories just before and after one row in the same project, oldest first, in
+the same compact lines with that row marked: the neighbours of a hit are often what explains it.
+Knowledge pages stay out of it, history only on request, and a row the reader may not see is
+"(not found)", so its existence is not disclosed.
+
 `memory_ask` is the synchronous Dialectic. It gives a model only the bounded context, then checks
 the reply as data: each atomic claim needs one or more IDs from that exact context, and every
 cited row must still be active. One unsupported claim rejects the whole answer. Returned prose

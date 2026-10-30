@@ -1554,6 +1554,17 @@ def fmt_row(r):
     return f"[#{mid}] ({flags}, {created}{window}) {content}"
 
 
+def fmt_brief(r, mark=""):
+    """One line of the compact index: id, kind, date, project, an estimate of what reading the
+    whole row costs, and the start of it. Borrowed from claude-mem's search -> get flow: scan
+    many hits cheaply, then fetch only the bodies worth their tokens (`get` with `ids`)."""
+    mid, mtype, status, imp, conf, created, vfrom, vto, project, content = r[:10]
+    text = " ".join(str(content or "").split())
+    head = text[:100] + ("…" if len(text) > 100 else "")
+    tags = mtype + (f" [{status}]" if status != "active" else "") + (f" @{project}" if project else "")
+    return f"[#{mid}] {tags} {created} ~{max(1, -(-len(text) // 4))}tok{mark}: {head}"
+
+
 def row_json(r):
     """One search/get row as a machine-readable object -- the contract scripts parse."""
     out = {"id": r[0], "type": r[1], "status": r[2], "importance": float(r[3]),
@@ -1850,6 +1861,114 @@ def _write_or_refuse(cur, payload):
         raise Refused(f"not applied: {exc}")
 
 
+def do_timeline(cur, p):
+    """What was learned around one memory: its author's rows just before and after it, in the
+    same project (or anywhere, for a row without one), oldest first, as compact index lines with
+    the anchor marked. Borrowed from claude-mem's timeline: the neighbours of a hit are often the
+    context that explains it. Readability is the views' rule (mem.may_read); history is included
+    only on request, as in search."""
+    try:
+        mid = int(p["id"])
+        before = max(0, min(10, int(p.get("before", 3))))
+        after = max(0, min(10, int(p.get("after", 3))))
+    except (KeyError, TypeError, ValueError):
+        raise SystemExit("timeline takes an integer id, and before/after of 0..10")
+    cur.execute("""SELECT author, project, created_at FROM mem.memories m
+                   WHERE id=%s AND mem.may_read(m.author, m.scope, m.project)""", (mid,))
+    anchor = cur.fetchone()
+    if not anchor:
+        return "(not found)"                  # same answer as get: existence is not disclosed
+    author, project, at = anchor
+    status = "" if p.get("include_inactive") else "AND m.status = 'active'"
+    cols = """m.id, m.memory_type::text, m.status::text, m.importance, m.confidence,
+              m.created_at::date::text, m.valid_from::date::text, m.valid_to::date::text,
+              m.project, m.content"""
+    scope = """m.author = %s AND m.project IS NOT DISTINCT FROM %s
+               AND mem.may_read(m.author, m.scope, m.project)
+               AND (m.metadata->>'kind') IS DISTINCT FROM 'page'"""
+    cur.execute(f"""SELECT {cols} FROM mem.memories m WHERE {scope} {status}
+                    AND (m.created_at, m.id) < (%s, %s)
+                    ORDER BY m.created_at DESC, m.id DESC LIMIT %s""",
+                (author, project, at, mid, before))
+    older = list(reversed(cur.fetchall()))
+    cur.execute(f"SELECT {cols} FROM mem.memories m WHERE m.id = %s", (mid,))
+    middle = cur.fetchall()
+    cur.execute(f"""SELECT {cols} FROM mem.memories m WHERE {scope} {status}
+                    AND (m.created_at, m.id) > (%s, %s)
+                    ORDER BY m.created_at, m.id LIMIT %s""",
+                (author, project, at, mid, after))
+    newer = cur.fetchall()
+    return "\n".join([fmt_brief(r) for r in older]
+                     + [fmt_brief(r, mark=" <- this one") for r in middle]
+                     + [fmt_brief(r) for r in newer])
+
+
+def _get_one(cur, mid, as_json):
+    """`get` for one id: the text form with provenance, or the row as JSON (None if unseen)."""
+    # Reads the base table deliberately -- `get` must still show a superseded or
+    # out-of-window row, which mem.active_memories excludes by design -- but through
+    # mem.may_read, the same rule the views use. The first version of this check tested
+    # `scope='project'` and forgot membership, so any project-scoped row in ANY project was
+    # fetchable by number: the rule was written out by hand here instead of being called,
+    # and the hand-written copy was wrong.
+    cur.execute("""SELECT m.id, m.memory_type::text, m.status::text, m.importance,
+                   m.confidence, m.created_at::date::text, m.valid_from::date::text,
+                   m.valid_to::date::text, m.project, m.content, 0.0,
+                   m.title, m.supersedes_id,
+                   (SELECT id FROM mem.memories s WHERE s.supersedes_id = m.id
+                      AND mem.may_read(s.author, s.scope, s.project) LIMIT 1),
+                   m.author, m.scope::text
+                   FROM mem.memories m
+                   WHERE m.id=%s
+                     AND mem.may_read(m.author, m.scope, m.project)""", (mid,))
+    r = cur.fetchone()
+    if as_json:
+        # The row only: what a script needs to show it to a model or a person. Provenance,
+        # evidence and assertions stay with the text form.
+        return row_json(r[:10] + (0.0,)) if r else None
+    elif not r:
+        # Deliberately the same answer as a missing id. "You may not see #123" tells a
+        # caller that #123 exists and whose it is -- which is most of what they wanted.
+        print("(not found)")
+    else:
+        print(fmt_row(r[:11]))
+        if r[14]:
+            print(f"  author: {r[14]} ({r[15]})")
+        cur.execute("SELECT observer, observed FROM mem.perspective_graph "
+                    "WHERE memory_id=%s", (mid,))
+        perspective = cur.fetchone()
+        if perspective:
+            observer, observed = perspective
+            print(f"  perspective: {observer['name']} -> {observed['name']}")
+        cur.execute("""SELECT evidence_memory_id, derived_memory_id, relation::text,
+                              confidence, coalesce(note,'')
+                       FROM mem.derivations
+                       WHERE evidence_memory_id=%s OR derived_memory_id=%s
+                       ORDER BY id""", (mid, mid))
+        for evidence_id, derived_id, relation, confidence, note in cur.fetchall():
+            arrow = f"#{evidence_id} -[{relation}]-> #{derived_id}"
+            print(f"  evidence: {arrow} ({confidence:.2f})"
+                  f"{(' — ' + note) if note else ''}")
+        if r[12]:
+            print(f"  supersedes: #{r[12]}")
+        if r[13]:
+            print(f"  superseded by: #{r[13]}")
+        # Reached only after the row above passed the scope check, so these two need no
+        # filter of their own -- but they DID need one before it existed: they are keyed by
+        # memory_id alone, and mem.sources carries session ids and raw transcript excerpts.
+        cur.execute("""SELECT predicate, coalesce(object_text, object_number::text),
+                       coalesce(unit,'') FROM mem.assertions WHERE memory_id=%s""",
+                    (mid,))
+        for pred, obj, unit in cur.fetchall():
+            print(f"  assert: {pred} = {obj}{(' ' + unit) if unit else ''}")
+        cur.execute("""SELECT source_type, coalesce(channel,''), coalesce(session_id,''),
+                       coalesce(excerpt,'') FROM mem.sources WHERE memory_id=%s""",
+                    (mid,))
+        for st, ch, sid, exc in cur.fetchall():
+            print(f"  source: {st}{(' via ' + ch) if ch else ''}"
+                  f"{(' — ' + exc[:120]) if exc else ''}")
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     p = json.loads(sys.stdin.read() or "{}")
@@ -1887,7 +2006,9 @@ def main():
             if not rows:
                 print("(no memories found)")
             for r in rows:
-                print(fmt_row(r))
+                print(fmt_brief(r) if p.get("brief") else fmt_row(r))
+            if rows and p.get("brief"):
+                print(f"(full text: get with ids={[r[0] for r in rows]})")
     elif cmd == "context":
         result = do_context(cur, p)
         conn.commit()
@@ -2015,69 +2136,23 @@ def main():
             else:
                 print(f"marked [#{p['id']}] {status}" if row else "(not found)")
     elif cmd == "get":
-        # Reads the base table deliberately -- `get` must still show a superseded or
-        # out-of-window row, which mem.active_memories excludes by design -- but through
-        # mem.may_read, the same rule the views use. The first version of this check tested
-        # `scope='project'` and forgot membership, so any project-scoped row in ANY project was
-        # fetchable by number: the rule was written out by hand here instead of being called,
-        # and the hand-written copy was wrong.
-        cur.execute("""SELECT m.id, m.memory_type::text, m.status::text, m.importance,
-                       m.confidence, m.created_at::date::text, m.valid_from::date::text,
-                       m.valid_to::date::text, m.project, m.content, 0.0,
-                       m.title, m.supersedes_id,
-                       (SELECT id FROM mem.memories s WHERE s.supersedes_id = m.id
-                          AND mem.may_read(s.author, s.scope, s.project) LIMIT 1),
-                       m.author, m.scope::text
-                       FROM mem.memories m
-                       WHERE m.id=%s
-                         AND mem.may_read(m.author, m.scope, m.project)""", (p["id"],))
-        r = cur.fetchone()
+        # One id, or a batch of them (`ids`, at most 20): the second half of the compact search
+        # (`brief`) -- look at the index first, then fetch the bodies worth reading.
+        ids = p.get("ids") if p.get("ids") is not None else [p.get("id")]
+        if not isinstance(ids, list) or not ids or len(ids) > 20 \
+                or not all(isinstance(x, int) and not isinstance(x, bool) for x in ids):
+            raise SystemExit("get takes an integer id, or ids: a list of 1..20 integers")
         if as_json:
-            # The row only: what a script needs to show it to a model or a person. Provenance,
-            # evidence and assertions stay with the text form.
-            print(json.dumps(row_json(r[:10] + (0.0,)) if r else None,
+            rows = [_get_one(cur, mid, True) for mid in ids]
+            print(json.dumps(rows if p.get("ids") is not None else rows[0],
                              ensure_ascii=False, default=str))
-        elif not r:
-            # Deliberately the same answer as a missing id. "You may not see #123" tells a
-            # caller that #123 exists and whose it is -- which is most of what they wanted.
-            print("(not found)")
         else:
-            print(fmt_row(r[:11]))
-            if r[14]:
-                print(f"  author: {r[14]} ({r[15]})")
-            cur.execute("SELECT observer, observed FROM mem.perspective_graph "
-                        "WHERE memory_id=%s", (p["id"],))
-            perspective = cur.fetchone()
-            if perspective:
-                observer, observed = perspective
-                print(f"  perspective: {observer['name']} -> {observed['name']}")
-            cur.execute("""SELECT evidence_memory_id, derived_memory_id, relation::text,
-                                  confidence, coalesce(note,'')
-                           FROM mem.derivations
-                           WHERE evidence_memory_id=%s OR derived_memory_id=%s
-                           ORDER BY id""", (p["id"], p["id"]))
-            for evidence_id, derived_id, relation, confidence, note in cur.fetchall():
-                arrow = f"#{evidence_id} -[{relation}]-> #{derived_id}"
-                print(f"  evidence: {arrow} ({confidence:.2f})"
-                      f"{(' — ' + note) if note else ''}")
-            if r[12]:
-                print(f"  supersedes: #{r[12]}")
-            if r[13]:
-                print(f"  superseded by: #{r[13]}")
-            # Reached only after the row above passed the scope check, so these two need no
-            # filter of their own -- but they DID need one before it existed: they are keyed by
-            # memory_id alone, and mem.sources carries session ids and raw transcript excerpts.
-            cur.execute("""SELECT predicate, coalesce(object_text, object_number::text),
-                           coalesce(unit,'') FROM mem.assertions WHERE memory_id=%s""",
-                        (p["id"],))
-            for pred, obj, unit in cur.fetchall():
-                print(f"  assert: {pred} = {obj}{(' ' + unit) if unit else ''}")
-            cur.execute("""SELECT source_type, coalesce(channel,''), coalesce(session_id,''),
-                           coalesce(excerpt,'') FROM mem.sources WHERE memory_id=%s""",
-                        (p["id"],))
-            for st, ch, sid, exc in cur.fetchall():
-                print(f"  source: {st}{(' via ' + ch) if ch else ''}"
-                      f"{(' — ' + exc[:120]) if exc else ''}")
+            for n, mid in enumerate(ids):
+                if n:
+                    print()
+                _get_one(cur, mid, False)
+    elif cmd == "timeline":
+        print(do_timeline(cur, p))
     elif cmd == "review_add":
         if p["action"] not in ("merge", "supersede", "derive"):
             raise SystemExit("review action must be merge, supersede or derive")

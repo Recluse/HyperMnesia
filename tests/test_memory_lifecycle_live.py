@@ -733,6 +733,57 @@ def main():
         same = [g["id"] for g in grp if g["content"].startswith("backup ")]
         check("equal importance falls back to newest first, then id",
               same == sorted(same, reverse=True), str(same))
+
+        print("\n== compact index, batch get, timeline ==")
+        seq = [write(ac, alice, type="semantic", content=f"kernel note {n}: " + "detail " * 30)
+               for n in range(5)]
+        other_project = write(ac, alice, type="semantic", content="kernel note elsewhere",
+                              project=P2)
+        bobs = write(bc, bob, type="semantic", content="kernel note by bob")
+        secret = write(ac, alice, type="semantic", content="kernel private note", scope="private")
+        out = cli("search", {"query": "kernel note", "k": 5, "brief": True})
+        lines = [l for l in out.splitlines() if l.startswith("[#")]
+        check("brief search: one short line per hit, with a token estimate",
+              lines and all("tok" in l and len(l) < 220 for l in lines), out)
+        check("brief search: ends with the ids to fetch",
+              "get with ids=[" in out.splitlines()[-1], out.splitlines()[-1])
+        out = cli("get", {"ids": [seq[0], seq[1]]})
+        check("get with ids returns each row", f"[#{seq[0]}]" in out and f"[#{seq[1]}]" in out, out)
+        got = json.loads(cli("get", {"ids": [seq[0], secret], "format": "json"}, who="bob"))
+        check("a batch get as JSON is a list; a row the reader may not see is null",
+              isinstance(got, list) and got[0]["id"] == seq[0] and got[1] is None, str(got))
+        try:
+            cli("get", {"ids": list(range(1, 30))})
+            refused = False
+        except SystemExit:
+            refused = True
+        check("more than 20 ids are refused", refused)
+        out = cli("timeline", {"id": seq[2], "before": 1, "after": 1})
+        tl = out.splitlines()
+        check("timeline: the row and one neighbour on each side, oldest first",
+              [l.split("]")[0] for l in tl] == [f"[#{seq[1]}", f"[#{seq[2]}", f"[#{seq[3]}"], out)
+        check("timeline: the anchor is marked", "<- this one" in tl[1] if len(tl) > 1 else False, out)
+        check("timeline: other projects and other authors stay out",
+              f"#{other_project}]" not in out and f"#{bobs}]" not in out, out)
+        check("timeline of a row the reader may not see says not found",
+              cli("timeline", {"id": secret}, who="bob") == "(not found)")
+        owner_sql("UPDATE mem.memories SET metadata = metadata || '{\"kind\":\"page\"}' "
+                  "WHERE id=%s", (seq[3],))
+        out = cli("timeline", {"id": seq[2], "before": 0, "after": 1})
+        check("timeline: a knowledge page is not a neighbour",
+              [l.split("]")[0] for l in out.splitlines()] == [f"[#{seq[2]}", f"[#{seq[4]}"], out)
+        owner_sql("UPDATE mem.memories SET status='retracted' WHERE id=%s", (seq[1],))
+        out = cli("timeline", {"id": seq[2], "before": 1, "after": 0})
+        check("timeline: history only on request",
+              f"#{seq[1]}]" not in out
+              and f"#{seq[1]}]" in cli("timeline", {"id": seq[2], "before": 1, "after": 0,
+                                                    "include_inactive": True}), out)
+        try:
+            cli("timeline", {"id": seq[2], "before": "many"})
+            refused = False
+        except SystemExit:
+            refused = True
+        check("timeline refuses a malformed window", refused)
     finally:
         for conn in (alice, bob):
             conn.rollback()

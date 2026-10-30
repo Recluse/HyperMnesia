@@ -571,3 +571,21 @@ fn children_inherit_the_pinned_scripts_and_a_missing_one_stays_in_its_release() 
                "a script missing at start-up was picked up from the next release: {v}");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn memory_timeline_and_batch_get_reach_mem_ops() {
+    // The stub mem_ops answers "op <command>": the new tool is dispatched to `timeline`, and a
+    // batch get to `get`, each behind the untrusted-data notice.
+    let mut s = Session::start("timeline");
+    s.send(Session::call(1, "memory_timeline", json!({"id": 3, "before": 1, "after": 1})));
+    s.send(Session::call(2, "memory_get", json!({"ids": [3, 4]})));
+    let mut got = std::collections::HashMap::new();
+    while got.len() < 2 {
+        let v = s.next(Duration::from_secs(15)).expect("answered");
+        got.insert(v["id"].as_i64().unwrap(), v["result"]["content"][0]["text"].as_str()
+            .unwrap_or_default().to_string());
+    }
+    assert!(got[&1].contains("untrusted reference data") && got[&1].ends_with("op timeline"),
+            "{}", got[&1]);
+    assert!(got[&2].ends_with("op get"), "{}", got[&2]);
+}
