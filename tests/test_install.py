@@ -48,10 +48,11 @@ prev = git(repo, "rev-parse", "--short=12", "HEAD~1")
 third = git(repo, "rev-parse", "--short=12", "HEAD~2")
 
 
-def run(home, *args, ok=True, script=INSTALL):
+def run(home, *args, ok=True, script=INSTALL, env_extra=None):
     env = {k: v for k, v in os.environ.items() if k not in ("HYPERMNESIA_HOME", "HYPERMNESIA_ENV_FILE")}
     env["HOME"] = str(home)
     env["USERPROFILE"] = str(home)
+    env.update(env_extra or {})
     r = subprocess.run([sys.executable, str(script), *args], env=env, capture_output=True,
                        text=True)
     if ok:
@@ -366,6 +367,55 @@ home3 = tmp / "home3"
 (home3 / ".HyperMnesia").chmod(0o700)
 r = run(home3, "--mcp-binary", str(fake), ok=False)
 assert r.returncode != 0 and "real directory" in r.stderr, r.stdout + r.stderr
+
+# -- the console across upgrades -------------------------------------------------------------
+# A stand-in cargo (CARGO): it "builds" each binary as a text naming the crate and its features,
+# so which build landed where can be read back without a Rust toolchain.
+fake_cargo = tmp / "fake-cargo"
+fake_cargo.write_text("""#!%s
+import os, sys
+a = sys.argv[1:]
+crate = os.path.basename(os.path.dirname(a[a.index("--manifest-path") + 1]))
+feat = a[a.index("--features") + 1] if "--features" in a else ""
+out = os.path.join(os.environ["CARGO_TARGET_DIR"], "release")
+os.makedirs(out, exist_ok=True)
+names = ["hypermnesia-mcp"] if crate == "mcp-server" else \\
+    ["hypermnesia", "hypermnesia-stats", "hypermnesia-jobs", "hypermnesia-settings", "hypermnesia-setup"]
+for n in names:
+    with open(os.path.join(out, n), "w") as fh:
+        fh.write(crate + " features=" + feat + "\\n")
+""" % sys.executable)
+fake_cargo.chmod(0o755)
+cg = {"CARGO": str(fake_cargo)}
+home12 = tmp / "home12"
+(home12 / ".claude").mkdir(parents=True)
+rels12 = home12 / ".HyperMnesia" / "releases"
+tray_bin = lambda sha: (rels12 / sha / "bin" / "hypermnesia").read_text()
+run(home12, "--mcp-binary", str(fake), "--ref", "HEAD~2", "--console=tray", env_extra=cg)
+assert tray_bin(third) == "console features=tray\n"
+assert "console_features=tray" in (rels12 / third / "RELEASE").read_text()
+# An ordinary upgrade, no --console: the console comes along, with the same features.
+r = run(home12, "--mcp-binary", str(fake), "--ref", "HEAD~1", env_extra=cg)
+assert tray_bin(prev) == "console features=tray\n", r.stdout
+assert "replaced release has the console" in r.stdout, r.stdout
+# The same commit with other features asked for: built into the release, not reused as it is.
+r = run(home12, "--mcp-binary", str(fake), "--ref", "HEAD~1", "--console", env_extra=cg)
+assert tray_bin(prev) == "console features=\n", r.stdout
+rec = (rels12 / prev / "RELEASE").read_text()
+assert rec.count("console_features=") == 1 and "console_features=\n" in rec, rec
+r = run(home12, "--mcp-binary", str(fake), "--ref", "HEAD~1", "--console", env_extra=cg)
+assert "console built" not in r.stdout, "the same request rebuilt the console"
+# --no-console leaves it out, even though the replaced release has one.
+run(home12, "--mcp-binary", str(fake), "--ref", "HEAD", "--no-console", env_extra=cg)
+assert not (rels12 / head / "bin" / "hypermnesia").exists()
+r = run(home12, "--mcp-binary", str(fake), "--console", "--no-console", ok=False, env_extra=cg)
+assert r.returncode != 0 and "contradict" in r.stderr, r.stderr
+# Without --mcp-binary the MCP server is built by cargo too, into the home's build directory.
+home13 = tmp / "home13"
+(home13 / ".claude").mkdir(parents=True)
+run(home13, env_extra=cg)
+assert (home13 / ".HyperMnesia" / "releases" / head / "bin" / BIN).read_text() == "mcp-server features=\n"
+assert (home13 / ".HyperMnesia" / "build" / "mcp-server-target" / "release" / BIN).exists()
 
 # -- path rewriting, on the raw text ---------------------------------------------------------
 # Spaces and apostrophes inside a path, Windows separators as escaped in JSON/TOML, quoted and bare

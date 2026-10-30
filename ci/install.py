@@ -26,7 +26,11 @@ Steps, each idempotent -- a second run with the same ref changes nothing:
     elsewhere (a machine without a Rust toolchain). It lands in releases/<sha>/bin/. --console
     builds the console crate too (optionally with cargo features, e.g. --console=tray on Linux)
     and puts its binaries beside it; a console started from there installs its autostart entry
-    pointing into `current`, not into the release it happened to start from.
+    pointing into `current`, not into the release it happened to start from. So that an
+    ordinary upgrade does not take that binary away, the console is built by default whenever
+    the release being replaced has one, with the features RELEASE records for it
+    (--no-console to leave it out); a reused release whose console was built with other
+    features than asked for is rebuilt, not silently reused.
  3. The move out of ~/.claude: hypermnesia.env and the state files an older install kept there.
     state/ is created only after the move, and the hooks use it only once it exists (until then
     they keep using ~/.claude), so state is never split between the two. Locks are not moved, and
@@ -126,7 +130,8 @@ def cargo_build(home, tree, crate, features=None):
     """`cargo build --release --locked` of one crate of a release tree, into a target directory
     under the home that outlives the release, so the next install's build is incremental."""
     target = os.path.join(home, "build", f"{crate}-target")
-    cmd = ["cargo", "build", "--release", "--locked",
+    # CARGO names another cargo, as it does for cargo's own tools (and for the tests here).
+    cmd = [os.environ.get("CARGO") or "cargo", "build", "--release", "--locked",
            "--manifest-path", os.path.join(tree, crate, "Cargo.toml")]
     if features:
         cmd += ["--features", features]
@@ -156,20 +161,76 @@ def add_console(home, tree, bindir, features):
     return got
 
 
+def read_release(rel):
+    """The KEY=value lines of a release's RELEASE file, or {} when it has none."""
+    out = {}
+    try:
+        with open(os.path.join(rel, "RELEASE"), encoding="utf-8") as fh:
+            for line in fh:
+                k, sep, v = line.rstrip("\n").partition("=")
+                if sep:
+                    out[k] = v
+    except OSError:
+        pass
+    return out
+
+
+def console_of(rel):
+    """The cargo features the console in this release was built with ("" for none), or None when
+    the release has no console -- or has one from before the features were recorded, which is
+    rebuilt rather than guessed at."""
+    if not os.path.isfile(os.path.join(rel, "bin", CONSOLE_BINS[1])):
+        return None
+    return read_release(rel).get("console_features")
+
+
+def wanted_console(home, requested, no_console):
+    """The console features this install builds, or None for no console.
+
+    Asked for: what was asked. Not asked for: whatever the release `current` points at has, so an
+    ordinary upgrade keeps an installed tray -- its autostart entry names current/bin/hypermnesia,
+    and a new release without it would take the binary away at the next login. --no-console
+    means none."""
+    if no_console:
+        return None
+    if requested is not None:
+        return requested
+    before = current_target(home)
+    had = console_of(os.path.join(home, "releases", before)) if before else None
+    if had is not None:
+        say(f"-- the replaced release has the console (features: {had or 'none'}): building it "
+            "again (--no-console to leave it out)")
+    return had
+
+
+def _record_console(rel, got, features):
+    """Rewrite the console lines of a release's RELEASE file, keeping every other line."""
+    path = os.path.join(rel, "RELEASE")
+    with open(path, encoding="utf-8") as fh:
+        keep = [l for l in fh if not l.startswith(("console=", "console_features="))]
+    tmp = f"{path}.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.writelines(keep)
+        fh.write(f"console={' '.join(got)}\nconsole_features={features}\n")
+    os.replace(tmp, path)
+
+
 def build_release(home, sha, ref, mcp_binary, console, dry):
     releases = os.path.join(home, "releases")
     final = os.path.join(releases, sha)
     if os.path.exists(os.path.join(final, "RELEASE")):
         say(f"-- release {sha}: already installed, reused")
         bindir = os.path.join(final, "bin")
-        if console is not None and not os.path.isfile(os.path.join(bindir, CONSOLE_BINS[1])):
+        if console is not None and console_of(final) != console:
+            # Not there, or built with other features (a tray asked for over a console without
+            # one): built into the release as asked, never silently reused.
             if dry:
-                say(f"-- release {sha}: would add the console")
+                say(f"-- release {sha}: would build the console (features: {console or 'none'})")
             else:
                 got = add_console(home, final, bindir, console)
-                with open(os.path.join(final, "RELEASE"), "a", encoding="utf-8") as fh:
-                    fh.write(f"console={' '.join(got)} (added {stamp()})\n")
-                say(f"-- release {sha}: console added ({', '.join(got)})")
+                _record_console(final, got, console)
+                say(f"-- release {sha}: console built (features: {console or 'none'}): "
+                    f"{', '.join(got)}")
         return final
     if dry:
         say(f"-- release {sha}: would be built from {ref}")
@@ -204,7 +265,8 @@ def build_release(home, sha, ref, mcp_binary, console, dry):
             os.chmod(dst, 0o755)
         extra = ""
         if console is not None:
-            extra = f"console={' '.join(add_console(home, tmp, bindir, console))}\n"
+            extra = (f"console={' '.join(add_console(home, tmp, bindir, console))}\n"
+                     f"console_features={console}\n")
         with open(os.path.join(tmp, "RELEASE"), "w", encoding="utf-8") as fh:
             fh.write(f"commit={git('rev-parse', sha)}\nref={ref}\ninstalled={stamp()}\n"
                      f"mcp={built}\n{extra}repo={REPO}\n")
@@ -680,7 +742,10 @@ def main():
     ap.add_argument("--mcp-binary", help="use this hypermnesia-mcp instead of building one")
     ap.add_argument("--console", nargs="?", const="", default=None, metavar="FEATURES",
                     help="also build the console into the release (FEATURES: cargo features, "
-                         "e.g. tray on Linux)")
+                         "e.g. tray on Linux); by default it is built when the release being "
+                         "replaced has it, with the same features")
+    ap.add_argument("--no-console", action="store_true",
+                    help="do not build the console, even when the replaced release has it")
     ap.add_argument("--keep", type=int, default=3, help="releases to keep (default 3)")
     ap.add_argument("--prune-age", type=int, default=30,
                     help="never prune a release that was current fewer than this many days ago "
@@ -691,6 +756,8 @@ def main():
     a = ap.parse_args()
     if a.keep < 1:
         die("--keep must be at least 1")
+    if a.console is not None and a.no_console:
+        die("--console and --no-console contradict each other")
     if a.mcp_binary and not os.path.isfile(a.mcp_binary):
         die(f"--mcp-binary {a.mcp_binary}: no such file")
     if os.path.exists(os.path.join(REPO, "RELEASE")):
@@ -717,7 +784,8 @@ def main():
     if not a.dry_run:
         make_private_dir(home)
         os.makedirs(os.path.join(home, "logs"), mode=0o700, exist_ok=True)
-    build_release(home, sha, a.ref, a.mcp_binary, a.console, a.dry_run)
+    console = wanted_console(home, a.console, a.no_console)
+    build_release(home, sha, a.ref, a.mcp_binary, console, a.dry_run)
     running = legacy_jobs_running()           # again: a timer may have fired during the build
     if running and not os.path.isdir(os.path.join(home, "state")):
         die(f"a job of the old layout started during the build ({', '.join(running)}); the "

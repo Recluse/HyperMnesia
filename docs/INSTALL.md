@@ -197,7 +197,8 @@ Windows (`HYPERMNESIA_HOME`, default `~/.HyperMnesia`):
 ./hm install --wire                     # HEAD: build the MCP server, switch current, wire configs
 ./hm install --ref 1a2b3c4 --wire       # a particular commit
 ./hm install --mcp-binary <path>        # a machine without Rust: a binary built elsewhere
-./hm install --console                  # the console's binaries too (--console=tray on Linux)
+./hm install --console                  # the console's binaries too (--console=tray on Linux);
+                                        # kept by later installs, same features (--no-console)
 ./hm install --dry-run                  # what would happen; changes nothing
 ./hm install --ref <previous sha>       # rollback: the release is still there, current switches
 ```
