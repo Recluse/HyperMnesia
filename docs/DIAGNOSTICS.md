@@ -30,7 +30,7 @@ reference, not a runbook: nothing here needs doing until something looks off.
 | That scope has `must` rules | a map with only `should`/`info` | the pre-edit hook injects `must` only, so it would stay silent by design |
 | Embedder reachable | a down or unconfigured embedder | search degrades to lexical-only rather than failing |
 | **Embedder matches the stored vectors** | up to 3 random chunks re-embedded through the configured embedder; warns above a cosine distance of 1e-3 from the stored vector. Skipped, and says so, when the embedder does not answer | `embedding_model` is a label from the config, not a fingerprint: a model re-published under the same tag moves every query vector away from the corpus with no error |
-| **Extraction is current** | the newest memory the extractor wrote for `MEM_AUTHOR` is older than `HM_EXTRACT_MAX_AGE_HOURS` (72); the transcript queue depth (`~/.claude/mem-queue.jsonl` minus done); a queue with no identity to write it | the extractor runs from a timer and can stop for good while the store keeps answering from what it already holds |
+| **Extraction is current** | the newest memory the extractor wrote for `MEM_AUTHOR` is older than `HM_EXTRACT_MAX_AGE_HOURS` (72); the transcript queue depth (`mem-queue.jsonl` minus done, in `~/.HyperMnesia/state/`, or `~/.claude/` before `./hm install`); a queue with no identity to write it | the extractor runs from a timer and can stop for good while the store keeps answering from what it already holds |
 | Reranker reachable | a down reranker, or one that idle-unloaded | search fails **open** to plain RRF, which looks like working search with worse ranking |
 
 A non-zero exit means something in the FAIL column; warnings do not fail the command.
@@ -169,7 +169,7 @@ have. What it says, and what each line means:
 | `systemd reloaded the unit but reports a different schedule than was set (...) -- the file was restored` (Linux) | the read-back after a reload did not match what was asked; the console does not call an edit done on the strength of an exit code alone |
 | `<name> ran and exited <code>` | `run` succeeded in the sense of starting; the program itself failed. The exit code is read back from `ExecMainStatus`/`InvocationID` after the request, not assumed from `systemctl start`'s own success |
 | `<timer> is masked -- unmask it first: systemctl --user unmask <timer>` (Linux) | `enable`/`disable` refuses a masked unit rather than fighting the mask |
-| `autostart starts <path>, not this binary (<path>)` | the installed autostart unit points at a binary that has moved, been rebuilt elsewhere, or been deleted — it will fail at every login with nothing on screen to say so until this line does |
+| `autostart starts <path>, not this binary (<path>)` | the installed autostart unit points at a binary that has moved, been rebuilt elsewhere, or been deleted — it will fail at every login with nothing on screen to say so until this line does. A tray running from an installed release is compared by the name its autostart entry uses, `~/.HyperMnesia/current/bin/hypermnesia`, not by the `releases/<sha>/` path it was started from |
 
 Schedules are read the way each backend means them. On macOS an omitted `StartCalendarInterval`
 field is a wildcard, so `{Minute: 15}` is "hourly at :15" and `{Day: 1, Hour: 3}` is "monthly day 1

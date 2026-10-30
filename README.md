@@ -259,6 +259,8 @@ edit.
                                    # waits for Postgres, applies the migrations (hm migrate)
 export DATABASE_URL=...            # init prints the exact line
 ./hm ingest /path/to/your/repo myrepo    # ingest -> embed -> ANN index -> doctor
+./hm install --wire                # this commit as ~/.HyperMnesia/current: the MCP server built,
+                                   # agent configs pointed at it rather than at this checkout
 ```
 
 **Have a folder of notes wired into `CLAUDE.md`?** Ingest it and then take it out of `CLAUDE.md`.

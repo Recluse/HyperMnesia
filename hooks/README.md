@@ -41,16 +41,18 @@ for `Edit`, `Write`, and `MultiEdit` alike (all carry the target at `tool_input.
 ## Wire the event hooks
 
 In Claude Code settings (`~/.claude/settings.json`), point each event at the script with your
-env (`DATABASE_URL`, `EMBED_BACKEND`, and `HM_LLM*` for the schedule jobs). Example:
+env (`DATABASE_URL`, `EMBED_BACKEND`, and `HM_LLM*` for the schedule jobs). The paths below are
+the installed release (`./hm install`, [docs/INSTALL.md](../docs/INSTALL.md#installing-a-release)),
+not a checkout: `./hm install --wire` rewrites hook commands that still name one. Example:
 
 ```json
 {
   "hooks": {
-    "PreToolUse":      [{"matcher": "Edit|Write|MultiEdit", "hooks": [{"type": "command", "command": "python3 /opt/hypermnesia/hooks/arch_invariants.py"}]}],
-    "SessionStart":    [{"hooks": [{"type": "command", "command": "python3 /opt/hypermnesia/hooks/mem_profile.py"}]}],
-    "UserPromptSubmit":[{"hooks": [{"type": "command", "command": "python3 /opt/hypermnesia/hooks/mem_recall.py"}]}],
-    "SessionEnd":      [{"hooks": [{"type": "command", "command": "python3 /opt/hypermnesia/hooks/mem_capture.py"}]}],
-    "PreCompact":      [{"hooks": [{"type": "command", "command": "python3 /opt/hypermnesia/hooks/mem_capture.py"}]}]
+    "PreToolUse":      [{"matcher": "Edit|Write|MultiEdit", "hooks": [{"type": "command", "command": "python3 /home/you/.HyperMnesia/current/hooks/arch_invariants.py"}]}],
+    "SessionStart":    [{"hooks": [{"type": "command", "command": "python3 /home/you/.HyperMnesia/current/hooks/mem_profile.py"}]}],
+    "UserPromptSubmit":[{"hooks": [{"type": "command", "command": "python3 /home/you/.HyperMnesia/current/hooks/mem_recall.py"}]}],
+    "SessionEnd":      [{"hooks": [{"type": "command", "command": "python3 /home/you/.HyperMnesia/current/hooks/mem_capture.py"}]}],
+    "PreCompact":      [{"hooks": [{"type": "command", "command": "python3 /home/you/.HyperMnesia/current/hooks/mem_capture.py"}]}]
   }
 }
 ```
@@ -69,8 +71,8 @@ drop straight into `~/.codex/hooks.json`:
 ```json
 {
   "hooks": {
-    "SessionStart":    [{"hooks": [{"type": "command", "command": "python3 /opt/hypermnesia/hooks/mem_profile.py"}]}],
-    "UserPromptSubmit":[{"hooks": [{"type": "command", "command": "python3 /opt/hypermnesia/hooks/mem_recall.py"}]}]
+    "SessionStart":    [{"hooks": [{"type": "command", "command": "python3 /home/you/.HyperMnesia/current/hooks/mem_profile.py"}]}],
+    "UserPromptSubmit":[{"hooks": [{"type": "command", "command": "python3 /home/you/.HyperMnesia/current/hooks/mem_recall.py"}]}]
   }
 }
 ```
@@ -99,7 +101,7 @@ The hooks read `DATABASE_URL` / `EMBED_BACKEND` from their environment (Claude C
 shell env through). Keep those exported, or set them in the hook command.
 
 The pipeline's tunables — thresholds, model names, batch sizes — come from one shared file
-instead, `~/.claude/hypermnesia.env`, which `_mem_common.py` loads on import, before any module
+instead, `~/.HyperMnesia/hypermnesia.env`, which `_mem_common.py` loads on import, before any module
 computes its constants. A variable already in the environment beats it, so a one-off run with a
 different threshold needs no edit. That matters most for the scheduled passes below: launchd and
 cron give them a minimal environment with none of your shell's exports, so for them the file is
@@ -118,13 +120,23 @@ Kubernetes placement.
 
 cron:
 ```cron
-0 */4 * * *  cd /opt/hypermnesia && DATABASE_URL=... HM_LLM_BACKEND=ollama HM_LLM_MODEL=qwen2.5:7b python3 hooks/mem_extract.py
-30 5 * * *   cd /opt/hypermnesia && DATABASE_URL=... HM_LLM_BACKEND=ollama HM_LLM_MODEL=qwen2.5:7b python3 hooks/mem_consolidate.py
-50 5 * * *   cd /opt/hypermnesia && DATABASE_URL=... HM_LLM_BACKEND=ollama HM_LLM_MODEL=qwen2.5:7b python3 hooks/mem_reflect.py
-10 6 * * *   cd /opt/hypermnesia && DATABASE_URL=... HM_LLM_BACKEND=ollama HM_LLM_MODEL=qwen2.5:7b python3 hooks/mem_dream.py
+0 */4 * * *  cd ~/.HyperMnesia/current && DATABASE_URL=... HM_LLM_BACKEND=ollama HM_LLM_MODEL=qwen2.5:7b python3 hooks/mem_extract.py
+30 5 * * *   cd ~/.HyperMnesia/current && DATABASE_URL=... HM_LLM_BACKEND=ollama HM_LLM_MODEL=qwen2.5:7b python3 hooks/mem_consolidate.py
+50 5 * * *   cd ~/.HyperMnesia/current && DATABASE_URL=... HM_LLM_BACKEND=ollama HM_LLM_MODEL=qwen2.5:7b python3 hooks/mem_reflect.py
+10 6 * * *   cd ~/.HyperMnesia/current && DATABASE_URL=... HM_LLM_BACKEND=ollama HM_LLM_MODEL=qwen2.5:7b python3 hooks/mem_dream.py
 ```
 
 systemd timer, launchd agent, or any scheduler works equally — they just invoke the scripts.
+Point it at `~/.HyperMnesia/current`, never at a checkout: a scheduled job runs whatever the tree
+it names holds at that moment.
+
+The jobs keep their state -- the transcript queue (`mem-queue.jsonl`) and its done list, the
+profile cache, the fault markers and the locks -- in `~/.HyperMnesia/state/` once `./hm install`
+has created it, and in `~/.claude/` until then (`state_path()` in `_mem_common.py`). Never in
+both: the installer moves everything and creates `state/` last, and no hook moves anything
+itself. A queue a hook of the old layout still appends to in `~/.claude` after the switch is
+read by the extractor as a second source, and removed once it has been quiet for a day and
+everything in it is done.
 On macOS, `hypermnesia-jobs` (in `console/`) lists whatever launchd holds, runs one now, and
 changes a schedule without hand-editing a plist.
 

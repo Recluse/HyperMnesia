@@ -70,14 +70,14 @@ Both are just MCP servers. In Claude Code's `.mcp.json`:
 {
   "mcpServers": {
     "hypermnesia": {
-      "command": "/opt/hypermnesia/mcp-server/target/release/hypermnesia-mcp",
+      "command": "/home/you/.HyperMnesia/current/bin/hypermnesia-mcp",
       "env": {
         "HM_REPO": "myrepo",
         "DATABASE_URL": "postgresql://hm:pass@localhost:5432/hypermnesia",
         "EMBED_BACKEND": "ollama",
-        "HM_SEARCH":  "/opt/hypermnesia/ingest/search.py",
-        "HM_MEM_OPS": "/opt/hypermnesia/ingest/mem_ops.py",
-        "HM_RERANK":  "/opt/hypermnesia/rerank/search_reranked.py"
+        "HM_SEARCH":  "/home/you/.HyperMnesia/current/ingest/search.py",
+        "HM_MEM_OPS": "/home/you/.HyperMnesia/current/ingest/mem_ops.py",
+        "HM_RERANK":  "/home/you/.HyperMnesia/current/rerank/search_reranked.py"
       }
     },
     "serena": {
@@ -159,7 +159,7 @@ Dreamer can propose new deductions or patterns, but only review approval can wri
 Dialectic takes one bounded context and returns cited claims or an abstention — see `MEMORY.md`.
 
 **Configuration (shared):** the tunables the passes read — thresholds, model names, batch sizes —
-come from one file, `~/.claude/hypermnesia.env`, loaded on import by `hooks/_mem_common.py` and
+come from one file, `~/.HyperMnesia/hypermnesia.env`, loaded on import by `hooks/_mem_common.py` and
 `ingest/_common.py`. A variable already in the environment beats it, so a one-off run needs no
 edit. The loader refuses the file entirely unless it is the owner's private file in a private
 directory, and accepts only an exact list of names: the file must not be able to choose an

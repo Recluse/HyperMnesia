@@ -177,8 +177,9 @@ printf '{"tool_name":"Edit","cwd":"/path/to/repo","tool_input":{"file_path":"/pa
 Empty output means no `must` was selected for that path — either the globs match nothing, or
 what they match carries only `should`/`info`. Fix the globs now, because a silent Tier 1 is
 worse than none: it looks like "no rules apply". Faults are announced instead of injected, but
-only on their first occurrence: the flip is a marker file at `~/.claude/hypermnesia-<fault>`
-(`store-down`, `graph-unparseable`, `no-repo-<tag>`), so delete it to see the notice again.
+only on their first occurrence: the flip is a marker file `hypermnesia-<fault>` (`store-down`,
+`graph-unparseable`, `no-repo-<tag>`) in `~/.HyperMnesia/state/` -- in `~/.claude/` on a machine
+where `./hm install` has not run yet -- so delete it to see the notice again.
 
 ## 4. Wire both MCP servers
 
@@ -190,13 +191,13 @@ answers "where is this symbol". Do not make either do the other's job — see
 {
   "mcpServers": {
     "hypermnesia": {
-      "command": "/opt/hypermnesia/mcp-server/target/release/hypermnesia-mcp",
+      "command": "/home/you/.HyperMnesia/current/bin/hypermnesia-mcp",
       "env": {
         "HM_REPO": "<repo-tag>",
         "DATABASE_URL": "postgresql://hm:pass@localhost:5432/hypermnesia",
         "EMBED_BACKEND": "ollama",
-        "HM_SEARCH": "/opt/hypermnesia/ingest/search.py",
-        "HM_MEM_OPS": "/opt/hypermnesia/ingest/mem_ops.py"
+        "HM_SEARCH": "/home/you/.HyperMnesia/current/ingest/search.py",
+        "HM_MEM_OPS": "/home/you/.HyperMnesia/current/ingest/mem_ops.py"
       }
     },
     "serena": {
@@ -214,9 +215,9 @@ Codex CLI, which uses the same contract):
 
 ```json
 {"hooks": {
-  "PreToolUse":      [{"matcher": "Edit|Write|MultiEdit", "hooks": [{"type": "command", "command": "HM_REPO=<repo-tag> python3 /opt/hypermnesia/hooks/arch_invariants.py", "timeout": 20}]}],
-  "SessionStart":    [{"hooks": [{"type": "command", "command": "python3 /opt/hypermnesia/hooks/mem_profile.py"}]}],
-  "UserPromptSubmit":[{"hooks": [{"type": "command", "command": "python3 /opt/hypermnesia/hooks/mem_recall.py"}]}]
+  "PreToolUse":      [{"matcher": "Edit|Write|MultiEdit", "hooks": [{"type": "command", "command": "HM_REPO=<repo-tag> python3 /home/you/.HyperMnesia/current/hooks/arch_invariants.py", "timeout": 20}]}],
+  "SessionStart":    [{"hooks": [{"type": "command", "command": "python3 /home/you/.HyperMnesia/current/hooks/mem_profile.py"}]}],
+  "UserPromptSubmit":[{"hooks": [{"type": "command", "command": "python3 /home/you/.HyperMnesia/current/hooks/mem_recall.py"}]}]
 }}
 ```
 

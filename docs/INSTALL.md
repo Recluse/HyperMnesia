@@ -27,6 +27,7 @@ order that works:
 ./hm init                        # generated password, compose up, schemas and migrations loaded
 export DATABASE_URL=...          # init prints the exact line
 ./hm ingest ~/code/myrepo myrepo # ingest -> embed -> build the ANN index -> check
+./hm install --wire              # install this commit as ~/.HyperMnesia/current, build the MCP server
 ./hm doctor                      # any time you suspect the store is answering worse than it should
 ```
 
@@ -89,8 +90,8 @@ echo "$DATABASE_URL"   # put this in your shell profile and your MCP client's en
 
 # 2b. Say who you are. Writes are REFUSED without it, on a one-person store too --
 #     a memory with no author cannot be scoped, shared or revoked.
-mkdir -p ~/.claude && echo "MEM_AUTHOR=$(id -un)" >> ~/.claude/hypermnesia.env
-chmod 600 ~/.claude/hypermnesia.env
+mkdir -m 700 -p ~/.HyperMnesia && echo "MEM_AUTHOR=$(id -un)" >> ~/.HyperMnesia/hypermnesia.env
+chmod 600 ~/.HyperMnesia/hypermnesia.env
 
 # 2c. More than one person? Read "Two people, one store" below before anyone writes anything:
 #     a shared hm_app login filters, one login per author (./hm author add) enforces.
@@ -116,7 +117,8 @@ python3 -m venv rerank/.venv && rerank/.venv/bin/pip install torch transformers 
 rerank/.venv/bin/python rerank/server.py &  # 127.0.0.1:8091, lazy-loads, idle-unloads
                                             # HM_RERANK_BIND=0.0.0.0 to serve it beyond localhost
 
-# 7. Point your MCP client at mcp-server (see "MCP client" below)
+# 7. Install a release and point your MCP client at it ("Installing a release" and "MCP client"
+#    below): ./hm install builds the MCP server into ~/.HyperMnesia/current
 
 # 8. Check it. Every fault this catches leaves a system that still answers -- an unbuilt index,
 #    unembedded chunks, two embedding models in one table, a scope name off by case.
@@ -172,25 +174,92 @@ setup; you lose the reranker's precision bump but nothing else.
 
 ---
 
+## Installing a release
+
+The hooks, the scheduled passes and the MCP server should not run out of the checkout you edit.
+Whatever lands in that tree is what runs: a tree copied over it, a half-finished branch or a
+`cargo clean` changes every job and every open session at once, without a word. `./hm install`
+puts one **commit** in a directory of its own instead, the same shape on macOS, Linux and
+Windows (`HYPERMNESIA_HOME`, default `~/.HyperMnesia`):
+
+```
+~/.HyperMnesia/
+  hypermnesia.env      MEM_AUTHOR and the pipeline's tunables (600; the directory 700)
+  current -> releases/<sha>    everything that runs, runs from here
+  releases/<sha>/      `git archive` of one commit, plus bin/hypermnesia-mcp
+  previous             the release `current` replaced, kept for a rollback
+  state/               the transcript queue and its done list, caches, fault markers, locks
+  logs/                what the schedulers write, the tray's log included
+  build/               cargo's target directories, so a rebuild is incremental
+```
+
+```bash
+./hm install --wire                     # HEAD: build the MCP server, switch current, wire configs
+./hm install --ref 1a2b3c4 --wire       # a particular commit
+./hm install --mcp-binary <path>        # a machine without Rust: a binary built elsewhere
+./hm install --console                  # the console's binaries too (--console=tray on Linux)
+./hm install --dry-run                  # what would happen; changes nothing
+./hm install --ref <previous sha>       # rollback: the release is still there, current switches
+```
+
+What it does, in order (the full account is at the top of `ci/install.py`):
+
+- installs the **committed** tree, never uncommitted edits, and keeps the newest three releases
+  (`--keep`) -- never removing the one `current` points at, the one it replaced, one that was
+  still current in the last 30 days (`--prune-age`, counted from the `RETIRED` stamp a release
+  gets when `current` moves away from it), or, on Linux, one a running process was started from:
+  an open session's MCP server keeps using its own release's scripts;
+- moves `hypermnesia.env` and the hooks' state out of `~/.claude`, where an install from before
+  this layout kept them, once. The old settings name is left as a link, so a session started
+  before the switch keeps its identity (on Windows the file is copied instead, and the old one is
+  yours to delete once every session has restarted). The hooks use `state/` only once it exists and the
+  installer creates it last, so the state is never split between two places, and a checkout run
+  before any install keeps working exactly as it did. It refuses to start while a job of the old
+  layout holds a lock. Files move by rename only, so a writer holding one open loses nothing
+  (the home must therefore be on the filesystem `~/.claude` is on, and a first move that fails
+  halfway is put back rather than published); a transcript queue a hook of the old layout still
+  writes in `~/.claude` after the switch is read by the extractor as a second source and
+  retired once it has been quiet for a day and is fully done. A settings link that already points somewhere else is left as it is, and so is the file
+  `HYPERMNESIA_ENV_FILE` names;
+- switches `current` in one rename (a junction on Windows);
+- with `--wire`, rewrites every path into a checkout that the known configs name -- Claude Code
+  (`~/.claude.json`, `~/.claude/settings.json`), Codex (`~/.codex/config.toml`,
+  `~/.codex/hooks.json`), OpenCode (`~/.config/opencode/opencode.json`) and any `--wire-file`
+  (a project's `.mcp.json`) -- to the same file under `current`: the MCP binary, the hook scripts,
+  and the `HM_SEARCH` / `HM_MEM_OPS` / `HM_RERANK` scripts. Each edited file is backed up to
+  `<file>.bak-hm-<UTC time>` first, and a project's own `.claude/hooks/` is left alone. Without
+  `--wire` it lists what still points into a checkout. `--wire` is refused for a home other
+  than the default: a hook started by its client has no `HYPERMNESIA_HOME` in its environment
+  and would read the default home's state.
+
+Open sessions keep the MCP process they started (it pins the release it was launched from) and
+pick up the new one when they restart. A checkout is still fine for development: point a config
+at `mcp-server/target/release/hypermnesia-mcp` and the server finds its scripts in that tree, as
+it always did.
+
 ## MCP client
 
 Add HyperMnesia's MCP server to your client. For Claude Code, in the repo's `.mcp.json`
-(absolute paths; the server shells to `psql` and the bundled python scripts):
+(absolute paths -- JSON does not expand `~`; the server shells to `psql` and the bundled python
+scripts):
 
 ```json
 { "mcpServers": { "hypermnesia": {
-  "command": "/opt/hypermnesia/mcp-server/target/release/hypermnesia-mcp",
+  "command": "/home/you/.HyperMnesia/current/bin/hypermnesia-mcp",
   "env": {
     "HM_REPO": "myrepo",
     "DATABASE_URL": "postgresql://hm:pass@localhost:5432/hypermnesia",
     "EMBED_BACKEND": "ollama",
-    "HM_SEARCH":  "/opt/hypermnesia/ingest/search.py",
-    "HM_MEM_OPS": "/opt/hypermnesia/ingest/mem_ops.py",
-    "HM_RERANK":  "/opt/hypermnesia/rerank/search_reranked.py"
+    "HM_SEARCH":  "/home/you/.HyperMnesia/current/ingest/search.py",
+    "HM_MEM_OPS": "/home/you/.HyperMnesia/current/ingest/mem_ops.py",
+    "HM_RERANK":  "/home/you/.HyperMnesia/current/rerank/search_reranked.py"
   } } } }
 ```
 
-Build the server once: `cd mcp-server && cargo build --release`. Needs the `psql` client on
+`./hm install` builds the server into the release ([Installing a release](#installing-a-release));
+`HM_SEARCH` and `HM_MEM_OPS` may be left out, since the server finds them beside its own binary.
+For development, `cd mcp-server && cargo build --release` and name
+`<checkout>/mcp-server/target/release/hypermnesia-mcp` instead. Needs the `psql` client on
 PATH (Tier 0/1 map/constraints/get_document read the DB via `psql "$DATABASE_URL"`); the
 `HM_SEARCH`/`HM_MEM_OPS` scripts need `psycopg2` on `HM_PYTHON` (default `python3`). Omit
 `HM_RERANK` to skip reranking (plain RRF).
@@ -240,11 +309,11 @@ for source comparisons and real stdio MCP checks against a simulated DB transpor
 
 For agent-directed memory search, add the following to `~/.codex/config.toml`.
 Export your existing `DATABASE_URL`, `EMBED_BACKEND`, and `MEM_AUTHOR`; adjust the
-binary path to your checkout. This enables the reading tools:
+binary path to your home. This enables the reading tools:
 
 ```toml
 [mcp_servers.hypermnesia]
-command = "/opt/hypermnesia/mcp-server/target/release/hypermnesia-mcp"
+command = "/home/you/.HyperMnesia/current/bin/hypermnesia-mcp"
 env_vars = ["DATABASE_URL", "EMBED_BACKEND", "MEM_AUTHOR"]
 enabled_tools = ["get_project_map", "get_constraints", "locate", "get_document", "search_docs", "memory_search", "memory_perspectives", "memory_evidence", "memory_peer_card", "memory_context", "memory_ask", "memory_get", "status", "project_status"]
 tool_timeout_sec = 130
@@ -276,7 +345,7 @@ Keep machine paths and credentials out of version control.
 Merge this fragment into a Git project's `opencode.json`, or into
 `~/.config/opencode/opencode.json` for all projects. Keep your existing provider,
 model and plugins, and append the two deny rules to existing permissions.
-Use your built binary and export the same store environment as above; secrets
+Use your installed binary and export the same store environment as above; secrets
 stay in the environment, outside version control:
 
 ```json
@@ -285,7 +354,7 @@ stay in the environment, outside version control:
     "servers": {
       "HyperMnesia": {
         "type": "local",
-        "command": ["/opt/hypermnesia/mcp-server/target/release/hypermnesia-mcp"],
+        "command": ["/home/you/.HyperMnesia/current/bin/hypermnesia-mcp"],
         "environment": {
           "DATABASE_URL": "{env:DATABASE_URL}",
           "EMBED_BACKEND": "{env:EMBED_BACKEND}",
@@ -423,6 +492,16 @@ cd console && cargo build --release
 ./target/release/hypermnesia --install      # the tray, at login (launchd on macOS, a systemd user unit on Linux)
 ```
 
+Or build it into the release with `./hm install --console` (`--console=tray` for the Linux tray)
+and run it from `~/.HyperMnesia/current/bin/`. Installed from there, the tray's autostart entry
+names `current/bin/hypermnesia`, not the `releases/<sha>/` directory the running binary happens to
+be in -- old releases are pruned, and an entry naming one would stop starting at login. Run from
+a checkout, it names that checkout's binary, as before. Either way its log is
+`~/.HyperMnesia/logs/tray.log`. The setup wizard's MCP and hook blocks point into `current` when a
+release is installed, and into this checkout (with a note) when not. Its deploy steps (`hm init`,
+`hm ingest`, `hm doctor`) need a checkout: `hm init` writes the stack's generated password into
+the tree it runs from, and a release is pruned.
+
 The four command-line tools build the same way everywhere; the data layer has no dependencies at
 all. The tray itself needs a GUI toolkit, declared per platform so a machine with none of it
 installed still builds everything else:
@@ -463,7 +542,7 @@ unaligned rows. The wizard offers the four usual shapes — direct psql, `docker
 | File | What |
 |------|------|
 | `~/.config/hypermnesia/console.conf` | the console's own settings: `HM_PSQL_CMD`, `HM_JOB_PREFIX`. Created mode 600 |
-| `~/.claude/hypermnesia.env` | the pipeline's shared tunables, the file `hypermnesia-settings` writes |
+| `~/.HyperMnesia/hypermnesia.env` | the pipeline's shared tunables, the file `hypermnesia-settings` writes ([where exactly](#the-shared-settings-file)) |
 
 Both are **refused entirely**, loudly, unless the file is yours, is unwritable by any other
 account, and (on macOS) carries no access-control list — an ACL is not in the mode bits, so a
@@ -483,7 +562,7 @@ What a refusal does differs, and the difference is deliberate:
 A password inside the psql command ends up in psql's argv, where any process running as you can
 read it. `~/.pgpass` or `PGPASSWORD` in the command's own environment avoids that.
 
-`~/.claude/hypermnesia.env` may set only the tunables in the table below plus the endpoint
+`hypermnesia.env` may set only the tunables in the table below plus the endpoint
 variables; names that decide what gets EXECUTED (`HM_PYTHON`, `HM_MEM_OPS`, `HM_SEARCH`,
 `HM_RERANK`, `HM_LLM_CMD`, `PATH`, `PYTHONPATH`) are refused by name. A variable already set in the
 environment beats the file — but "the environment" means the shell that started the process, and
@@ -508,6 +587,8 @@ the file is what is in force.
 | `HM_SEARCH` | bundled `ingest/search.py` | document-search script path; environment only |
 | `HM_MEM_OPS` | bundled `ingest/mem_ops.py` | memory operation script path; environment only |
 | `HM_DIALECTIC` | bundled `hooks/mem_dialectic.py` | grounded Q&A script path; environment only |
+| `HYPERMNESIA_HOME` | `~/.HyperMnesia` | this machine's HyperMnesia directory: the settings file, `current`, `state/`, `logs/` ([Installing a release](#installing-a-release)). Read the same way by the hooks, the MCP server, the console and `./hm install`; empty counts as unset |
+| `HYPERMNESIA_ENV_FILE` | `$HYPERMNESIA_HOME/hypermnesia.env` | the settings file, named outright ([the shared settings file](#the-shared-settings-file)); empty counts as unset |
 | `HM_RERANK_BIND` | `127.0.0.1` | address the reranker listens on (the endpoint has no auth) |
 | `HM_DB_TIMEOUT_SECS` | `30` | MCP server: ceiling on one `psql` call |
 | `HM_SEARCH_TIMEOUT_SECS` | `60` | MCP server: ceiling on one search |
@@ -551,9 +632,14 @@ it listed as refused rather than applied.
 
 ### The shared settings file
 
-`~/.claude/hypermnesia.env` — one `KEY=value` file for the tunables above, written by
+`~/.HyperMnesia/hypermnesia.env` — one `KEY=value` file for the tunables above, written by
 `hypermnesia-settings set <KEY> <value>`, loaded on import by `hooks/_mem_common.py` and
-`ingest/_common.py`. `HYPERMNESIA_ENV_FILE` moves it. The rules it is read under are in
+`ingest/_common.py`, and read by the MCP server for `MEM_AUTHOR` and the dialectic timeout. All
+three find it the same way: `HYPERMNESIA_ENV_FILE` when it is set and not empty, else
+`hypermnesia.env` in `HYPERMNESIA_HOME` (default `~/.HyperMnesia`) -- or
+`~/.claude/hypermnesia.env`, where an install from before that directory kept it, for as long as
+that copy is the only one. `./hm install` moves it and leaves a link at the old name. The rules
+it is read under are in
 [The console](#the-console-optional-menu-bar--system-tray--cli) above: refused whole unless it is
 your own private file, and only the exact names listed here are accepted.
 
@@ -604,7 +690,7 @@ authorization, and the identifier must never come from an untrusted request.)*
 
 ### Identity
 
-`MEM_AUTHOR`, from `~/.claude/hypermnesia.env` (read by both the Python hooks and the Rust MCP
+`MEM_AUTHOR`, from `~/.HyperMnesia/hypermnesia.env` (read by both the Python hooks and the Rust MCP
 server, so one machine has one identity) or from the environment. A non-empty value in the
 environment decides: an invalid one leaves the process with no identity rather than falling back
 to the file. It reaches Postgres as the connection option `mem.reader` — which a shared login
