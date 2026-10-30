@@ -1919,7 +1919,11 @@ def _get_one(cur, mid, as_json):
     cur.execute("""SELECT m.id, m.memory_type::text, m.status::text, m.importance,
                    m.confidence, m.created_at::date::text, m.valid_from::date::text,
                    m.valid_to::date::text, m.project, m.content, 0.0,
-                   m.title, m.supersedes_id,
+                   m.title,
+                   -- The predecessor's id only when the reader may see that row: a bare foreign
+                   -- key would tell a reader of the new row that a hidden one exists.
+                   (SELECT o.id FROM mem.memories o WHERE o.id = m.supersedes_id
+                      AND mem.may_read(o.author, o.scope, o.project)),
                    (SELECT id FROM mem.memories s WHERE s.supersedes_id = m.id
                       AND mem.may_read(s.author, s.scope, s.project) LIMIT 1),
                    m.author, m.scope::text
@@ -2003,6 +2007,23 @@ def strip_private(text):
     return "".join(out)
 
 
+def _strip_private_deep(value):
+    if isinstance(value, str):
+        return strip_private(value) if _PRIVATE_TAG.search(value) else value
+    if isinstance(value, list):
+        return [_strip_private_deep(v) for v in value]
+    if isinstance(value, dict):
+        # Keys too: a metadata key is stored as it was given. One that is nothing but a private
+        # span goes with its value.
+        out = {}
+        for k, v in value.items():
+            key = _strip_private_deep(k) if isinstance(k, str) else k
+            if key != "":
+                out[key] = _strip_private_deep(v)
+        return out
+    return value
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     p = json.loads(sys.stdin.read() or "{}")
@@ -2010,12 +2031,14 @@ def main():
     # stdin is external by definition -- an MCP client, a hook, a person -- so none survive.
     if isinstance(p, dict):
         p = {k: v for k, v in p.items() if not str(k).startswith("_trusted")}
-        # Before anything is embedded, searched, stored or logged: the texts a caller hands in.
-        for key in ("query", "content", "title"):
-            if isinstance(p.get(key), str) and _PRIVATE_TAG.search(p[key]):
-                p[key] = strip_private(p[key]).strip()
-                if key == "content" and not p[key]:
-                    raise SystemExit("content is empty once its <private> spans are removed")
+        # Before anything is embedded, searched, stored, logged or echoed in an error: EVERY
+        # string the caller handed in, at any depth -- the query and the content, but also a
+        # source excerpt, an assertion, an entity name, a session id, a timestamp a refusal
+        # would quote back.
+        p = _strip_private_deep(p)
+        if isinstance(p.get("content"), str) and not p["content"].strip() \
+                and cmd in ("write", "supersede"):
+            raise SystemExit("content is empty once its <private> spans are removed")
     conn = connect()
     cur = conn.cursor()
     # Before ANY statement: every read surface below filters on this, and a connection that

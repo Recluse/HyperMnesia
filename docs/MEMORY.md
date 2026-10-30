@@ -269,11 +269,12 @@ the fact that a secret existed survives, the secret does not. Best-effort (known
 guarantee); ordinary prose like "the password reset flow" is left untouched.
 
 **Keeping a span out.** `<private>...</private>` in a prompt or a message keeps that span out of
-everything: the extractor drops it from each turn, before any cut, so the model never sees it;
-recall drops it from the prompt before the prompt becomes a search query; and `mem_ops.py` drops
-it from a query, content or title that reaches it some other way -- an MCP `memory_search` or
-`memory_write` the model filled in -- before anything is embedded, searched or stored, and
-refuses a write that is nothing but a private span. The tag is case-insensitive and may span
+everything: the extractor drops it from each turn, before any cut and before the injected-memory
+fences are removed, so the model never sees it; recall drops it from the prompt before the prompt
+becomes a search query; `memory_ask` drops it from the question before the context request and
+the model call; and `mem_ops.py` drops it from every string it is handed, at any depth -- the
+query, the content, a source excerpt, a timestamp a refusal would quote back -- before anything
+is embedded, searched, stored or echoed, and refuses a write that is nothing but a private span. The tag is case-insensitive and may span
 lines; spans nest, a stray `</private>` is dropped, and an opening tag without its close hides
 the rest of that turn.
 

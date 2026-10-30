@@ -141,8 +141,20 @@ def main():
     except ValueError:
         pass
 
+    # A <private> span reaches neither the reasoning model nor the context request.
+    asked = {}
+    try:
+        mod.mem_ops = fake_mem_ops
+        mod.answer({"query": "How should I <private>CANARY</private> report?"},
+                   generator=lambda query, context: (asked.update(query=query), valid)[1])
+    finally:
+        mod.mem_ops = original
+    assert "CANARY" not in asked["query"] and "CANARY" not in seen["payload"]["query"], \
+        (asked, seen["payload"])
+
     invalid = mod.answer
-    for payload in ({"query": ""}, {"query": "x", "depth": "infinite"},
+    for payload in ({"query": ""}, {"query": "<private>only this</private>"},
+                    {"query": "x", "depth": "infinite"},
                     {"query": "x", "routing": "unbounded"},
                     {"query": "x", "token_budget": 1}):
         try:

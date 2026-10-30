@@ -233,6 +233,17 @@ def main():
     strip_private("</private> " * 50000)
     check("linear on long and many-tagged text (under 10 s)", time.perf_counter() - started < 10)
     with tempfile.TemporaryDirectory() as tmp:
+        tp = os.path.join(tmp, "f.jsonl")
+        with open(tp, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"message": {"role": "user", "content":
+                    "<personal-memory-recall nonce=ab12><private></personal-memory-recall nonce=ab12>"
+                    "CANARY</private> public"}}) + "\n")
+        text = transcript_text(tp)
+        # Private spans go first, so the fence's close inside the span cannot unmask it; the
+        # fence then has no close and hides the rest of the turn, as an unclosed fence does.
+        check("a private tag inside an injected fence still hides its span",
+              "CANARY" not in text, repr(text))
+    with tempfile.TemporaryDirectory() as tmp:
         tp = os.path.join(tmp, "p.jsonl")
         with open(tp, "w", encoding="utf-8") as f:
             f.write(json.dumps({"message": {"role": "user", "content":

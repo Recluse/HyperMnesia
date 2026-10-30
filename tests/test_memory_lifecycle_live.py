@@ -822,6 +822,41 @@ def main():
             except SystemExit:
                 refused = True
             check(f"a write that is nothing but a private span is refused ({content!r})", refused)
+        mid = json.loads(cli("write", {"type": "semantic", "project": P1, "format": "json",
+                                       "content": "printer moved",
+                                       "source": {"excerpt": "said <private>CANARY-5</private> aloud"}}))["id"]
+        excerpt = owner_sql("SELECT coalesce(excerpt,'') FROM mem.sources WHERE memory_id=%s", (mid,))
+        mk = json.loads(cli("write", {"type": "semantic", "project": P1, "format": "json",
+                                      "content": "printer keys",
+                                      "metadata": {"<private>CANARY-6</private>": True,
+                                                   "note <private>CANARY-7</private>": 1}}))["id"]
+        meta = owner_sql("SELECT metadata::text FROM mem.memories WHERE id=%s", (mk,))[0][0]
+        check("a private span in a metadata KEY is not stored either", "CANARY" not in meta, meta)
+        check("a private span in a nested field (source excerpt) is not stored",
+              excerpt and all("CANARY" not in e[0] for e in excerpt), str(excerpt))
+        try:
+            cli("write", {"type": "semantic", "project": P1, "content": "x",
+                          "valid_from": "<private>CANARY-4</private>"})
+            echoed = ""
+        except SystemExit as exc:
+            echoed = str(exc)
+        except Exception as exc:          # a refusal from the database is a refusal too
+            echoed = str(exc)
+            alice.rollback()
+        check("a refusal does not echo a private span back", "CANARY" not in echoed, echoed)
+
+        print("\n== get does not disclose a predecessor the reader may not see ==")
+        P3 = f"{TAG}-three"
+        owner_sql("INSERT INTO mem.project_members (author, project) VALUES ('alice', %s) "
+                  "ON CONFLICT DO NOTHING", (P3,))
+        hidden = write(ac, alice, type="semantic", content="vacation plan draft", project=P3)
+        out = json.loads(cli("supersede", {"old_id": hidden, "type": "semantic", "project": P2,
+                                           "content": "vacation plan final", "format": "json"}))
+        as_bob = cli("get", {"id": out["id"]}, who="bob")
+        check("the replacement is readable to a P2 member", f"[#{out['id']}]" in as_bob, as_bob)
+        check("but its hidden predecessor's id is not shown", f"#{hidden}" not in as_bob, as_bob)
+        as_alice = cli("get", {"id": out["id"]})
+        check("the author still sees the chain", f"supersedes: #{hidden}" in as_alice, as_alice)
         check("timeline of a row the reader may not see says not found",
               cli("timeline", {"id": secret}, who="bob") == "(not found)")
         owner_sql("UPDATE mem.memories SET metadata = metadata || '{\"kind\":\"page\"}' "

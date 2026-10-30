@@ -23,7 +23,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _mem_common import defang, mem_ops
+from _mem_common import defang, mem_ops, strip_private
 from _llm import complete
 
 # The author-name rule of _mem_common.identity() and the MCP server's mem_author().
@@ -186,7 +186,11 @@ def answer(payload, generator=None):
     query = payload.get("query")
     if not isinstance(query, str) or not query.strip() or len(query) > 6000:
         raise ValueError("query must be a non-empty string up to 6000 characters")
-    query = query.strip()
+    # A <private> span is not part of the question: it would reach the reasoning model and,
+    # through the context request, the store.
+    query = strip_private(query).strip()
+    if not query:
+        raise ValueError("query is empty once its <private> spans are removed")
     depth = payload.get("depth", "low")
     if depth not in DEPTHS:
         raise ValueError("depth must be auto, minimal, low, medium, high or max")
