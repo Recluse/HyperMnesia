@@ -39,6 +39,12 @@
 #                              line), then assert no chunk was left without an embedding. This is
 #                              the one to put on a timer -- freshness.py reports drift, this ends
 #                              it.
+#   ./hm install [--wire] [--ref <commit>] [--console[=<features>]] [--dry-run] ...
+#                              install a COMMIT of this checkout as the machine's release:
+#                              ~/.HyperMnesia/current (HYPERMNESIA_HOME moves it), with the MCP
+#                              server built into it. Hooks, jobs and MCP configs then run that,
+#                              not this working copy. --wire rewrites the configs that still point
+#                              into a checkout (each one backed up first). ci/install.py --help.
 #   ./hm doctor                is this install actually working, or only appearing to
 #   ./hm latency               where the time goes: hook, embedder, database, reranker
 #
@@ -588,6 +594,7 @@ case "$sub" in
     refresh) cmd_refresh "$@" ;;
     migrate) cmd_migrate "$@" ;;
     author)  cmd_author "$@" ;;
+    install) exec "$PY" "$ROOT/ci/install.py" "$@" ;;
     doctor)  exec "$PY" "$ROOT/ci/doctor.py" "$@" ;;
     latency) exec "$PY" "$ROOT/ci/latency.py" "$@" ;;
     -h|--help|help) usage 0 ;;

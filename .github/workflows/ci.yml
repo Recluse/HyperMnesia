@@ -70,6 +70,10 @@ jobs:
         run: python tests/test_mem_extract_queue.py
       - name: Ingest ignore file
         run: python tests/test_ingest_ignore.py
+      # Hooks, jobs and the MCP server run from an installed commit, not from a checkout; the
+      # state moves out of ~/.claude exactly once and is never split between the two places.
+      - name: Installed release and the state/settings rule (throwaway HOME)
+        run: python tests/test_hm_home.py && python tests/test_install.py
       # The fixture is shared with `cargo test`: both resolvers must pick the same components.
       - name: Tier-1 parity fixture (Python side) and hook root resolution
         run: python tests/test_tier1_parity.py && python tests/test_arch_hook_root.py
