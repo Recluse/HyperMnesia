@@ -121,14 +121,26 @@ def main():
     check("nested fences reusing one kind and nonce go whole: nothing between closes leaks",
           strip(reused).split() == ["tail"], strip(reused))
     import time
-    for name, flood in (("unclosed openings", "<personal-memory-recall nonce=abcd> " * 20000),
-                        ("unpaired closes", "x </personal-memory-recall nonce=abcd> " * 20000),
-                        ("open/close pairs", "<personal-memory-x nonce=ab12>y"
-                                             "</personal-memory-x nonce=ab12> " * 20000)):
-        started = time.perf_counter()
-        strip(flood)
-        took = time.perf_counter() - started
-        check(f"linear on 20,000 {name} (under 0.5 s)", took < 0.5, f"{took:.2f} s")
+
+    def best_of_3(text):
+        times = []
+        for _ in range(3):
+            started = time.perf_counter()
+            strip(text)
+            times.append(time.perf_counter() - started)
+        return min(times)
+    # Linear, not "fast": the scan is timed at two sizes and the ratio decides. An absolute
+    # budget (0.5 s) failed whenever the machine was busy and passed a quadratic scan on a fast
+    # one. Sizes are large enough to leave cache effects behind (below ~16k units the timing
+    # jumps around); quadrupling the input costs about 4x when linear and 16x when quadratic.
+    for name, unit in (("unclosed openings", "<personal-memory-recall nonce=abcd> "),
+                       ("unpaired closes", "x </personal-memory-recall nonce=abcd> "),
+                       ("open/close pairs", "<personal-memory-x nonce=ab12>y"
+                                            "</personal-memory-x nonce=ab12> ")):
+        small, large = best_of_3(unit * 20000), best_of_3(unit * 80000)
+        ratio = large / max(small, 1e-6)
+        check(f"linear in {name} (x4 input costs under x9 time)", ratio < 9,
+              f"{small:.4f} s -> {large:.4f} s, x{ratio:.1f}")
     other_close = ("<personal-memory-recall nonce=aa11>a</personal-memory-recall nonce=bb22>"
                    " tail")
     check("a close with another nonce does not end the block (treated as truncated)",
