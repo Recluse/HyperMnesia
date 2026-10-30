@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Dreamer provenance, feedback-loop and review-gate contracts."""
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import json
 import os
 import re

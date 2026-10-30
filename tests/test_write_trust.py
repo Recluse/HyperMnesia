@@ -13,6 +13,7 @@ memory_write_and_supersede_drop_undeclared_keys):
 
     python3 tests/test_write_trust.py
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import importlib.util
 import io
 import json

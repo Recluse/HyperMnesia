@@ -13,6 +13,7 @@ database or embedder is needed.
 
     python3 tests/test_hook_contract.py
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import json
 import os
 import stat

@@ -18,6 +18,7 @@ With HM_APP_URL set, the whole contract runs a second time as the application ro
 the one row-level security binds. As the owner alone it proves the views and nothing about the
 policies: the owner bypasses them.
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import os
 import shutil
 import subprocess

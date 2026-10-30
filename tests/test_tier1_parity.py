@@ -11,6 +11,7 @@ the `tier1_fixture_parity` unit test in main.rs asserts the same file against Ru
 
     python3 tests/test_tier1_parity.py
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import json
 import os
 import re

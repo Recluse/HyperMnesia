@@ -14,6 +14,7 @@ exit code and output file are what we assert on.
 
     python3 tests/test_ingest_enumeration.py
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import os
 import subprocess
 import sys

@@ -6,6 +6,7 @@ git branch in a repository and the walk branch outside one, and a rule that only
 branch someone happened to try is worse than none -- the file it was written for stays in the
 index while the ignore file sits there looking like it works.
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import os
 import subprocess
 import sys

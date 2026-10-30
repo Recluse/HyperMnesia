@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Deterministic contract checks for prompt-ready memory context packing."""
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import importlib.util
 import json
 import sys

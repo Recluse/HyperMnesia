@@ -17,6 +17,7 @@ Only a genuine read failure may return None, because only that one can succeed l
 
     python3 tests/test_mem_extract_queue.py
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import contextlib
 import io
 import json
@@ -153,10 +154,16 @@ def main():
                     return "{}"
                 return write_answer
             saved = {k: getattr(mem_extract, k) for k in
-                     ("mem_ops", "QUEUE", "DONE", "LOCK", "extract", "identity")}
+                     ("mem_ops", "QUEUE", "DONE", "LOCK", "extract", "identity",
+                      "STATE_DIR", "LEGACY_DIR", "legacy_twin")}
             mem_extract.mem_ops = fake_mem_ops
             mem_extract.QUEUE, mem_extract.DONE = queue, done
             mem_extract.LOCK = os.path.join(tmp, "lock")
+            # Every path the run can reach, not only the three it is about: the old-queue
+            # retirement reads and deletes in LEGACY_DIR once STATE_DIR exists.
+            mem_extract.STATE_DIR = os.path.join(tmp, "state")
+            mem_extract.LEGACY_DIR = os.path.join(tmp, "legacy")
+            mem_extract.legacy_twin = lambda name: None
             mem_extract.extract = lambda text: [{"type": "semantic", "content": "a new fact"}]
             mem_extract.identity = lambda: author
             argv, sys.argv = sys.argv, ["mem_extract.py"]

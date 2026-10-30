@@ -13,6 +13,7 @@ rather than silently skipped.
 
     python3 tests/test_consolidate_groups.py
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import contextlib
 import io
 import json

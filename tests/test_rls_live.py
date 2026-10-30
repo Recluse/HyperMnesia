@@ -25,6 +25,7 @@ directory, and that `./hm migrate` is a no-op on a second run and refuses a chan
 Run it against a THROWAWAY database: it creates (and drops) two login roles with random names
 and writes rows it deletes again. Without a database it is skipped; under CI it fails instead.
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import os
 import secrets
 import shutil

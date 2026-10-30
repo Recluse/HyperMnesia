@@ -16,6 +16,7 @@ embedder needed.
 
     python3 tests/test_ingest_redaction.py
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import os
 import subprocess
 import sys

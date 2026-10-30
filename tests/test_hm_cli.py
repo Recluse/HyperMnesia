@@ -12,6 +12,7 @@ psql and python are both stubbed and record their argv, so this needs no databas
 
     python3 tests/test_hm_cli.py
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import json
 import os
 import stat

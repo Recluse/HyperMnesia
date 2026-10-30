@@ -20,6 +20,7 @@ No database is needed: the SQL text and the pure functions are checked.
 
     python3 tests/test_mem_pages.py
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import importlib.util
 import json
 import sys

@@ -267,27 +267,36 @@ def done_key(tp):
         return tp
 
 
-def retire_legacy_queue(old_queue, old_done, quiet=86400, settle=2.0):
-    """Remove the ~/.claude queue an old-layout process left, once nobody has written it for
-    `quiet` seconds and every record in it is done.
+def retire_legacy_queue(old_queue, old_done, quiet=86400):
+    """Retire the ~/.claude queue an old-layout process left, without a timing guess.
 
-    A capture hook of an unwired config can still append at any moment, so the file is never read
-    and then deleted: it is renamed aside first (a writer that already has it open keeps writing
-    into that inode; a new one creates a fresh file, which the next run reads), left to settle --
-    hooks live well under a second -- and only then read. Anything not done by then is appended to
-    the new queue, so the delete loses nothing. Its done list is folded into the new one first.
-    A `.retiring` file a dead run left is finished the same way."""
+    A capture hook of an unwired config can still append at any moment, through a descriptor it
+    opened before anything here ran, so the file is never read and then deleted in one go:
+
+    1. once it has been quiet for `quiet` seconds and every record in it is done, it is renamed
+       aside to mem-queue.jsonl.retiring -- a writer holding it open keeps writing into that
+       inode, a new writer creates a fresh ~/.claude queue, which is read as a second source;
+    2. on EVERY run after that, the .retiring file is read and each record that is neither done
+       nor already carried (state/mem-queue.carried) is appended to the new queue;
+    3. only when the .retiring file itself has gone `quiet` seconds without a write is it deleted,
+       with the old done list folded into the new one first, and the carried list with it.
+
+    A record written into the renamed inode is therefore carried over on the next run, however
+    late it arrives, as long as it arrives within a day of the last write into that file."""
     retiring = _retiring()
-    if not old_queue and not os.path.exists(retiring):
-        return
     try:
         if old_queue and not os.path.exists(retiring):
             if any(p and time.time() - os.path.getmtime(p) < quiet for p in (old_queue, old_done)):
                 return
             if not _all_done(old_queue, old_done):
-                return                        # still pending: keep reading it
+                return                        # still pending: keep reading it as a source
             os.replace(old_queue, retiring)
-            time.sleep(settle)
+            # The quiet period of step 3 starts now, not at the last write: a hook can have the
+            # file open without having written yet, and opening does not touch mtime.
+            os.utime(retiring, None)
+            print("set the ~/.claude queue an old-layout process left aside for retirement")
+        if not os.path.exists(retiring):
+            return
         done = _done_union(old_done)
         late = []
         for line in open(retiring, encoding="utf-8"):
@@ -295,11 +304,22 @@ def retire_legacy_queue(old_queue, old_done, quiet=86400, settle=2.0):
                 tp = json.loads(line).get("transcript_path")
             except (ValueError, AttributeError):
                 continue
-            if tp and done_key(tp) not in done:
-                late.append(line if line.endswith("\n") else line + "\n")
+            k = done_key(tp) if tp else None
+            if k and k not in done:
+                done.add(k)
+                late.append((k, line if line.endswith("\n") else line + "\n"))
         if late:
             with open(QUEUE, "a", encoding="utf-8") as f:
-                f.write("".join(late))
+                f.write("".join(line for _, line in late))
+            # Marked carried in the old list's place, so the next read of `.retiring` does not
+            # queue the same lines again; the new queue's own done marks follow extraction, and
+            # the main loop does not count these as done -- they are still to be extracted.
+            with open(_carried(), "a", encoding="utf-8") as f:
+                for k, _ in late:
+                    f.write(k + "\n")
+            print(f"carried {len(late)} late record(s) from the ~/.claude queue into the new one")
+        if time.time() - os.path.getmtime(retiring) < quiet:
+            return                            # a writer may still hold it: read it again next run
         if old_done and os.path.exists(old_done):
             have = (set(open(DONE, encoding="utf-8").read().splitlines())
                     if os.path.exists(DONE) else set())
@@ -308,8 +328,9 @@ def retire_legacy_queue(old_queue, old_done, quiet=86400, settle=2.0):
                     f.write(k + "\n")
             os.remove(old_done)
         os.remove(retiring)
-        print("retired the ~/.claude queue an old-layout process left"
-              + (f" ({len(late)} late record(s) moved to the new queue)" if late else ""))
+        if os.path.exists(_carried()):
+            os.remove(_carried())
+        print("retired the ~/.claude queue an old-layout process left")
     except OSError:
         pass
 
@@ -318,9 +339,15 @@ def _retiring():
     return os.path.join(LEGACY_DIR, "mem-queue.jsonl.retiring")
 
 
+def _carried():
+    """Keys of `.retiring` records already carried into the new queue (state/, removed with it)."""
+    return os.path.join(STATE_DIR, "mem-queue.carried")
+
+
 def _done_union(old_done):
+    """Done, as retirement sees it: both done lists and what it has already carried over."""
     done = set()
-    for path in (DONE, old_done):
+    for path in (DONE, old_done, _carried()):
         if path and os.path.exists(path):
             done |= set(open(path, encoding="utf-8").read().splitlines())
     return done

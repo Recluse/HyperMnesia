@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Grounding and abstention contracts for the synchronous memory Dialectic."""
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import importlib.util
 import json
 import os

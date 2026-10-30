@@ -8,7 +8,7 @@ that is the only one. The MCP server (cargo test) and the console (cargo test) p
 
     python3 tests/test_hm_home.py
 """
-import json, os, re, shutil, subprocess, sys, tempfile
+import ast, json, os, re, shutil, subprocess, sys, tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -100,7 +100,8 @@ if os.name != "nt":
     assert py(who, home, HYPERMNESIA_HOME=str(other)) == "bob", "the old name, followed"
 
 # The extractor and an old-layout writer: the ~/.claude queue is read as a second source and never
-# copied; it is retired only when quiet for a day and fully done, its done list folded in first.
+# copied. Once quiet for a day and fully done it is renamed aside; the renamed file is re-read on
+# every run and deleted only after a day without a write into it, its done list folded in first.
 sw = tmp / "sw"
 (sw / ".claude").mkdir(parents=True)
 st = sw / ".HyperMnesia" / "state"
@@ -114,53 +115,86 @@ import json, os, sys, time
 sys.path.insert(0, %r)
 import mem_extract as e
 q, d = e.legacy_twin("mem-queue.jsonl"), e.legacy_twin("mem-queue.done")
+r = q + ".retiring"
 key = e.done_key(json.loads(open(q).read())["transcript_path"])
-e.retire_legacy_queue(q, d, settle=0)            # young: kept
-young = os.path.exists(q)
+e.retire_legacy_queue(q, d)                       # young: kept as it is
+young = os.path.exists(q) and not os.path.exists(r)
 old = time.time() - 2 * 86400
 os.utime(q, (old, old)); os.utime(d, (old, old))
-e.retire_legacy_queue(q, d, settle=0)            # quiet but not done: kept
-pending = os.path.exists(q)
+e.retire_legacy_queue(q, d)                       # quiet but not done: kept as it is
+pending = os.path.exists(q) and not os.path.exists(r)
 with open(e.DONE, "a") as f: f.write(key + "\\n")
-e.retire_legacy_queue(q, d, settle=0)            # quiet and done: retired
-print(json.dumps([young, pending, os.path.exists(q), os.path.exists(d),
+e.retire_legacy_queue(q, d)                       # quiet and done: renamed aside, not deleted
+aside = not os.path.exists(q) and os.path.exists(r) and os.path.exists(d)
+e.retire_legacy_queue(None, d)                    # the next run: still within its quiet day
+kept = os.path.exists(r)
+os.utime(r, (old, old))
+e.retire_legacy_queue(None, d)                    # a day without a write: retired
+print(json.dumps([young, pending, aside, kept, os.path.exists(r), os.path.exists(d),
                   sorted(open(e.DONE).read().split())]))
 """ % HOOKS
-young, pending, q_left, d_left, done = json.loads(py(code, sw, MEM_AUTHOR="t"))
-assert young and pending and not q_left and not d_left, (young, pending, q_left, d_left)
+young, pending, aside, kept, r_left, d_left, done = json.loads(py(code, sw, MEM_AUTHOR="t"))
+assert young and pending and aside and kept and not r_left and not d_left, \
+    (young, pending, aside, kept, r_left, d_left)
 assert "k0" in done and "k1" in done, "the old done list was folded in before it was removed"
-# A writer that had the old queue open when it was retired: its line lands in the renamed file
-# during the settle, and is carried into the new queue instead of being deleted with it.
+
+# A writer that had the old queue open when it was renamed aside, and writes much later: its line
+# lands in the renamed file and is carried into the new queue on the next run -- once -- and the
+# file is kept for a day after that write. No timing guess is involved.
 late = """
-import json, os, sys, threading, time
+import json, os, sys, time
 sys.path.insert(0, %r)
 import mem_extract as e
 q = os.path.join(e.LEGACY_DIR, "mem-queue.jsonl")
+r = q + ".retiring"
 open(q, "w").write(json.dumps({"transcript_path": "/t/a.jsonl"}) + "\\n")
 with open(e.DONE, "a") as f: f.write(e.done_key("/t/a.jsonl") + "\\n")
 old = time.time() - 2 * 86400
 os.utime(q, (old, old))
 fd = open(q, "a")                                 # opened before the retirement renames it
-def write_late():
-    time.sleep(0.3)
-    fd.write(json.dumps({"transcript_path": "/t/late.jsonl"}) + "\\n"); fd.close()
-threading.Thread(target=write_late).start()
-e.retire_legacy_queue(e.legacy_twin("mem-queue.jsonl"), None, settle=1.0)
-print(json.dumps([os.path.exists(q), os.path.exists(q + ".retiring"),
-                  open(e.QUEUE).read() if os.path.exists(e.QUEUE) else ""]))
+e.retire_legacy_queue(e.legacy_twin("mem-queue.jsonl"), None)
+fd.write(json.dumps({"transcript_path": "/t/late.jsonl"}) + "\\n"); fd.close()
+e.retire_legacy_queue(None, None)                 # the next run carries the late line
+first = open(e.QUEUE).read() if os.path.exists(e.QUEUE) else ""
+carried = open(e._carried()).read() if os.path.exists(e._carried()) else ""
+not_done = e.done_key("/t/late.jsonl") not in open(e.DONE).read()
+e.retire_legacy_queue(None, None)
+second = open(e.QUEUE).read()
+kept = os.path.exists(r)
+os.utime(r, (old, old))                           # a day without a write into it
+e.retire_legacy_queue(None, None)
+print(json.dumps([os.path.exists(q), kept, os.path.exists(r), os.path.exists(e._carried()),
+                  first, second, carried, not_done]))
 """ % HOOKS
 lw = tmp / "lw"
 (lw / ".claude").mkdir(parents=True)
 (lw / ".HyperMnesia" / "state").mkdir(parents=True)
-gone, retiring, newq = json.loads(py(late, lw, MEM_AUTHOR="t"))
-assert not gone and not retiring, (gone, retiring)
-assert "/t/late.jsonl" in newq and "/t/a.jsonl" not in newq, newq
-# A .retiring file a dead run left is finished by the next one.
+q_left, kept, r_left, c_left, first, second, carried, not_done = json.loads(py(late, lw, MEM_AUTHOR="t"))
+assert not q_left and first.count("/t/late.jsonl") == 1 and "/t/a.jsonl" not in first, first
+assert second == first, "a record already carried was carried twice"
+assert "/t/late.jsonl" in carried and not_done, "a carried record must still be extracted"
+assert kept and not r_left and not c_left, "retired a day after the rename, the carried list with it"
+# A .retiring file a dead run left, long quiet, is finished by the next one.
 (lw / ".claude" / "mem-queue.jsonl.retiring").write_text('{"transcript_path": "/t/b.jsonl"}\n')
+os.utime(lw / ".claude" / "mem-queue.jsonl.retiring", (1000, 1000))
 finish = ("import sys; sys.path.insert(0, %r); import mem_extract as e; "
-          "e.retire_legacy_queue(None, None, settle=0); print(open(e.QUEUE).read().count('/t/b.jsonl'))" % HOOKS)
+          "e.retire_legacy_queue(None, None); print(open(e.QUEUE).read().count('/t/b.jsonl'))" % HOOKS)
 assert py(finish, lw, MEM_AUTHOR="t") == "1"
 assert not (lw / ".claude" / "mem-queue.jsonl.retiring").exists()
+
+# Every test that imports or runs the hooks isolates HYPERMNESIA_HOME too (tests/_isolate.py), or
+# builds its subprocess environment without it: a test overriding HOME alone would otherwise
+# write caches and fault markers -- or retire a queue -- in the real home of whoever runs it.
+for t in sorted((ROOT / "tests").glob("test_*.py")):
+    src = t.read_text(encoding="utf-8")
+    if t.name in ("test_hm_home.py", "test_install.py"):
+        assert '"HYPERMNESIA_HOME"' in src and '"HYPERMNESIA_ENV_FILE"' in src, t.name
+        continue
+    imports = [n for n in ast.parse(src).body if isinstance(n, (ast.Import, ast.ImportFrom))
+               and getattr(n, "module", None) != "__future__"]
+    assert imports and isinstance(imports[0], ast.Import) and \
+        [a.name for a in imports[0].names] == ["_isolate"], \
+        f"{t.name}: tests/_isolate.py must be imported first, before anything from hooks/"
 
 # Before any install there is no twin: the ~/.claude file IS the queue. A link is never one.
 bare = tmp / "bare"

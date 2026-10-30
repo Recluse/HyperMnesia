@@ -8,6 +8,7 @@ git top level of the cwd, else the cwd; the repo scope defaults to the root's fo
 
     python3 tests/test_arch_hook_root.py
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import json
 import os
 import stat

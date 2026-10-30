@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Public model prompts are English; multilingual query handling belongs in data and tests."""
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import ast
 import re
 from pathlib import Path

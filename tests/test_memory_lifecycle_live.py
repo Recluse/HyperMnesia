@@ -22,6 +22,7 @@ mem_ops tests bypass it. Needs psycopg2 and a database migrated in the documente
 
     DATABASE_URL=postgresql://... python3 tests/test_memory_lifecycle_live.py
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import contextlib
 import importlib.util
 import io

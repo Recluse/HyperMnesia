@@ -8,6 +8,7 @@ otherwise. It loads sql/schema.sql + sql/migrate_constraint_sources.sql, RESETS 
 
     DATABASE_URL=postgresql://hm:hm@localhost:5432/hypermnesia python3 tests/test_arch_live.py
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import hashlib
 import json
 import os

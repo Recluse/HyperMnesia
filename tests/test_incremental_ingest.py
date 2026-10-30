@@ -17,6 +17,7 @@ No database and no embedder: the ingester writes SQL, and SQL is what we assert 
 
     python3 tests/test_incremental_ingest.py
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import os
 import subprocess
 import sys

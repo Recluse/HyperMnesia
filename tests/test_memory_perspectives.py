@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Perspective graph contract: directional identity, ownership and MCP exposure."""
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import importlib.util
 import json
 import sys

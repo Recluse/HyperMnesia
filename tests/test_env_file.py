@@ -21,6 +21,7 @@ could not run one pass with a different threshold without editing the shared set
 
     python3 tests/test_env_file.py
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import os
 import subprocess
 import sys

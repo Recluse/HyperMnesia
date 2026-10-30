@@ -17,6 +17,7 @@ migration TWICE (it must be re-runnable), checks, and drops the scratch database
 
     DATABASE_URL=postgresql://... python3 tests/test_memory_lifecycle_migration_live.py
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import os
 import shutil
 import subprocess

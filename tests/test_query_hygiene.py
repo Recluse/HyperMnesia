@@ -16,6 +16,7 @@ No database needed: these are pure string functions, and the lexeme claim above 
 
     python3 tests/test_query_hygiene.py
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import os
 import re
 import sys

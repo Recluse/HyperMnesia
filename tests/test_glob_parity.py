@@ -14,6 +14,7 @@ the `glob_parity` unit test in mcp-server (same table, kept in sync by this file
 
     python3 tests/test_glob_parity.py
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import os
 import re
 import sys

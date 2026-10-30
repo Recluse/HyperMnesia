@@ -11,6 +11,7 @@ database, no embedder and no network are needed.
 
     python3 tests/test_doctor.py
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import contextlib
 import hashlib
 import http.server

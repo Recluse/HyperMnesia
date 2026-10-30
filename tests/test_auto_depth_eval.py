@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Contract checks for the automatic-depth evaluation gate."""
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import importlib.util
 import json
 from pathlib import Path

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Runnable source-freshness and actual MCP transport checks; no live DB needed."""
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import hashlib
 import json
 import os

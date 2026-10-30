@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Static contract for entity authorship and the live migration."""
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]

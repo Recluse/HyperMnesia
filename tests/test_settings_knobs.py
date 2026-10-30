@@ -26,6 +26,7 @@ Two more things are checked here, because a grep for the key string is not enoug
 
     python3 tests/test_settings_knobs.py
 """
+import _isolate  # noqa: F401  (first: a throwaway HOME and HYPERMNESIA_HOME)
 import os
 import re
 import sys
