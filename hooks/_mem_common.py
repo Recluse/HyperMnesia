@@ -214,6 +214,19 @@ def defang(text):
     return _CTRL.sub(" ", _MEM_TAG.sub("[mem", text))
 
 
+# `<private>...</private>`: the owner's way to say "not this part" without stopping the session.
+# Whatever is inside never reaches the extractor's model, the store, or a recall query. An opening
+# tag without its close hides the rest of the text it appears in -- erring toward hiding, since
+# the tag was typed precisely because that text was not for keeping. Case-insensitive, across
+# lines; nesting is not a thing.
+_PRIVATE = re.compile(r"<private>.*?(?:</private>|\Z)", re.I | re.S)
+
+
+def strip_private(text):
+    """`text` without its <private> spans (see above). Linear time."""
+    return _PRIVATE.sub("", text or "")
+
+
 def fence(kind, header, body, max_body=None):
     """Wrap injected memory in a nonce-fenced block (data, not instructions).
     Truncation only clips the body -- the closing tag is always emitted."""

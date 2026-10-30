@@ -9,7 +9,7 @@ to ask. All are **fail-open** — they never block a tool call — but none is f
 |------|-------------------|--------------|
 | `arch_invariants.py` | PreToolUse (`Edit\|Write\|MultiEdit`) | inject the `must` constraints for the file being edited (Tier 0/1) |
 | `mem_profile.py` | SessionStart (`startup\|resume\|clear\|compact`) | inject the pinned profile |
-| `mem_recall.py`  | UserPromptSubmit | inject memories relevant to the prompt |
+| `mem_recall.py`  | UserPromptSubmit | inject memories relevant to the prompt (a `<private>...</private>` span is never part of the query) |
 | `mem_capture.py` | SessionEnd, PreCompact | enqueue the transcript path |
 | `mem_extract.py` | schedule (cron/systemd/launchd) | distill queued transcripts -> memories |
 | `mem_consolidate.py` | schedule (daily) | merge/supersede near-duplicates: cliques only, bounded group size, low-confidence proposals parked for you |

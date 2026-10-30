@@ -199,6 +199,78 @@ def main():
         check("no MEM_AUTHOR: refuses to start (exit 2), touches nothing",
               code == 2 and not calls, str((code, calls)))
 
+    print("\n== <private> spans never leave the machine ==")
+    from _mem_common import strip_private
+    check("a closed span is removed, the rest stays",
+          strip_private("keep <private>my password is x</private> this") == "keep  this")
+    check("the tag is case-insensitive and spans lines",
+          strip_private("a <PRIVATE>x\ny</Private>b") == "a b")
+    check("an unclosed tag hides the rest of the text it is in",
+          strip_private("keep <private> the rest") == "keep ")
+    check("text without the tag is untouched, and None is an empty string",
+          strip_private("plain <privately> text") == "plain <privately> text"
+          and strip_private(None) == "")
+    started = time.perf_counter()
+    strip_private("<private>" + "x" * 200000 + " <private> " * 20000)
+    check("linear on a long unclosed span (under 10 s)", time.perf_counter() - started < 10)
+    with tempfile.TemporaryDirectory() as tmp:
+        tp = os.path.join(tmp, "p.jsonl")
+        with open(tp, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"message": {"role": "user", "content":
+                    "deploy notes <private>token abc123</private> are done"}}) + "\n")
+            f.write(json.dumps({"message": {"role": "user", "content":
+                    "draft <private> half a secret"}}) + "\n")
+            f.write(json.dumps({"message": {"role": "assistant", "content": "next turn survives"}})
+                    + "\n")
+        text = transcript_text(tp)
+        check("transcript_text drops private spans, an unclosed one only to the end of its turn",
+              "abc123" not in text and "half a secret" not in text
+              and "next turn survives" in text and "deploy notes" in text, repr(text))
+        # And once more right before the model: whatever produced the text, the span is gone.
+        queue, done = os.path.join(tmp, "q.jsonl"), os.path.join(tmp, "done")
+        with open(queue, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"transcript_path": tp}) + "\n")
+        seen = []
+        saved = {k: getattr(mem_extract, k) for k in
+                 ("mem_ops", "QUEUE", "DONE", "LOCK", "extract", "identity", "transcript_text",
+                  "STATE_DIR", "LEGACY_DIR", "legacy_twin")}
+        mem_extract.mem_ops = lambda cmd, payload, timeout=10: "[]" if cmd == "search" else "{}"
+        mem_extract.QUEUE, mem_extract.DONE = queue, done
+        mem_extract.LOCK = os.path.join(tmp, "lock")
+        mem_extract.STATE_DIR = os.path.join(tmp, "state")
+        mem_extract.LEGACY_DIR = os.path.join(tmp, "legacy")
+        mem_extract.legacy_twin = lambda name: None
+        mem_extract.identity = lambda: "alice"
+        mem_extract.transcript_text = lambda path: ("from another reader <private>KEY-42</private> "
+                                                    + "x" * 600)
+        mem_extract.extract = lambda text: seen.append(text) or []
+        argv, sys.argv = sys.argv, ["mem_extract.py"]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                mem_extract.main()
+        finally:
+            sys.argv = argv
+            for k, v in saved.items():
+                setattr(mem_extract, k, v)
+        check("the model is never handed a private span, whatever produced the text",
+              len(seen) == 1 and "KEY-42" not in seen[0] and "another reader" in seen[0],
+              repr(seen)[:200])
+    import mem_recall
+    asked = []
+    saved_ops = mem_recall.mem_ops
+    mem_recall.mem_ops = lambda cmd, payload, timeout=10: asked.append(payload) or "[]"
+    stdin, sys.stdin = sys.stdin, io.StringIO(json.dumps(
+        {"prompt": "how do we rotate <private>the vault token s3cr3t</private> deploy keys"}))
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            mem_recall.main()
+    finally:
+        sys.stdin = stdin
+        mem_recall.mem_ops = saved_ops
+    check("recall never sends a private span as the search query",
+          len(asked) == 1 and "s3cr3t" not in asked[0]["query"]
+          and "deploy keys" in asked[0]["query"], repr(asked))
+
     print("\n== one bad input costs only itself (issue: a malformed item jammed the queue) ==")
     with tempfile.TemporaryDirectory() as tmp:
         tp = os.path.join(tmp, "bad.jsonl")

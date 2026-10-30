@@ -20,7 +20,7 @@ queued for the next run; 2 when MEM_AUTHOR is unset or invalid (nothing is attem
 import json, math, os, re, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _mem_common import (mem_ops, defang, acquire_lock, release_lock, identity, state_path,
-                         legacy_twin, LEGACY_DIR, STATE_DIR)
+                         legacy_twin, strip_private, LEGACY_DIR, STATE_DIR)
 from _llm import complete
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ingest"))
 from _redact import scrub
@@ -142,8 +142,10 @@ def transcript_text(path):
                                    if isinstance(b, dict) and b.get("type") == "text")
                 else:
                     txt = ""
-                # Before the per-turn cut, so a block is never half-removed by it.
-                txt = strip_memory_blocks(txt).strip()
+                # Injected memory and <private> spans go before the per-turn cut, so neither is
+                # ever half-removed by it, and an unclosed <private> hides only its own turn
+                # (strip_memory_blocks above, strip_private in _mem_common.py).
+                txt = strip_private(strip_memory_blocks(txt)).strip()
                 if txt:
                     out.append(f"[{role}] {txt[:2000]}")
     except OSError:
@@ -483,7 +485,9 @@ def main():
                         f.write(done_key(tp) + "\n")
                     continue
                 try:
-                    items = extract(text)
+                    # Once more right before the model sees it: whatever the source of `text`,
+                    # a <private> span never leaves this machine.
+                    items = extract(strip_private(text))
                 except Exception as e:
                     run_failures += 1
                     print(f"  extract FAILED (will retry next run): {tp}: {e}")

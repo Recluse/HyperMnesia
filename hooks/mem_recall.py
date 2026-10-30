@@ -8,7 +8,7 @@ injection -- does not rely on the agent choosing to call memory_search
 """
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _mem_common import mem_ops, read_stdin_json, fence, store_down_flip
+from _mem_common import mem_ops, read_stdin_json, fence, store_down_flip, strip_private
 
 MIN_LEN = 16
 DOWN_NOTE = ("Long-term memory is UNAVAILABLE right now (the store did not answer the search). "
@@ -20,7 +20,8 @@ MAX_CHARS = 3500  # ~ 1k tokens ceiling for the whole block
 
 def main():
     j = read_stdin_json()
-    prompt = (j.get("prompt") or "").strip()
+    # A <private> span is not a query: it would leave this machine as the search text.
+    prompt = strip_private(j.get("prompt") or "").strip()
     if len(prompt) < MIN_LEN or prompt[0] in ("/", "!"):
         return
     out = mem_ops("search", {"query": prompt[:500], "k": K}, timeout=9)
