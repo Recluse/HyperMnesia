@@ -278,7 +278,9 @@ is embedded, searched, stored or echoed, and refuses a write that is nothing but
 lines; spans nest, a stray `</private>` is dropped, and an opening tag without its close hides
 the rest of that turn. A key that carries a span is dropped with its value, never rewritten into
 another key. `search_docs` strips its query the same way. Repository documents are not
-conversation: ingest indexes them as they are in the repo.
+conversation: ingest indexes them as they are in the repo. The tag is about content -- prompts,
+transcripts, memory texts and the queries handed to memory and doc search; identifiers, paths,
+settings and command-line arguments are taken as given.
 
 **The LLM step is pluggable** (see `hooks/_llm.py`): set `HM_LLM_BACKEND` to `openai`
 (`HM_LLM_URL`/`HM_LLM_KEY`/`HM_LLM_MODEL`), `ollama` (`HM_LLM_MODEL`), or `cli` (`HM_LLM_CMD`).
