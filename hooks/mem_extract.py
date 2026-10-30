@@ -17,7 +17,7 @@ Exit status: 0 when every pending transcript it reached was processed or legitim
 1 when anything failed (a write, a duplicate check, an extraction) -- those transcripts stay
 queued for the next run; 2 when MEM_AUTHOR is unset or invalid (nothing is attempted).
 """
-import json, os, re, sys, time
+import json, math, os, re, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _mem_common import (mem_ops, defang, acquire_lock, release_lock, identity, state_path,
                          legacy_twin, LEGACY_DIR, STATE_DIR)
@@ -120,21 +120,28 @@ def transcript_text(path):
     """
     out = []
     try:
-        with open(path, encoding="utf-8") as f:
+        # errors="replace": a transcript cut mid-character by a crash is still a transcript.
+        # Raised, the decode error escaped the OSError handler and killed the whole run, and
+        # the next run met the same byte -- with every transcript queued behind it unreached.
+        with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 try:
                     j = json.loads(line)
                 except ValueError:
                     continue
-                m = j.get("message") or {}
+                m = j.get("message") if isinstance(j, dict) else None
+                if not isinstance(m, dict):
+                    continue                  # a line that is not a transcript event
                 role, content = m.get("role"), m.get("content")
                 if role not in ("user", "assistant"):
                     continue
                 if isinstance(content, str):
                     txt = content
-                else:
-                    txt = " ".join(b.get("text", "") for b in (content or [])
+                elif isinstance(content, list):
+                    txt = " ".join(str(b.get("text") or "") for b in content
                                    if isinstance(b, dict) and b.get("type") == "text")
+                else:
+                    txt = ""
                 # Before the per-turn cut, so a block is never half-removed by it.
                 txt = strip_memory_blocks(txt).strip()
                 if txt:
@@ -142,6 +149,18 @@ def transcript_text(path):
     except OSError:
         return None
     return "\n".join(out)[-TAIL_CHARS:]
+
+
+def _score(value, default):
+    """A model-supplied score as a finite float, or `default` when it is not one. Models answer
+    `"importance": null` or `"high"` often enough, and float() raised on both outside any
+    handler -- a deterministic answer at temperature 0 then failed the same transcript on every
+    run."""
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return default
+    return x if math.isfinite(x) else default
 
 
 def extract(text):
@@ -168,8 +187,11 @@ def extract(text):
         except ValueError:
             items = None
         if isinstance(items, list):
+            # The content must be TEXT: a list or a number is truthy, passed this filter and
+            # raised later in is_duplicate(), outside any handler.
             return [i for i in items
-                    if isinstance(i, dict) and i.get("content")
+                    if isinstance(i, dict) and isinstance(i.get("content"), str)
+                    and i["content"].strip()
                     and i.get("type") in ("preference", "semantic", "episodic",
                                            "prospective", "procedural")]
     # no parseable array -> error/limit/refusal, not a real empty result
@@ -230,9 +252,16 @@ def is_duplicate(content):
         raise DuplicateCheckFailed(f"unreadable search answer: {exc}")
     if not isinstance(rows, list):
         raise DuplicateCheckFailed("search answer is not a list")
+    # Only the direction in which the candidate adds nothing: it is a fragment of what is
+    # already held. The other one (`existing in cand`) took a CORRECTION that quotes the old
+    # memory -- "never uses docker for local dev on macos" against "uses docker for local dev" --
+    # for a repeat, before the negation and salient-token guards below ever ran, and dropped it
+    # while the old row stayed active. A fragment can still flip polarity against the sentence
+    # around it, so the negation guard applies here too.
+    norm = " ".join(cand.split())
     for row in rows:
-        existing = str((row or {}).get("content") or "").strip().lower()
-        if existing and (cand in existing or existing in cand):
+        existing = " ".join(str((row or {}).get("content") or "").lower().split())
+        if existing and norm in existing and not _neg_differs(norm, existing):
             return True
     # (2) tight semantic paraphrase, with the negation guard.
     near = mem_ops("nearest", {"content": content[:400]}, timeout=15)
@@ -408,82 +437,90 @@ def main():
                     queue.append(r)
         print(f"{len(queue)} transcript(s) pending")
         for rec in queue[:limit]:
-            tp = rec["transcript_path"]
-            # GONE is not BUSY. These two shared one branch, and the difference is whether the
-            # retry can ever succeed: a file locked right now will be readable later, a file that
-            # no longer exists will not. Merged, the queue can only grow -- measured on a live
-            # store, 56 of 59 pending entries were transcripts deleted weeks earlier. They filled
-            # the whole per-run window (`queue[:limit]`), so the three live transcripts sat at
-            # positions 45, 52 and 59 where no run ever reached them, and every new session
-            # appended behind those. Extraction had stopped, and said so nowhere: the log printed
-            # "will retry" thousands of times, which reads as a system doing something.
-            if not os.path.exists(tp):
-                print(f"  gone (marking done): {tp}")
-                with open(DONE, "a", encoding="utf-8") as f:
-                    f.write(done_key(tp) + "\n")
-                continue
-            text = transcript_text(tp)
-            if text is None:                 # present but unreadable right now -> retry next run
-                print(f"  unreadable (will retry): {tp}")
-                continue
-            if len(text) < 500:              # genuinely tiny -> nothing durable, mark done
-                print(f"  skip (tiny): {tp}")
-                with open(DONE, "a", encoding="utf-8") as f:
-                    f.write(done_key(tp) + "\n")
-                continue
             try:
-                items = extract(text)
+                tp = rec["transcript_path"]
+                # GONE is not BUSY. These two shared one branch, and the difference is whether the
+                # retry can ever succeed: a file locked right now will be readable later, a file that
+                # no longer exists will not. Merged, the queue can only grow -- measured on a live
+                # store, 56 of 59 pending entries were transcripts deleted weeks earlier. They filled
+                # the whole per-run window (`queue[:limit]`), so the three live transcripts sat at
+                # positions 45, 52 and 59 where no run ever reached them, and every new session
+                # appended behind those. Extraction had stopped, and said so nowhere: the log printed
+                # "will retry" thousands of times, which reads as a system doing something.
+                if not os.path.exists(tp):
+                    print(f"  gone (marking done): {tp}")
+                    with open(DONE, "a", encoding="utf-8") as f:
+                        f.write(done_key(tp) + "\n")
+                    continue
+                text = transcript_text(tp)
+                if text is None:                 # present but unreadable right now -> retry next run
+                    print(f"  unreadable (will retry): {tp}")
+                    continue
+                if len(text) < 500:              # genuinely tiny -> nothing durable, mark done
+                    print(f"  skip (tiny): {tp}")
+                    with open(DONE, "a", encoding="utf-8") as f:
+                        f.write(done_key(tp) + "\n")
+                    continue
+                try:
+                    items = extract(text)
+                except Exception as e:
+                    run_failures += 1
+                    print(f"  extract FAILED (will retry next run): {tp}: {e}")
+                    continue
+                saved, failed = 0, 0
+                for it in items:
+                    try:
+                        duplicate = is_duplicate(it["content"])
+                    except DuplicateCheckFailed as exc:
+                        failed += 1
+                        print(f"  duplicate check FAILED ({exc}), not written: {it['content'][:80]}")
+                        continue
+                    if duplicate:
+                        print(f"  dup, skip: {it['content'][:80]}")
+                        continue
+                    if dry:
+                        print(f"  [dry] {it['type']}: {it['content'][:100]}")
+                        saved += 1
+                        continue
+                    r = mem_ops("write", {
+                        # untrusted transcript-derived content: defang tags/control chars, and
+                        # clamp so the model can't self-assign importance=1.0 to pin the profile.
+                        "type": it["type"], "content": defang(it["content"]),
+                        "importance": min(0.7, max(0.0, _score(it.get("importance"), 0.5))),
+                        "confidence": min(0.8, max(0.0, _score(it.get("confidence"), 0.7))),
+                        "project": it.get("project") or None,
+                        "source": {"source_type": "assistant_inference",
+                                   "channel": "extractor",
+                                   "session_id": rec.get("session_id"),
+                                   "excerpt": f"session {rec.get('ts')} cwd={rec.get('cwd')}"},
+                        "format": "json",
+                    }, timeout=30)
+                    try:
+                        new_id = int(json.loads(r)["id"]) if r else None
+                    except (ValueError, KeyError, TypeError):
+                        new_id = None
+                    if new_id:
+                        saved += 1
+                        print(f"  saved [#{new_id}]: {it['content'][:90]}")
+                    else:
+                        failed += 1
+                        print(f"  write FAILED (will retry): {it['content'][:80]}")
+                print(f"  {tp}: {saved}/{len(items)} saved" + (f", {failed} FAILED" if failed else ""))
+                # Only mark done when nothing failed -- a transient DB/embedder error must not
+                # permanently lose extracted items (a done transcript is never re-extracted).
+                if not dry and failed == 0:
+                    with open(DONE, "a", encoding="utf-8") as f:
+                        f.write(done_key(tp) + "\n")
+                elif failed:
+                    run_failures += 1
+                    print(f"  NOT marking done -- {failed} item(s) failed, will retry next run")
             except Exception as e:
+                # One bad transcript costs only itself. An exception nobody anticipated used to
+                # end the process: the transcript was not marked done, the queue order is fixed,
+                # and the next run met it first again -- so nothing queued behind it was reached.
                 run_failures += 1
-                print(f"  extract FAILED (will retry next run): {tp}: {e}")
-                continue
-            saved, failed = 0, 0
-            for it in items:
-                try:
-                    duplicate = is_duplicate(it["content"])
-                except DuplicateCheckFailed as exc:
-                    failed += 1
-                    print(f"  duplicate check FAILED ({exc}), not written: {it['content'][:80]}")
-                    continue
-                if duplicate:
-                    print(f"  dup, skip: {it['content'][:80]}")
-                    continue
-                if dry:
-                    print(f"  [dry] {it['type']}: {it['content'][:100]}")
-                    saved += 1
-                    continue
-                r = mem_ops("write", {
-                    # untrusted transcript-derived content: defang tags/control chars, and
-                    # clamp so the model can't self-assign importance=1.0 to pin the profile.
-                    "type": it["type"], "content": defang(it["content"]),
-                    "importance": min(0.7, max(0.0, float(it.get("importance", 0.5)))),
-                    "confidence": min(0.8, max(0.0, float(it.get("confidence", 0.7)))),
-                    "project": it.get("project") or None,
-                    "source": {"source_type": "assistant_inference",
-                               "channel": "extractor",
-                               "session_id": rec.get("session_id"),
-                               "excerpt": f"session {rec.get('ts')} cwd={rec.get('cwd')}"},
-                    "format": "json",
-                }, timeout=30)
-                try:
-                    new_id = int(json.loads(r)["id"]) if r else None
-                except (ValueError, KeyError, TypeError):
-                    new_id = None
-                if new_id:
-                    saved += 1
-                    print(f"  saved [#{new_id}]: {it['content'][:90]}")
-                else:
-                    failed += 1
-                    print(f"  write FAILED (will retry): {it['content'][:80]}")
-            print(f"  {tp}: {saved}/{len(items)} saved" + (f", {failed} FAILED" if failed else ""))
-            # Only mark done when nothing failed -- a transient DB/embedder error must not
-            # permanently lose extracted items (a done transcript is never re-extracted).
-            if not dry and failed == 0:
-                with open(DONE, "a", encoding="utf-8") as f:
-                    f.write(done_key(tp) + "\n")
-            elif failed:
-                run_failures += 1
-                print(f"  NOT marking done -- {failed} item(s) failed, will retry next run")
+                print(f"  FAILED (will retry next run): {rec.get('transcript_path') or rec.get('session_id')}: "
+                      f"{type(e).__name__}: {e}")
         if not dry and os.path.isdir(STATE_DIR):
             retire_legacy_queue(old_queue, old_done)
     finally:

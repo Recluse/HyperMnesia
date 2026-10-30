@@ -194,6 +194,101 @@ def main():
         check("no MEM_AUTHOR: refuses to start (exit 2), touches nothing",
               code == 2 and not calls, str((code, calls)))
 
+    print("\n== one bad input costs only itself (issue: a malformed item jammed the queue) ==")
+    with tempfile.TemporaryDirectory() as tmp:
+        tp = os.path.join(tmp, "bad.jsonl")
+        with open(tp, "wb") as f:
+            f.write(b'[1, 2]\n"a string"\n{"message": "not a dict"}\n{"message": {"role": "user", "content": 7}}\n')
+            f.write(json.dumps({"message": {"role": "user", "content": "kept " * 10}}).encode() + b"\n")
+            f.write(b'{"message": {"role": "user", "content": "cut mid-char \xd0"}}\n')
+        text = transcript_text(tp)
+        check("a transcript with non-object lines and a broken UTF-8 byte still reads",
+              text is not None and "kept" in text and "cut mid-char" in text, repr(text))
+    check("a score that is not a number falls back to the default",
+          mem_extract._score(None, 0.5) == 0.5 and mem_extract._score("high", 0.7) == 0.7
+          and mem_extract._score(float("nan"), 0.5) == 0.5 and mem_extract._score("0.9", 0.5) == 0.9)
+    answer = json.dumps([
+        {"type": "semantic", "content": ["a", "list"]}, {"type": "semantic", "content": 42},
+        {"type": "semantic", "content": "   "}, {"type": "semantic", "content": "a real fact"}])
+
+    saved_complete = mem_extract.complete
+    mem_extract.complete = lambda prompt, text: answer
+    try:
+        got = mem_extract.extract("x")
+    finally:
+        mem_extract.complete = saved_complete
+    check("only items whose content is text are kept",
+          [i["content"] for i in got] == ["a real fact"], str(got))
+
+    def dup(cand, existing):
+        saved_ops = mem_extract.mem_ops
+        mem_extract.mem_ops = lambda cmd, payload, timeout=10: (
+            json.dumps([{"content": existing}]) if cmd == "search" else "{}")
+        try:
+            return mem_extract.is_duplicate(cand)
+        finally:
+            mem_extract.mem_ops = saved_ops
+    check("a correction quoting the old memory is not a duplicate of it",
+          not dup("never uses docker for local dev on macos", "uses docker for local dev"))
+    check("a refinement with new facts is not a duplicate",
+          not dup("prefers zed for rust, cursor for typescript", "prefers zed"))
+    check("a fragment of what is held still is one",
+          dup("uses docker for local dev", "Uses  docker for local dev on every machine"))
+    check("a fragment that flips polarity against its sentence is not",
+          not dup("uses docker for local dev", "never uses docker for local dev"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tps = []
+        for n in ("first", "second"):
+            tp = os.path.join(tmp, f"{n}.jsonl")
+            with open(tp, "w", encoding="utf-8") as f:
+                f.write(json.dumps({"message": {"role": "user", "content": n * 200}}) + "\n")
+            tps.append(tp)
+        queue, done = os.path.join(tmp, "q.jsonl"), os.path.join(tmp, "done")
+        with open(queue, "w", encoding="utf-8") as f:
+            for tp in tps:
+                f.write(json.dumps({"transcript_path": tp}) + "\n")
+        writes = []
+
+        def fake_ops(cmd, payload, timeout=10):
+            if cmd == "write":
+                writes.append(payload)
+                return '{"id": 9}'
+            return "[]" if cmd == "search" else "{}"
+        real_text = mem_extract.transcript_text
+
+        def flaky_text(path):
+            if path.endswith("first.jsonl"):
+                raise LookupError("something nobody anticipated")
+            return real_text(path)
+        saved = {k: getattr(mem_extract, k) for k in
+                 ("mem_ops", "QUEUE", "DONE", "LOCK", "extract", "identity", "transcript_text",
+                  "legacy_twin", "STATE_DIR", "LEGACY_DIR")}
+        mem_extract.legacy_twin = lambda name: None
+        mem_extract.STATE_DIR = os.path.join(tmp, "no-state")
+        mem_extract.LEGACY_DIR = os.path.join(tmp, "no-legacy")
+        mem_extract.mem_ops, mem_extract.QUEUE, mem_extract.DONE = fake_ops, queue, done
+        mem_extract.LOCK = os.path.join(tmp, "lock")
+        mem_extract.transcript_text = flaky_text
+        mem_extract.extract = lambda text: [{"type": "semantic", "content": "a fact",
+                                             "importance": None, "confidence": "high"}]
+        mem_extract.identity = lambda: "alice"
+        argv, sys.argv = sys.argv, ["mem_extract.py"]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                code = mem_extract.main()
+        finally:
+            sys.argv = argv
+            for k, v in saved.items():
+                setattr(mem_extract, k, v)
+        marked = open(done, encoding="utf-8").read() if os.path.exists(done) else ""
+        check("an unexpected error in one transcript does not stop the next one",
+              code == 1 and len(writes) == 1 and "second" in marked and "first" not in marked,
+              str((code, len(writes), marked)))
+        check("a null or wordy score is written as the default, not a crash",
+              writes and writes[0]["importance"] == 0.5 and writes[0]["confidence"] == 0.7,
+              str(writes))
+
     print(f"\n{ran - len(failures)}/{ran} checks passed"
           + (f"; FAILED: {', '.join(failures)}" if failures else ""))
     return 1 if failures else 0
