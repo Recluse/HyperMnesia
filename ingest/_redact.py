@@ -15,7 +15,11 @@ import re
 
 # (compiled pattern, label). Order matters only for readability; all are applied.
 _PATTERNS = [
-    (re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----", re.S), "private-key"),
+    # A private key block of any kind (RSA, EC, DSA, OPENSSH, ENCRYPTED, PGP "PRIVATE KEY BLOCK"),
+    # from BEGIN to END -- or to the end of the text: a key cut short (a transcript turn clipped
+    # mid-key, a paste missing its last line) is still a key.
+    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----.*?"
+                r"(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|\Z)", re.S), "private-key"),
     (re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}"), "anthropic-key"),
     (re.compile(r"sk-proj-[A-Za-z0-9_\-]{20,}"), "openai-key"),
     (re.compile(r"sk-[A-Za-z0-9]{20,}"), "openai-key"),
@@ -27,8 +31,22 @@ _PATTERNS = [
     (re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "jwt"),
     # connection string with an inline password: scheme://user:PASSWORD@host -> keep everything but the secret
     (re.compile(r"(?P<pre>[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@]+:)(?P<secret>[^\s:/@]+)(?P<at>@)"), "url-password"),
-    # generic name=value / name: value assignment for sensitive keys
-    (re.compile(r"(?i)(?P<key>\b(?:\w*(?:password|passwd)|secret|token|api[_-]?key|access[_-]?key|auth[_-]?token|bearer)\b\s*[:=]\s*[\"']?)(?P<secret>[^\s\"']{8,})"), "credential"),
+    # An HTTP credential header, then a bare bearer token.
+    (re.compile(r"(?i)(?P<key>\b(?:proxy-)?authorization\s*:\s*(?:bearer|basic|token|digest)\s+)"
+                r"(?!\[REDACTED:)(?P<secret>[A-Za-z0-9._~+/=:-]{8,})"), "credential"),
+    (re.compile(r"(?P<key>\bBearer\s+)(?!\[REDACTED:)(?P<secret>[A-Za-z0-9._~+/=-]{16,})"), "credential"),
+    # name=value, name: value and "name": "value" for a sensitive name -- with any prefix on the
+    # name (AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN, CLIENT_SECRET, PGPASSWORD) and a closing quote
+    # after it (JSON, quoted YAML). The name must END in the sensitive word, so max_tokens,
+    # TOKEN_URL or password_reset_url are left alone; a value an earlier rule already redacted
+    # (GITLAB_TOKEN=[REDACTED:gitlab-pat]) keeps its more specific label.
+    (re.compile(r"(?i)(?P<key>\b[A-Za-z0-9_.-]*?(?:password|passwd|passphrase|secret|token|"
+                r"api[_-]?key|access[_-]?key|private[_-]?key|credentials?)[\"']?\s*[:=]\s*[\"']?)"
+                r"(?!\[REDACTED:)(?P<secret>[^\s\"',;}]{6,})"), "credential"),
+    # The libpq variables, whose values can be shorter than the six characters asked of the
+    # generic rule above: PGPASSWORD=<literal> is what people type at a shell.
+    (re.compile(r"(?i)(?P<key>\bPG(?:PASSWORD|PASSFILE|SSLKEY)\s*=\s*[\"\']?)"
+                r"(?P<secret>[^\s\"\']{4,})"), "credential"),
 ]
 
 

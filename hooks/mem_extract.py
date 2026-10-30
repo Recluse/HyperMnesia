@@ -146,7 +146,7 @@ def transcript_text(path):
                 # ever half-removed by it, and an unclosed <private> hides only its own turn
                 # (strip_memory_blocks above, strip_private in _mem_common.py). Private spans
                 # first: a fence's close inside a span must not unmask what follows it.
-                txt = strip_memory_blocks(strip_private(txt)).strip()
+                txt = scrub(strip_memory_blocks(strip_private(txt))).strip()
                 if txt:
                     out.append(f"[{role}] {txt[:2000]}")
     except OSError:
