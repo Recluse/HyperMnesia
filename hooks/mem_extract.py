@@ -485,9 +485,10 @@ def main():
                         f.write(done_key(tp) + "\n")
                     continue
                 try:
-                    # Once more right before the model sees it: whatever the source of `text`,
-                    # a <private> span never leaves this machine.
-                    items = extract(strip_private(text))
+                    # <private> spans are already gone: transcript_text() strips them per turn,
+                    # before the tail cut. Stripped after the cut, a cut-off opening tag would let
+                    # the rest of its span through, and an unclosed one would swallow later turns.
+                    items = extract(text)
                 except Exception as e:
                     run_failures += 1
                     print(f"  extract FAILED (will retry next run): {tp}: {e}")

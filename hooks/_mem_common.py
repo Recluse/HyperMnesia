@@ -215,16 +215,35 @@ def defang(text):
 
 
 # `<private>...</private>`: the owner's way to say "not this part" without stopping the session.
-# Whatever is inside never reaches the extractor's model, the store, or a recall query. An opening
-# tag without its close hides the rest of the text it appears in -- erring toward hiding, since
-# the tag was typed precisely because that text was not for keeping. Case-insensitive, across
-# lines; nesting is not a thing.
-_PRIVATE = re.compile(r"<private>.*?(?:</private>|\Z)", re.I | re.S)
+# Whatever is inside never reaches the extractor's model, the store, or a recall query. Spans
+# nest (an inner pair does not end the outer one -- a non-greedy regex did, and leaked what
+# followed it), a stray close is dropped, and an opening tag without its close hides the rest of
+# the text it appears in -- erring toward hiding, since the tag was typed precisely because that
+# text was not for keeping. Case-insensitive, across lines. The same function is in
+# ingest/mem_ops.py, which can run where nothing from here is importable.
+_PRIVATE_TAG = re.compile(r"<(/?)private>", re.I)
 
 
 def strip_private(text):
-    """`text` without its <private> spans (see above). Linear time."""
-    return _PRIVATE.sub("", text or "")
+    """`text` without its <private> spans (see above). One linear scan over the tags."""
+    text = text or ""
+    out, pos, depth = [], 0, 0
+    for tag in _PRIVATE_TAG.finditer(text):
+        if not tag.group(1):
+            if depth == 0:
+                out.append(text[pos:tag.start()])
+            depth += 1
+        elif depth:
+            depth -= 1
+            if depth == 0:
+                pos = tag.end()
+        else:                                 # a close nothing opened: drop the tag itself
+            out.append(text[pos:tag.start()])
+            pos = tag.end()
+    if depth:
+        return "".join(out)                   # unclosed: the rest stays hidden
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def fence(kind, header, body, max_body=None):

@@ -210,9 +210,28 @@ def main():
     check("text without the tag is untouched, and None is an empty string",
           strip_private("plain <privately> text") == "plain <privately> text"
           and strip_private(None) == "")
+    check("spans nest: an inner close does not end the outer span",
+          strip_private("a <private>A<private>B</private>CANARY</private> z") == "a  z")
+    check("a stray close is dropped, the text around it kept",
+          strip_private("x </private> y") == "x  y")
+    check("a nested unclosed span still hides the rest",
+          strip_private("a <private>b <private>c</private> d") == "a ")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mem_ops_parity",
+                                                  os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ingest", "mem_ops.py"))
+    mo = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mo)
+    cases = ["keep <private>x</private> this", "a <PRIVATE>x\ny</Private>b", "keep <private> rest",
+             "a <private>A<private>B</private>C</private> z", "x </private> y", "", "plain",
+             "<private></private><private>a</private>b</private>c"]
+    check("mem_ops.py's copy of strip_private agrees with the hooks' on every case",
+          all(mo.strip_private(c) == strip_private(c) for c in cases),
+          str([(c, mo.strip_private(c), strip_private(c)) for c in cases
+               if mo.strip_private(c) != strip_private(c)]))
     started = time.perf_counter()
     strip_private("<private>" + "x" * 200000 + " <private> " * 20000)
-    check("linear on a long unclosed span (under 10 s)", time.perf_counter() - started < 10)
+    strip_private("</private> " * 50000)
+    check("linear on long and many-tagged text (under 10 s)", time.perf_counter() - started < 10)
     with tempfile.TemporaryDirectory() as tmp:
         tp = os.path.join(tmp, "p.jsonl")
         with open(tp, "w", encoding="utf-8") as f:
@@ -220,41 +239,18 @@ def main():
                     "deploy notes <private>token abc123</private> are done"}}) + "\n")
             f.write(json.dumps({"message": {"role": "user", "content":
                     "draft <private> half a secret"}}) + "\n")
+            # A span longer than the per-turn cut: stripped first, or its end would come through.
+            f.write(json.dumps({"message": {"role": "user", "content":
+                    "<private>" + "s" * 5000 + " LONGSECRET</private> after the long one"}}) + "\n")
             f.write(json.dumps({"message": {"role": "assistant", "content": "next turn survives"}})
                     + "\n")
         text = transcript_text(tp)
         check("transcript_text drops private spans, an unclosed one only to the end of its turn",
               "abc123" not in text and "half a secret" not in text
-              and "next turn survives" in text and "deploy notes" in text, repr(text))
-        # And once more right before the model: whatever produced the text, the span is gone.
-        queue, done = os.path.join(tmp, "q.jsonl"), os.path.join(tmp, "done")
-        with open(queue, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"transcript_path": tp}) + "\n")
-        seen = []
-        saved = {k: getattr(mem_extract, k) for k in
-                 ("mem_ops", "QUEUE", "DONE", "LOCK", "extract", "identity", "transcript_text",
-                  "STATE_DIR", "LEGACY_DIR", "legacy_twin")}
-        mem_extract.mem_ops = lambda cmd, payload, timeout=10: "[]" if cmd == "search" else "{}"
-        mem_extract.QUEUE, mem_extract.DONE = queue, done
-        mem_extract.LOCK = os.path.join(tmp, "lock")
-        mem_extract.STATE_DIR = os.path.join(tmp, "state")
-        mem_extract.LEGACY_DIR = os.path.join(tmp, "legacy")
-        mem_extract.legacy_twin = lambda name: None
-        mem_extract.identity = lambda: "alice"
-        mem_extract.transcript_text = lambda path: ("from another reader <private>KEY-42</private> "
-                                                    + "x" * 600)
-        mem_extract.extract = lambda text: seen.append(text) or []
-        argv, sys.argv = sys.argv, ["mem_extract.py"]
-        try:
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                mem_extract.main()
-        finally:
-            sys.argv = argv
-            for k, v in saved.items():
-                setattr(mem_extract, k, v)
-        check("the model is never handed a private span, whatever produced the text",
-              len(seen) == 1 and "KEY-42" not in seen[0] and "another reader" in seen[0],
-              repr(seen)[:200])
+              and "next turn survives" in text and "deploy notes" in text, repr(text)[:300])
+        check("a span longer than the per-turn cut is stripped before the cut",
+              "LONGSECRET" not in text and "sss" not in text and "after the long one" in text,
+              repr(text)[:300])
     import mem_recall
     asked = []
     saved_ops = mem_recall.mem_ops

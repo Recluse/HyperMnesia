@@ -735,11 +735,26 @@ def main():
               same == sorted(same, reverse=True), str(same))
 
         print("\n== compact index, batch get, timeline ==")
-        seq = [write(ac, alice, type="semantic", content=f"kernel note {n}: " + "detail " * 30)
-               for n in range(5)]
-        other_project = write(ac, alice, type="semantic", content="kernel note elsewhere",
-                              project=P2)
-        bobs = write(bc, bob, type="semantic", content="kernel note by bob")
+        # Foreign rows are written BETWEEN alice's, so the isolation checks below have rows to
+        # keep out: another project, another author, an expired row and a future one.
+        seq, foreign = [], {}
+        for n in range(5):
+            seq.append(write(ac, alice, type="semantic",
+                             content=f"kernel note {n}: " + "detail " * 30))
+            if n == 1:
+                foreign["other project"] = write(ac, alice, type="semantic",
+                                                 content="kernel note elsewhere", project=P2)
+                foreign["other author"] = write(bc, bob, type="semantic",
+                                                content="kernel note by bob")
+            if n == 2:
+                foreign["expired"] = write(ac, alice, type="semantic",
+                                           content="kernel note that expired")
+                owner_sql("UPDATE mem.memories SET valid_to = '2000-01-01' WHERE id=%s",
+                          (foreign["expired"],))
+                foreign["future"] = write(ac, alice, type="semantic",
+                                          content="kernel note not yet valid")
+                owner_sql("UPDATE mem.memories SET valid_from = '2099-01-01' WHERE id=%s",
+                          (foreign["future"],))
         secret = write(ac, alice, type="semantic", content="kernel private note", scope="private")
         out = cli("search", {"query": "kernel note", "k": 5, "brief": True})
         lines = [l for l in out.splitlines() if l.startswith("[#")]
@@ -763,8 +778,50 @@ def main():
         check("timeline: the row and one neighbour on each side, oldest first",
               [l.split("]")[0] for l in tl] == [f"[#{seq[1]}", f"[#{seq[2]}", f"[#{seq[3]}"], out)
         check("timeline: the anchor is marked", "<- this one" in tl[1] if len(tl) > 1 else False, out)
-        check("timeline: other projects and other authors stay out",
-              f"#{other_project}]" not in out and f"#{bobs}]" not in out, out)
+        for what, fid in foreign.items():
+            check(f"timeline: {what} stays out", f"[#{fid}]" not in out, out)
+        out = cli("timeline", {"id": seq[2], "before": 3, "after": 3, "include_inactive": True})
+        check("include_inactive brings the expired and future rows back, still not the others",
+              f"[#{foreign['expired']}]" in out and f"[#{foreign['future']}]" in out
+              and f"[#{foreign['other author']}]" not in out
+              and f"[#{foreign['other project']}]" not in out, out)
+        for bad in ({"id": True}, {"id": 1.9}, {"id": str(seq[2])},
+                    {"id": seq[2], "before": True}, {"id": seq[2], "after": 2.5},
+                    {"id": seq[2], "include_inactive": "false"}):
+            try:
+                cli("timeline", bad)
+                refused = False
+            except SystemExit:
+                refused = True
+            check(f"timeline refuses {bad!r} instead of coercing it", refused)
+        out = cli("search", {"query": "kernel note", "k": 3, "brief": "yes"})
+        check("brief is honoured only when it is literally true",
+              "get with ids=" not in out, out[-200:])
+
+        print("\n== <private> spans never reach the embedder or the table ==")
+        seen = []
+        real_embed = m.embed
+        m.embed = lambda text: (seen.append(text), real_embed(text))[1]
+        try:
+            cli("search", {"query": "kernel <private>CANARY-1</private> note", "k": 1})
+            mid = json.loads(cli("write", {"type": "semantic", "project": P1, "format": "json",
+                                           "title": "t <private>CANARY-3</private>",
+                                           "content": "deploy <private>CANARY-2</private> window"}))["id"]
+        finally:
+            m.embed = real_embed
+        stored = owner_sql("SELECT content, coalesce(title, '') FROM mem.memories WHERE id=%s",
+                           (mid,))[0]
+        check("neither the query nor the content reached the embedder with its private span",
+              seen and not any("CANARY" in t for t in seen), str(seen))
+        check("the stored content and title have no private span",
+              "CANARY" not in stored[0] and "CANARY" not in stored[1], str(stored))
+        for content in ("<private>only this</private>", "  <PRIVATE>unclosed"):
+            try:
+                cli("write", {"type": "semantic", "project": P1, "content": content})
+                refused = False
+            except SystemExit:
+                refused = True
+            check(f"a write that is nothing but a private span is refused ({content!r})", refused)
         check("timeline of a row the reader may not see says not found",
               cli("timeline", {"id": secret}, who="bob") == "(not found)")
         owner_sql("UPDATE mem.memories SET metadata = metadata || '{\"kind\":\"page\"}' "

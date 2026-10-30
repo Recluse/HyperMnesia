@@ -1867,33 +1867,38 @@ def do_timeline(cur, p):
     the anchor marked. Borrowed from claude-mem's timeline: the neighbours of a hit are often the
     context that explains it. Readability is the views' rule (mem.may_read); history is included
     only on request, as in search."""
-    try:
-        mid = int(p["id"])
-        before = max(0, min(10, int(p.get("before", 3))))
-        after = max(0, min(10, int(p.get("after", 3))))
-    except (KeyError, TypeError, ValueError):
-        raise SystemExit("timeline takes an integer id, and before/after of 0..10")
+    def whole(v):
+        return isinstance(v, int) and not isinstance(v, bool)
+    mid, before, after = p.get("id"), p.get("before", 3), p.get("after", 3)
+    if not (whole(mid) and whole(before) and whole(after)) \
+            or not isinstance(p.get("include_inactive", False), bool):
+        # Exact types, no coercion: `true` or 1.9 as an id would quietly mean row 1, and the
+        # string "false" as include_inactive would be truthy.
+        raise SystemExit("timeline takes an integer id, integer before/after (0..10) and a "
+                         "boolean include_inactive")
+    before, after = max(0, min(10, before)), max(0, min(10, after))
     cur.execute("""SELECT author, project, created_at FROM mem.memories m
                    WHERE id=%s AND mem.may_read(m.author, m.scope, m.project)""", (mid,))
     anchor = cur.fetchone()
     if not anchor:
         return "(not found)"                  # same answer as get: existence is not disclosed
     author, project, at = anchor
-    status = "" if p.get("include_inactive") else "AND m.status = 'active'"
+    # The views apply the reader's rule; the active one also drops rows outside their validity
+    # window, as search does -- status alone let an expired or not-yet-valid row through.
+    view = "mem.all_memories" if p.get("include_inactive") is True else "mem.active_memories"
     cols = """m.id, m.memory_type::text, m.status::text, m.importance, m.confidence,
               m.created_at::date::text, m.valid_from::date::text, m.valid_to::date::text,
               m.project, m.content"""
     scope = """m.author = %s AND m.project IS NOT DISTINCT FROM %s
-               AND mem.may_read(m.author, m.scope, m.project)
                AND (m.metadata->>'kind') IS DISTINCT FROM 'page'"""
-    cur.execute(f"""SELECT {cols} FROM mem.memories m WHERE {scope} {status}
+    cur.execute(f"""SELECT {cols} FROM {view} m WHERE {scope}
                     AND (m.created_at, m.id) < (%s, %s)
                     ORDER BY m.created_at DESC, m.id DESC LIMIT %s""",
                 (author, project, at, mid, before))
     older = list(reversed(cur.fetchall()))
     cur.execute(f"SELECT {cols} FROM mem.memories m WHERE m.id = %s", (mid,))
     middle = cur.fetchall()
-    cur.execute(f"""SELECT {cols} FROM mem.memories m WHERE {scope} {status}
+    cur.execute(f"""SELECT {cols} FROM {view} m WHERE {scope}
                     AND (m.created_at, m.id) > (%s, %s)
                     ORDER BY m.created_at, m.id LIMIT %s""",
                 (author, project, at, mid, after))
@@ -1969,6 +1974,35 @@ def _get_one(cur, mid, as_json):
                   f"{(' — ' + exc[:120]) if exc else ''}")
 
 
+_PRIVATE_TAG = re.compile(r"<(/?)private>", re.I)
+
+
+def strip_private(text):
+    """`text` without its <private>...</private> spans: nested spans, a stray close dropped, an
+    unclosed tag hiding the rest. The same rule as hooks/_mem_common.py strip_private(), which
+    this file does not import (it can run in a pod or a container); the hooks strip before
+    anything leaves the machine, and this is the backstop for what arrives some other way -- an
+    MCP memory_search or memory_write the model filled in."""
+    text = text or ""
+    out, pos, depth = [], 0, 0
+    for tag in _PRIVATE_TAG.finditer(text):
+        if not tag.group(1):
+            if depth == 0:
+                out.append(text[pos:tag.start()])
+            depth += 1
+        elif depth:
+            depth -= 1
+            if depth == 0:
+                pos = tag.end()
+        else:
+            out.append(text[pos:tag.start()])
+            pos = tag.end()
+    if depth:
+        return "".join(out)
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     p = json.loads(sys.stdin.read() or "{}")
@@ -1976,6 +2010,12 @@ def main():
     # stdin is external by definition -- an MCP client, a hook, a person -- so none survive.
     if isinstance(p, dict):
         p = {k: v for k, v in p.items() if not str(k).startswith("_trusted")}
+        # Before anything is embedded, searched, stored or logged: the texts a caller hands in.
+        for key in ("query", "content", "title"):
+            if isinstance(p.get(key), str) and _PRIVATE_TAG.search(p[key]):
+                p[key] = strip_private(p[key]).strip()
+                if key == "content" and not p[key]:
+                    raise SystemExit("content is empty once its <private> spans are removed")
     conn = connect()
     cur = conn.cursor()
     # Before ANY statement: every read surface below filters on this, and a connection that
@@ -2006,8 +2046,8 @@ def main():
             if not rows:
                 print("(no memories found)")
             for r in rows:
-                print(fmt_brief(r) if p.get("brief") else fmt_row(r))
-            if rows and p.get("brief"):
+                print(fmt_brief(r) if p.get("brief") is True else fmt_row(r))
+            if rows and p.get("brief") is True:
                 print(f"(full text: get with ids={[r[0] for r in rows]})")
     elif cmd == "context":
         result = do_context(cur, p)

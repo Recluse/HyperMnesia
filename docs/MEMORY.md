@@ -269,10 +269,13 @@ the fact that a secret existed survives, the secret does not. Best-effort (known
 guarantee); ordinary prose like "the password reset flow" is left untouched.
 
 **Keeping a span out.** `<private>...</private>` in a prompt or a message keeps that span out of
-everything: the extractor drops it from each turn before the model sees the transcript (and once
-more right before the model call), and recall drops it from the prompt before the prompt becomes
-a search query. The tag is case-insensitive and may span lines; an opening tag without its close
-hides the rest of that turn.
+everything: the extractor drops it from each turn, before any cut, so the model never sees it;
+recall drops it from the prompt before the prompt becomes a search query; and `mem_ops.py` drops
+it from a query, content or title that reaches it some other way -- an MCP `memory_search` or
+`memory_write` the model filled in -- before anything is embedded, searched or stored, and
+refuses a write that is nothing but a private span. The tag is case-insensitive and may span
+lines; spans nest, a stray `</private>` is dropped, and an opening tag without its close hides
+the rest of that turn.
 
 **The LLM step is pluggable** (see `hooks/_llm.py`): set `HM_LLM_BACKEND` to `openai`
 (`HM_LLM_URL`/`HM_LLM_KEY`/`HM_LLM_MODEL`), `ollama` (`HM_LLM_MODEL`), or `cli` (`HM_LLM_CMD`).
