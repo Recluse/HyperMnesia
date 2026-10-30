@@ -384,8 +384,17 @@ def check_identity(out):
                            "One login per author makes the database enforce it: ./hm author add"))
 
 
-QUEUE = os.path.expanduser("~/.claude/mem-queue.jsonl")
-DONE = os.path.expanduser("~/.claude/mem-queue.done")
+# Where the hooks keep them: HYPERMNESIA_HOME/state once ci/install.py has created it, ~/.claude
+# until then (_mem_common.state_path). A doctor that cannot import the hooks looks where an
+# install that never ran the installer keeps them.
+def _state_path(name):
+    if _mem_common is not None:
+        return _mem_common.state_path(name)
+    return os.path.expanduser(os.path.join("~", ".claude", name))
+
+
+QUEUE = _state_path("mem-queue.jsonl")
+DONE = _state_path("mem-queue.done")
 REEXTRACT_BYTES = 10 * 1024 * 1024              # hooks/mem_extract.py: done_key()
 
 
@@ -429,7 +438,7 @@ def check_extraction(out):
         if depth:
             out.append(finding(WARN, f"{depth} transcript(s) wait for extraction",
                                "and MEM_AUTHOR is unset, so the extractor cannot write any of them",
-                               "Set MEM_AUTHOR (~/.claude/hypermnesia.env)."))
+                               f"Set MEM_AUTHOR ({getattr(_mem_common, 'ENV_FILE', None) or 'hypermnesia.env'})."))
         return
     lit = "'" + who.replace("'", "''") + "'"
     rows, err = q("SELECT coalesce(extract(epoch FROM now() - max(m.created_at))::bigint, -1) "

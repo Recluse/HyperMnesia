@@ -24,7 +24,73 @@ import json, os, re, secrets, subprocess, sys, time
 # block. The boundary is the stat below: the file is ignored ENTIRELY and loudly unless it is
 # owned by this user, unwritable by anyone else, and sitting in a directory with the same
 # property. A partly-applied file carrying someone else's values is worse than none.
-ENV_FILE = os.path.expanduser(os.environ.get("HYPERMNESIA_ENV_FILE", "~/.claude/hypermnesia.env"))
+ENV_FILE = None   # set below, once HOME_DIR is known
+
+# -- where this machine keeps HyperMnesia ------------------------------------
+# One directory per machine, the same shape on every OS (ci/install.py creates it):
+#   HOME_DIR/hypermnesia.env    the settings file above
+#   HOME_DIR/current            the installed release, switched by the installer
+#   HOME_DIR/state/             queue, done list, caches, fault markers, locks
+#   HOME_DIR/logs/              what the schedulers write
+# Before it existed, everything ran out of a working copy and kept its state among Claude Code's
+# own files in ~/.claude. A working copy is a bad thing to run from: a tree copied over one
+# changes what every scheduled job executes, silently, and `cargo clean` in it takes the MCP
+# server of every open session with it. HYPERMNESIA_HOME moves the whole thing (tests, a second
+# install); an empty value counts as unset.
+HOME_DIR = os.path.abspath(os.path.expanduser(os.environ.get("HYPERMNESIA_HOME") or "~/.HyperMnesia"))
+STATE_DIR = os.path.join(HOME_DIR, "state")
+LOG_DIR = os.path.join(HOME_DIR, "logs")
+# Where an install from before HOME_DIR kept the same files.
+LEGACY_DIR = os.path.expanduser("~/.claude")
+
+
+def state_path(name):
+    """HOME_DIR/state/<name> once the state directory exists, else the same name in ~/.claude.
+
+    One place or the other, never a mix: ci/install.py moves every state file out of ~/.claude
+    and only then creates state/, so its existence means the move has happened. A hook therefore
+    never moves anything itself -- importing a module must not relocate a queue under a job of
+    the old layout that is still writing it -- and a checkout run before any install keeps
+    working exactly where it always did.
+    """
+    if os.path.isdir(STATE_DIR):
+        return os.path.join(STATE_DIR, name)
+    return os.path.join(LEGACY_DIR, name)
+
+
+def legacy_twin(name):
+    """The ~/.claude copy of a state file that an old-layout process may still be writing, once
+    state/ is in use; None before that (then state_path() IS the ~/.claude file), and None for a
+    link or anything that is not a regular file.
+
+    For the extraction queue and its done list only, which are append-only and read, never
+    rewritten: a hook that started before ci/install.py switched computed the old path at import
+    and may append there once more, and the installer leaves a colliding queue where it is rather
+    than merge it under a live writer. The extractor reads both files, writes only the new ones,
+    and removes the old pair when nothing has touched it for a day and everything in it is done --
+    it is never copied and deleted, which would lose a line appended between the copy and the
+    delete.
+    """
+    if not os.path.isdir(STATE_DIR):
+        return None
+    old = os.path.join(LEGACY_DIR, name)
+    return old if os.path.isfile(old) and not os.path.islink(old) else None
+
+
+def _env_file():
+    """The settings file: HYPERMNESIA_ENV_FILE, else HOME_DIR/hypermnesia.env, else the copy an
+    older install has in ~/.claude while that is the only one. An empty variable counts as unset.
+    The file is not moved here: it has an owner and a mode the loader checks, and moving it is
+    the installer's job, done once and reported."""
+    explicit = os.environ.get("HYPERMNESIA_ENV_FILE")
+    if explicit:
+        return os.path.expanduser(explicit)
+    new = os.path.join(HOME_DIR, "hypermnesia.env")
+    old = os.path.join(LEGACY_DIR, "hypermnesia.env")
+    return old if not os.path.exists(new) and os.path.exists(old) else new
+
+
+ENV_FILE = _env_file()
 
 # The knobs the console offers (console/src/settings.rs, KNOBS) plus the endpoints a deployment
 # has to name somewhere. tests/test_settings_knobs.py keeps this list and that one in step.
@@ -60,6 +126,11 @@ def _file_fault(path):
         st = os.stat(path)
     except OSError:
         return None                          # no file is not a fault: there are defaults
+    if not hasattr(os, "getuid"):
+        # Windows: no owner uid and no group/other mode bits to read -- the protection there is
+        # the profile directory's ACL. The MCP server skips the same check off unix, so both
+        # readers still agree about the file.
+        return None
     if st.st_mode & 0o022:
         return f"{path} is writable by others (chmod 600)"
     if st.st_uid != os.getuid():
@@ -303,7 +374,7 @@ def profile_cache_path():
     """
     import hashlib
     tag = hashlib.sha256((identity() or "anon").encode("utf-8")).hexdigest()[:16]
-    return os.path.expanduser(f"~/.claude/hypermnesia-profile-cache.{tag}.txt")
+    return state_path(f"hypermnesia-profile-cache.{tag}.txt")
 
 
 def _reader_env():
@@ -349,7 +420,7 @@ def psql(sql, timeout=10):
                 env=_reader_env())
 
 
-STORE_DOWN = os.path.expanduser("~/.claude/hypermnesia-store-down")
+STORE_DOWN = state_path("hypermnesia-store-down")
 
 
 def flag_flip(name, on):
@@ -362,7 +433,7 @@ def flag_flip(name, on):
     then reasons as if the store were empty rather than absent. One marker file per fault
     kind; its existence IS the state.
     """
-    path = os.path.expanduser(f"~/.claude/hypermnesia-{name}")
+    path = state_path(f"hypermnesia-{name}")
     try:
         was = os.path.exists(path)
         if on and not was:

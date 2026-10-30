@@ -20,10 +20,10 @@ Refuses to start without a valid MEM_AUTHOR.
 import json, math, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _mem_common import (mem_ops, psql, defang, acquire_lock, release_lock, profile_cache_path,
-                         identity)
+                         identity, state_path)
 from _llm import complete
 
-LOCK = os.path.expanduser("~/.claude/mem-consolidate.lock")
+LOCK = state_path("mem-consolidate.lock")
 # The same per-identity path mem_profile.py writes. A literal here went stale when the cache
 # became per-identity, and the invalidation below then deleted a file nothing reads.
 PROFILE_CACHE = profile_cache_path()

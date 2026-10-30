@@ -20,12 +20,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _mem_common import (mem_ops, acquire_lock, release_lock, profile_cache_path,  # noqa: E402
-                         identity)
+                         identity, state_path)
 from _llm import complete        # noqa: E402
 
 MIN_MEMS = int(os.environ.get("MEM_REFLECT_MIN", "5"))   # skip projects with fewer active memories
 MAX_MEMS = int(os.environ.get("MEM_REFLECT_MAX", "80"))  # cap what we feed the LLM
-LOCK = os.path.expanduser("~/.claude/mem-reflect.lock")
+LOCK = state_path("mem-reflect.lock")
 PROFILE_CACHE = profile_cache_path()  # the per-identity file mem_profile.py actually writes
 
 PROMPT = """You maintain a long-term-memory "page" for an AI coding agent about ONE project. Below \

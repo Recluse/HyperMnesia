@@ -14,10 +14,10 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _mem_common import acquire_lock, defang, identity, mem_ops, release_lock
+from _mem_common import acquire_lock, defang, identity, mem_ops, release_lock, state_path
 from _llm import complete
 
-LOCK = os.path.expanduser("~/.claude/hypermnesia-dream.lock")
+LOCK = state_path("hypermnesia-dream.lock")
 MIN_MEMORIES = int(os.environ.get("MEM_DREAM_MIN_MEMORIES", "3"))
 MAX_MEMORIES = int(os.environ.get("MEM_DREAM_MAX_MEMORIES", "24"))
 MAX_GROUPS = int(os.environ.get("MEM_DREAM_MAX_GROUPS", "2"))

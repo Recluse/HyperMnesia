@@ -5,7 +5,8 @@ to mem.* with provenance. Run manually or from cron/systemd/launchd; NOT from a 
 
     python3 hooks/mem_extract.py [--dry-run] [--limit N]
 
-Idempotent: processed transcript paths are recorded in ~/.claude/mem-queue.done;
+Idempotent: processed transcript paths are recorded in <HYPERMNESIA_HOME>/state/mem-queue.done
+(~/.claude/mem-queue.done until ci/install.py has created state/);
 a lock file serializes concurrent runs. A write-time novelty gate (is_duplicate:
 exact-substring + tight semantic paraphrase with a negation guard) drops repeats so
 they don't pile up; deeper semantic consolidation is the cron agent's job.
@@ -16,16 +17,17 @@ Exit status: 0 when every pending transcript it reached was processed or legitim
 1 when anything failed (a write, a duplicate check, an extraction) -- those transcripts stay
 queued for the next run; 2 when MEM_AUTHOR is unset or invalid (nothing is attempted).
 """
-import json, os, re, sys
+import json, os, re, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _mem_common import mem_ops, defang, acquire_lock, release_lock, identity
+from _mem_common import (mem_ops, defang, acquire_lock, release_lock, identity, state_path,
+                         legacy_twin, LEGACY_DIR, STATE_DIR)
 from _llm import complete
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ingest"))
 from _redact import scrub
 
-QUEUE = os.path.expanduser("~/.claude/mem-queue.jsonl")
-DONE = os.path.expanduser("~/.claude/mem-queue.done")
-LOCK = os.path.expanduser("~/.claude/mem-extract.lock")
+QUEUE = state_path("mem-queue.jsonl")
+DONE = state_path("mem-queue.done")
+LOCK = state_path("mem-extract.lock")
 TAIL_CHARS = 60_000       # transcript tail given to the extractor
 
 PROMPT = """You are a long-term-memory extractor for an AI coding agent. Below is a slice of a \
@@ -265,6 +267,77 @@ def done_key(tp):
         return tp
 
 
+def retire_legacy_queue(old_queue, old_done, quiet=86400, settle=2.0):
+    """Remove the ~/.claude queue an old-layout process left, once nobody has written it for
+    `quiet` seconds and every record in it is done.
+
+    A capture hook of an unwired config can still append at any moment, so the file is never read
+    and then deleted: it is renamed aside first (a writer that already has it open keeps writing
+    into that inode; a new one creates a fresh file, which the next run reads), left to settle --
+    hooks live well under a second -- and only then read. Anything not done by then is appended to
+    the new queue, so the delete loses nothing. Its done list is folded into the new one first.
+    A `.retiring` file a dead run left is finished the same way."""
+    retiring = _retiring()
+    if not old_queue and not os.path.exists(retiring):
+        return
+    try:
+        if old_queue and not os.path.exists(retiring):
+            if any(p and time.time() - os.path.getmtime(p) < quiet for p in (old_queue, old_done)):
+                return
+            if not _all_done(old_queue, old_done):
+                return                        # still pending: keep reading it
+            os.replace(old_queue, retiring)
+            time.sleep(settle)
+        done = _done_union(old_done)
+        late = []
+        for line in open(retiring, encoding="utf-8"):
+            try:
+                tp = json.loads(line).get("transcript_path")
+            except (ValueError, AttributeError):
+                continue
+            if tp and done_key(tp) not in done:
+                late.append(line if line.endswith("\n") else line + "\n")
+        if late:
+            with open(QUEUE, "a", encoding="utf-8") as f:
+                f.write("".join(late))
+        if old_done and os.path.exists(old_done):
+            have = (set(open(DONE, encoding="utf-8").read().splitlines())
+                    if os.path.exists(DONE) else set())
+            with open(DONE, "a", encoding="utf-8") as f:
+                for k in sorted(set(open(old_done, encoding="utf-8").read().splitlines()) - have):
+                    f.write(k + "\n")
+            os.remove(old_done)
+        os.remove(retiring)
+        print("retired the ~/.claude queue an old-layout process left"
+              + (f" ({len(late)} late record(s) moved to the new queue)" if late else ""))
+    except OSError:
+        pass
+
+
+def _retiring():
+    return os.path.join(LEGACY_DIR, "mem-queue.jsonl.retiring")
+
+
+def _done_union(old_done):
+    done = set()
+    for path in (DONE, old_done):
+        if path and os.path.exists(path):
+            done |= set(open(path, encoding="utf-8").read().splitlines())
+    return done
+
+
+def _all_done(queue_path, old_done):
+    done = _done_union(old_done)
+    for line in open(queue_path, encoding="utf-8"):
+        try:
+            tp = json.loads(line).get("transcript_path")
+        except (ValueError, AttributeError):
+            continue
+        if tp and done_key(tp) not in done:
+            return False
+    return True
+
+
 def main():
     dry = "--dry-run" in sys.argv
     limit = int(sys.argv[sys.argv.index("--limit") + 1]) if "--limit" in sys.argv else 20
@@ -283,12 +356,18 @@ def main():
         print("another extract run holds the lock; exiting")
         return 0
     try:
+        # A queue an old-layout hook may still have appended to in ~/.claude after
+        # ci/install.py switched is a second source, read but never written (legacy_twin).
+        old_queue, old_done = legacy_twin("mem-queue.jsonl"), legacy_twin("mem-queue.done")
         done = set()
-        if os.path.exists(DONE):
-            done = set(open(DONE, encoding="utf-8").read().splitlines())
+        for path in (DONE, old_done):
+            if path and os.path.exists(path):
+                done |= set(open(path, encoding="utf-8").read().splitlines())
         queue, seen = [], set()
-        if os.path.exists(QUEUE):
-            for line in open(QUEUE, encoding="utf-8"):
+        for path in (QUEUE, old_queue):
+            if not path or not os.path.exists(path):
+                continue
+            for line in open(path, encoding="utf-8"):
                 try:
                     r = json.loads(line)
                 except ValueError:
@@ -376,6 +455,8 @@ def main():
             elif failed:
                 run_failures += 1
                 print(f"  NOT marking done -- {failed} item(s) failed, will retry next run")
+        if not dry and os.path.isdir(STATE_DIR):
+            retire_legacy_queue(old_queue, old_done)
     finally:
         release_lock(LOCK)
     if run_failures:

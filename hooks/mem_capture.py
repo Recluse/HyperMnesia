@@ -7,9 +7,9 @@ compaction mid-session. The queue is consumed by mem_extract.py. Fail-open.
 """
 import json, os, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _mem_common import read_stdin_json
+from _mem_common import read_stdin_json, state_path
 
-QUEUE = os.path.expanduser("~/.claude/mem-queue.jsonl")
+QUEUE = state_path("mem-queue.jsonl")
 
 
 def main():

@@ -60,9 +60,9 @@ def run_hook(script, event, extra_env=None, fake_psql_out=None):
     env.pop("CLAUDE_PROJECT_DIR", None)   # arch_invariants resolves paths against it
     env.update(extra_env or {})
     with tempfile.TemporaryDirectory() as tmp:
-        # The hooks keep one-notice-per-fault markers under $HOME/.claude. Never let a test
-        # run write into (or clear) the real one; callers that need the markers to persist
-        # across two runs pass their own HOME.
+        # The hooks keep one-notice-per-fault markers under $HOME (~/.HyperMnesia/state, or
+        # ~/.claude before an install). Never let a test run write into (or clear) the real
+        # ones; callers that need the markers to persist across two runs pass their own HOME.
         # (setdefault would not do: HOME is already inherited from os.environ.)
         env["HOME"] = (extra_env or {}).get("HOME", tmp)
         if fake_psql_out is not None:

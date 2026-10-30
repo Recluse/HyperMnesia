@@ -97,8 +97,11 @@ def check(name, ok, detail=""):
         failures.append(name)
 
 
-def run(answers, env_extra=None, fail=False, queue=None):
-    """Run the doctor against a stubbed store; returns (findings, exit_code)."""
+def run(answers, env_extra=None, fail=False, queue=None, queue_dir=".claude"):
+    """Run the doctor against a stubbed store; returns (findings, exit_code).
+
+    queue_dir is where the queue is written, relative to the throwaway HOME: ~/.claude for an
+    install that never ran ci/install.py, .HyperMnesia/state for one that did."""
     with tempfile.TemporaryDirectory() as tmp:
         shim = os.path.join(tmp, "psql")
         with open(shim, "w", encoding="utf-8") as f:
@@ -120,10 +123,12 @@ def run(answers, env_extra=None, fail=False, queue=None):
         # A private HOME: no settings file, no identity and no extraction queue leak in from
         # the machine running the test.
         env.pop("MEM_AUTHOR", None)
+        env.pop("HYPERMNESIA_HOME", None)
+        env.pop("HYPERMNESIA_ENV_FILE", None)
         env["HOME"] = tmp
         if queue is not None:
-            os.makedirs(os.path.join(tmp, ".claude"), exist_ok=True)
-            with open(os.path.join(tmp, ".claude", "mem-queue.jsonl"), "w") as f:
+            os.makedirs(os.path.join(tmp, queue_dir), exist_ok=True)
+            with open(os.path.join(tmp, queue_dir, "mem-queue.jsonl"), "w") as f:
                 for i in range(queue):
                     f.write(json.dumps({"transcript_path": f"/nonexistent/t{i}.jsonl"}) + "\n")
         if fail:
@@ -331,6 +336,13 @@ def main():
     stall = by_title(f, "stalled")
     check("a ten-day-old newest extraction with a queue is flagged",
           (stall or {}).get("level") == "warn" and "4 transcript(s) queued"
+          in stall.get("detail", ""), str(stall))
+    # Installed: the queue lives in HYPERMNESIA_HOME/state, and the doctor must count it there.
+    f, _ = run(ext, env_extra={"MEM_AUTHOR": "alice"}, queue=2,
+               queue_dir=os.path.join(".HyperMnesia", "state"))
+    stall = by_title(f, "stalled")
+    check("the queue is counted in HYPERMNESIA_HOME/state once that exists",
+          (stall or {}).get("level") == "warn" and "2 transcript(s) queued"
           in stall.get("detail", ""), str(stall))
     ext["channel = 'extractor'"] = [["600"]]
     f, _ = run(ext, env_extra={"MEM_AUTHOR": "alice"}, queue=0)
