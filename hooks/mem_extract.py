@@ -290,10 +290,12 @@ def retire_legacy_queue(old_queue, old_done, quiet=86400):
                 return
             if not _all_done(old_queue, old_done):
                 return                        # still pending: keep reading it as a source
-            os.replace(old_queue, retiring)
             # The quiet period of step 3 starts now, not at the last write: a hook can have the
-            # file open without having written yet, and opening does not touch mtime.
-            os.utime(retiring, None)
+            # file open without having written yet, and opening does not touch mtime. Touched
+            # BEFORE the rename: a run that dies in between must not leave a `.retiring` whose old
+            # mtime lets the next run delete it at once.
+            os.utime(old_queue, None)
+            os.replace(old_queue, retiring)
             print("set the ~/.claude queue an old-layout process left aside for retirement")
         if not os.path.exists(retiring):
             return

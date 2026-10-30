@@ -174,6 +174,31 @@ assert not q_left and first.count("/t/late.jsonl") == 1 and "/t/a.jsonl" not in 
 assert second == first, "a record already carried was carried twice"
 assert "/t/late.jsonl" in carried and not_done, "a carried record must still be extracted"
 assert kept and not r_left and not c_left, "retired a day after the rename, the carried list with it"
+# A run that dies between the touch and the rename leaves the old queue freshly touched, so the
+# next run starts the quiet day over instead of deleting a just-renamed file at once.
+crash = """
+import json, os, sys, time
+sys.path.insert(0, %r)
+import mem_extract as e
+q = os.path.join(e.LEGACY_DIR, "mem-queue.jsonl")
+open(q, "w").write(json.dumps({"transcript_path": "/t/c.jsonl"}) + "\\n")
+with open(e.DONE, "a") as f: f.write(e.done_key("/t/c.jsonl") + "\\n")
+old = time.time() - 2 * 86400
+os.utime(q, (old, old))
+real = os.replace
+def die(src, dst): raise OSError("killed between the touch and the rename")
+e.os.replace = die
+e.retire_legacy_queue(q, None)
+e.os.replace = real
+fresh = time.time() - os.path.getmtime(q) < 60
+e.retire_legacy_queue(q, None)
+print(json.dumps([fresh, os.path.exists(q), os.path.exists(q + ".retiring")]))
+""" % HOOKS
+cw = tmp / "cw"
+(cw / ".claude").mkdir(parents=True)
+(cw / ".HyperMnesia" / "state").mkdir(parents=True)
+assert json.loads(py(crash, cw, MEM_AUTHOR="t")) == [True, True, False]
+
 # A .retiring file a dead run left, long quiet, is finished by the next one.
 (lw / ".claude" / "mem-queue.jsonl.retiring").write_text('{"transcript_path": "/t/b.jsonl"}\n')
 os.utime(lw / ".claude" / "mem-queue.jsonl.retiring", (1000, 1000))
