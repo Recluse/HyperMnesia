@@ -496,29 +496,78 @@ fn an_escaped_stdin_holder_does_not_leak_threads_or_fds() {
     assert_eq!(s.next(Duration::from_secs(5)).expect("ping")["id"], 20);
 }
 
+/// A HYPERMNESIA_HOME with releases a and b and `current -> releases/a`; `files` are written into
+/// both releases (with the release name substituted for `{r}`), `only_b` into b alone.
+fn two_releases(tag: &str, files: &[(&str, &str)], only_b: &[(&str, &str)]) -> std::path::PathBuf {
+    let base = std::env::temp_dir().join(format!("hm-pin-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    for r in ["a", "b"] {
+        let rel = base.join("releases").join(r);
+        std::fs::create_dir_all(&rel).unwrap();
+        for (name, body) in files { std::fs::write(rel.join(name), body.replace("{r}", r)).unwrap(); }
+    }
+    for (name, body) in only_b { std::fs::write(base.join("releases/b").join(name), body).unwrap(); }
+    std::os::unix::fs::symlink("releases/a", base.join("current")).unwrap();
+    base
+}
+
+fn switch_to_b(base: &std::path::Path) {
+    std::fs::remove_file(base.join("current")).unwrap();
+    std::os::unix::fs::symlink("releases/b", base.join("current")).unwrap();
+}
+
 #[test]
-fn a_script_named_through_a_link_stays_in_the_release_it_started_with() {
+fn a_script_named_through_current_stays_in_the_release_it_started_with() {
     // `ci/install.py --wire` points HM_* script variables at <home>/current/..., and the next
     // install moves `current`. A session started before that must keep running the scripts of
     // the release it started with, as it keeps its own binary.
-    let base = std::env::temp_dir().join(format!("hm-pin-releases-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    for r in ["a", "b"] {
-        std::fs::create_dir_all(base.join(r)).unwrap();
-        std::fs::write(base.join(r).join("dialectic.sh"),
-                       format!("cat >/dev/null; echo '{{\"version\":3,\"answer\":\"{r}\"}}'\n")).unwrap();
-    }
-    std::os::unix::fs::symlink("a", base.join("current")).unwrap();
+    let base = two_releases("link", &[("dialectic.sh",
+        "cat >/dev/null; echo '{\"version\":3,\"answer\":\"{r}\"}'\n")], &[]);
     let named = base.join("current/dialectic.sh");
-    let mut s = Session::start_with("pin", &[("HM_DIALECTIC", named.to_str().unwrap())]);
+    let mut s = Session::start_with("pin", &[("HM_DIALECTIC", named.to_str().unwrap()),
+                                             ("HYPERMNESIA_HOME", base.to_str().unwrap())]);
     s.send(Session::call(1, "memory_ask", json!({"query":"q"})));
     let v = s.next(Duration::from_secs(15)).expect("answered");
     assert_eq!(v["result"]["structuredContent"]["answer"], "a", "{v}");
-    std::fs::remove_file(base.join("current")).unwrap();
-    std::os::unix::fs::symlink("b", base.join("current")).unwrap();
+    switch_to_b(&base);
     s.send(Session::call(2, "memory_ask", json!({"query":"q"})));
     let v = s.next(Duration::from_secs(15)).expect("answered");
     assert_eq!(v["result"]["structuredContent"]["answer"], "a",
                "after `current` moved, the session ran the next release's script");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn children_inherit_the_pinned_scripts_and_a_missing_one_stays_in_its_release() {
+    // The dialectic starts mem_ops by HM_MEM_OPS: a child must see the pinned value, not the
+    // `current` path the config named. And a script the starting release does not have must not
+    // be picked up from the next one after a switch.
+    let base = two_releases("children", &[
+        ("mem_ops.sh", "echo op\n"),
+        ("dialectic.sh", "cat >/dev/null; echo \"{\\\"version\\\":3,\\\"answer\\\":\\\"$HM_MEM_OPS\\\"}\"\n"),
+    ], &[("new.sh", "cat >/dev/null; echo '{\"version\":3,\"answer\":\"from b\"}'\n")]);
+    let cur = base.join("current");
+    let home = base.to_str().unwrap();
+    let mut s = Session::start_with("pin-children", &[
+        ("HM_DIALECTIC", cur.join("dialectic.sh").to_str().unwrap()),
+        ("HM_MEM_OPS", cur.join("mem_ops.sh").to_str().unwrap()), ("HYPERMNESIA_HOME", home)]);
+    s.send(Session::call(1, "memory_ask", json!({"query":"q"})));
+    let v = s.next(Duration::from_secs(15)).expect("answered");
+    let want = std::fs::canonicalize(base.join("releases/a")).unwrap().join("mem_ops.sh");
+    assert_eq!(v["result"]["structuredContent"]["answer"], want.to_str().unwrap(),
+               "the child saw an unpinned HM_MEM_OPS: {v}");
+    drop(s);
+    let base = two_releases("missing", &[], &[("new.sh",
+        "cat >/dev/null; echo '{\"version\":3,\"answer\":\"from b\"}'\n")]);
+    let named = base.join("current/new.sh");
+    let mut s = Session::start_with("pin-missing", &[("HM_DIALECTIC", named.to_str().unwrap()),
+                                                     ("HYPERMNESIA_HOME", base.to_str().unwrap())]);
+    s.send(json!({"jsonrpc":"2.0","id":0,"method":"ping"}));
+    let _ = s.next(Duration::from_secs(15));
+    switch_to_b(&base);
+    s.send(Session::call(2, "memory_ask", json!({"query":"q"})));
+    let v = s.next(Duration::from_secs(15)).expect("answered");
+    assert_ne!(v["result"]["structuredContent"]["answer"], "from b",
+               "a script missing at start-up was picked up from the next release: {v}");
     let _ = std::fs::remove_dir_all(&base);
 }
