@@ -224,9 +224,7 @@ fn py() -> String { std::env::var("HM_PYTHON").unwrap_or_else(|_| "python3".to_s
 /// `release_root`). Only if neither works does it fall back to a cwd-relative path, and it says
 /// so on stderr when it does.
 fn script_path(env_key: &str, rel: &str) -> String {
-    if let Ok(p) = std::env::var(env_key) {
-        if !p.is_empty() { return p; }
-    }
+    if let Some(p) = pinned_script(env_key) { return p; }
     if let Some(root) = release_root() {
         let p = root.join(rel);
         if p.exists() { return p.to_string_lossy().into_owned(); }
@@ -240,6 +238,30 @@ fn script_path(env_key: &str, rel: &str) -> String {
                falling back to a path relative to the working directory, which may belong to a \
                different checkout. Set {env_key} to be sure.");
     rel.to_string()
+}
+
+/// The variables a client config may name a bundled script with.
+const SCRIPT_VARS: &[&str] = &["HM_SEARCH", "HM_MEM_OPS", "HM_RERANK", "HM_DIALECTIC", "HM_DOCTOR",
+                               "HM_PROJECT_STATUS"];
+
+/// A script variable's value as it resolved when this process started, or None when it is unset
+/// or empty. `ci/install.py --wire` points these at `<home>/current/...`, and `current` moves at
+/// the next install: read per call, a running session would then execute the NEXT release's
+/// search and memory scripts beside this release's binary and the rest of its scripts. So each
+/// one is canonicalized once, at the top of main() -- following `current` to `releases/<sha>`,
+/// as `release_root()` does for the binary -- and that path is used for the whole session.
+fn pinned_script(key: &str) -> Option<String> {
+    static PINNED: OnceLock<HashMap<String, String>> = OnceLock::new();
+    PINNED.get_or_init(|| SCRIPT_VARS.iter().filter_map(|k| {
+        std::env::var(k).ok().filter(|v| !v.is_empty()).map(|v| (k.to_string(), pin_path(&v)))
+    }).collect()).get(key).cloned()
+}
+
+/// A path with every link resolved (a Windows verbatim drive prefix stripped again), or the path
+/// as given when it does not resolve -- a missing script then fails where it is used, by name.
+fn pin_path(p: &str) -> String {
+    std::fs::canonicalize(p).map(strip_verbatim)
+        .map(|c| c.to_string_lossy().into_owned()).unwrap_or_else(|_| p.to_string())
 }
 
 /// The tree the bundled scripts belong to: the directory above `bin/` when the binary sits in an
@@ -1268,9 +1290,9 @@ fn tool_search_docs(query: &str, k: u32) -> Result<String, String> {
     use std::process::{Command, Stdio};
     let kk = k.clamp(1, 20);
     // HM_RERANK -> the rerank orchestrator (fail-open to RRF); else the plain search.py (HM_SEARCH).
-    let script = match std::env::var("HM_RERANK") {
-        Ok(p) if !p.is_empty() => p,
-        _ => script_path("HM_SEARCH", "ingest/search.py"),
+    let script = match pinned_script("HM_RERANK") {
+        Some(p) => p,
+        None => script_path("HM_SEARCH", "ingest/search.py"),
     };
     let child = spawn_child(Command::new(py()).arg(script).arg(kk.to_string()).arg(repo())
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()), "search")?;
@@ -1974,8 +1996,10 @@ fn drain_and_stop() {
 }
 
 fn main() {
-    // Pin the release this process belongs to before the installer can switch `current`.
+    // Pin the release this process belongs to before the installer can switch `current`: the
+    // binary's own tree, and every script a config names through `current`.
     let _ = release_root();
+    let _ = pinned_script("HM_SEARCH");
     // Everything the stdin thread sends goes through the writer thread; start it before the
     // first line is read.
     let _ = out_queue();
@@ -2271,6 +2295,29 @@ mod tests {
         assert_eq!(strip_verbatim(PathBuf::from(r"\\?\UNC\srv\share")),
                    PathBuf::from(r"\\?\UNC\srv\share"), "a verbatim UNC path is kept");
         assert_eq!(strip_verbatim(PathBuf::from("/home/u/x")), PathBuf::from("/home/u/x"));
+    }
+
+    /// A script named through a link (`<home>/current/...`) is pinned to the release the link
+    /// pointed at when it was resolved; switching the link afterwards does not move it.
+    #[cfg(unix)]
+    #[test]
+    fn a_script_named_through_current_is_pinned() {
+        let d = std::env::temp_dir().join(format!("hm-pin-{}", std::process::id()));
+        for r in ["a", "b"] {
+            std::fs::create_dir_all(d.join("releases").join(r).join("ingest")).unwrap();
+            std::fs::write(d.join("releases").join(r).join("ingest/search.py"), r).unwrap();
+        }
+        std::os::unix::fs::symlink("releases/a", d.join("current")).unwrap();
+        let named = d.join("current/ingest/search.py").to_string_lossy().into_owned();
+        let pinned = pin_path(&named);
+        assert_eq!(std::fs::canonicalize(&pinned).unwrap(),
+                   std::fs::canonicalize(d.join("releases/a/ingest/search.py")).unwrap());
+        std::fs::remove_file(d.join("current")).unwrap();
+        std::os::unix::fs::symlink("releases/b", d.join("current")).unwrap();
+        assert_eq!(std::fs::read_to_string(&pinned).unwrap(), "a",
+                   "the pinned path still names release a after current moved to b");
+        assert_eq!(pin_path("/no/such/script.py"), "/no/such/script.py", "kept as given");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// The shared Tier-1 contract (tests/fixtures/tier1_cases.json), the same file

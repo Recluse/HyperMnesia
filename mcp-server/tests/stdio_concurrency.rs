@@ -495,3 +495,30 @@ fn an_escaped_stdin_holder_does_not_leak_threads_or_fds() {
     s.send(json!({"jsonrpc":"2.0","id":20,"method":"ping"}));
     assert_eq!(s.next(Duration::from_secs(5)).expect("ping")["id"], 20);
 }
+
+#[test]
+fn a_script_named_through_a_link_stays_in_the_release_it_started_with() {
+    // `ci/install.py --wire` points HM_* script variables at <home>/current/..., and the next
+    // install moves `current`. A session started before that must keep running the scripts of
+    // the release it started with, as it keeps its own binary.
+    let base = std::env::temp_dir().join(format!("hm-pin-releases-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    for r in ["a", "b"] {
+        std::fs::create_dir_all(base.join(r)).unwrap();
+        std::fs::write(base.join(r).join("dialectic.sh"),
+                       format!("cat >/dev/null; echo '{{\"version\":3,\"answer\":\"{r}\"}}'\n")).unwrap();
+    }
+    std::os::unix::fs::symlink("a", base.join("current")).unwrap();
+    let named = base.join("current/dialectic.sh");
+    let mut s = Session::start_with("pin", &[("HM_DIALECTIC", named.to_str().unwrap())]);
+    s.send(Session::call(1, "memory_ask", json!({"query":"q"})));
+    let v = s.next(Duration::from_secs(15)).expect("answered");
+    assert_eq!(v["result"]["structuredContent"]["answer"], "a", "{v}");
+    std::fs::remove_file(base.join("current")).unwrap();
+    std::os::unix::fs::symlink("b", base.join("current")).unwrap();
+    s.send(Session::call(2, "memory_ask", json!({"query":"q"})));
+    let v = s.next(Duration::from_secs(15)).expect("answered");
+    assert_eq!(v["result"]["structuredContent"]["answer"], "a",
+               "after `current` moved, the session ran the next release's script");
+    let _ = std::fs::remove_dir_all(&base);
+}

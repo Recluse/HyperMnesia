@@ -258,6 +258,8 @@ scripts):
 
 `./hm install` builds the server into the release ([Installing a release](#installing-a-release));
 `HM_SEARCH` and `HM_MEM_OPS` may be left out, since the server finds them beside its own binary.
+Script paths named through `current` are resolved once, when the server starts, so a running
+session keeps the scripts of the release it started with when the next install moves `current`.
 For development, `cd mcp-server && cargo build --release` and name
 `<checkout>/mcp-server/target/release/hypermnesia-mcp` instead. Needs the `psql` client on
 PATH (Tier 0/1 map/constraints/get_document read the DB via `psql "$DATABASE_URL"`); the
