@@ -2013,14 +2013,12 @@ def _strip_private_deep(value):
     if isinstance(value, list):
         return [_strip_private_deep(v) for v in value]
     if isinstance(value, dict):
-        # Keys too: a metadata key is stored as it was given. One that is nothing but a private
-        # span goes with its value.
-        out = {}
-        for k, v in value.items():
-            key = _strip_private_deep(k) if isinstance(k, str) else k
-            if key != "":
-                out[key] = _strip_private_deep(v)
-        return out
+        # Keys too: a metadata key is stored as it was given. A key that carries a private span
+        # is DROPPED with its value, never rewritten: rewritten, "_identity<private>x</private>"
+        # became "_identity" after the server had already removed the caller's `_identity`, and
+        # replaced the identity the server set -- a read as someone else.
+        return {k: _strip_private_deep(v) for k, v in value.items()
+                if not (isinstance(k, str) and _PRIVATE_TAG.search(k))}
     return value
 
 

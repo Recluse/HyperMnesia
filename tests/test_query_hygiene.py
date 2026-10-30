@@ -83,6 +83,21 @@ check("stopwords are still dropped", m_simple("the on of a") == "zzz-no-lexemes-
 check("an all-punctuation query matches nothing rather than everything",
       m_no_neg("---") == "zzz-no-lexemes-zzz")
 
+print("\n<private> spans never become a doc search:")
+_ns = {"re": re, "sys": sys}
+exec(compile(src[src.index("_PRIVATE_TAG = re.compile("):src.index("def main(")], "search.py", "exec"), _ns)
+import io
+_saved, sys.stdin = sys.stdin, io.StringIO("deploy <private>CANARY</private> rules")
+try:
+    _q = _ns["_read_query"]()
+finally:
+    sys.stdin = _saved
+check("a span is removed from a stdin query", "CANARY" not in _q and _q == "deploy rules")
+check("nested and unclosed spans behave as in the hooks",
+      _ns["_strip_private"]("a <private>x<private>y</private>CANARY</private> b") == "a  b"
+      and _ns["_strip_private"]("keep <private> rest") == "keep ")
+check("the CLI query is stripped too", '_strip_private(args[0])' in src)
+
 print(f"\n{ran - len(failures)}/{ran} checks passed"
       + (f"; FAILED: {', '.join(failures)}" if failures else ""))
 sys.exit(1 if failures else 0)

@@ -832,6 +832,10 @@ def main():
                                                    "note <private>CANARY-7</private>": 1}}))["id"]
         meta = owner_sql("SELECT metadata::text FROM mem.memories WHERE id=%s", (mk,))[0][0]
         check("a private span in a metadata KEY is not stored either", "CANARY" not in meta, meta)
+        # A key that only BECOMES `_identity` once its span is removed must not replace the
+        # identity the server set: bob asking for alice's private row stays bob.
+        as_bob = cli("get", {"id": secret, "_identity<private>x</private>": "alice"}, who="bob")
+        check("a crafted key cannot turn into _identity", as_bob == "(not found)", as_bob)
         check("a private span in a nested field (source excerpt) is not stored",
               excerpt and all("CANARY" not in e[0] for e in excerpt), str(excerpt))
         try:
