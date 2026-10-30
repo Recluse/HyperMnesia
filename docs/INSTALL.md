@@ -145,6 +145,9 @@ and reports "relation does not exist" from the wrong store.
 ```bash
 export DATABASE_URL="postgresql://hm:<the password in deploy/docker/.env>@localhost:5432/hypermnesia"
 export EMBED_BACKEND=tei TEI_URL=http://localhost:8080    # this stack has no Ollama
+# Or an OpenAI-style server you already run -- LM Studio, llama.cpp's llama-server, vLLM. It has
+# to serve bge-m3 (1024 dimensions, like the rest of the store); EMBED_MODEL is its id there:
+#   export EMBED_BACKEND=openai OPENAI_EMBED_URL=http://localhost:1234/v1 EMBED_MODEL=text-embedding-bge-m3
 ```
  See
 `deploy/docker/docker-compose.yml` for the services and ports. TEI serves `bge-m3` on CPU; add a
@@ -591,9 +594,11 @@ the file is what is in force.
 | Env | Default | Meaning |
 |-----|---------|---------|
 | `DATABASE_URL` | `postgresql://hm@localhost:5432/hypermnesia` | Postgres connection string. `hm ingest` refuses to run without it; the Python tools, the hooks and the MCP server fall back to that default |
-| `EMBED_BACKEND` | `ollama` | `ollama` or `tei` |
+| `EMBED_BACKEND` | `ollama` | `ollama`, `tei`, or `openai` (an OpenAI-style `/v1/embeddings` server) |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama endpoint |
 | `TEI_URL` | `http://localhost:8080` | TEI endpoint |
+| `OPENAI_EMBED_URL` | `http://localhost:1234/v1` | base URL of an OpenAI-style embeddings API (LM Studio, llama.cpp `llama-server`, vLLM, LocalAI); `EMBED_MODEL` is the id that server gives bge-m3 |
+| `OPENAI_EMBED_KEY` | (none) | bearer key, if that server wants one |
 | `HM_RERANK` | unset | path to `rerank/search_reranked.py` (unset = RRF only) |
 | `HM_RERANK_URL` | `http://127.0.0.1:8091` | reranker service; `ci/doctor.py` (and `status`) check it whenever either this or `HM_RERANK` is set, and say so when neither is |
 | `HM_LLM_BACKEND` | auto | `openai` \| `ollama` \| `cli` (auto: openai if HM_LLM_URL set, else cli if HM_LLM_CMD, else ollama) |

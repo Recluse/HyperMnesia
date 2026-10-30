@@ -118,8 +118,8 @@ pub const KNOBS: &[Knob] = &[
            what: "model name for the Ollama backend, and the string stamped into embedding_model",
            kind: Kind::Text },
     Knob { key: "EMBED_BACKEND", default: "ollama", read_by: "ingest/_common.py",
-           what: "ollama | tei",
-           kind: Kind::OneOf(&["ollama", "tei"]) },
+           what: "ollama | tei | openai (any OpenAI-style /v1/embeddings server: LM Studio, llama-server, vLLM)",
+           kind: Kind::OneOf(&["ollama", "tei", "openai"]) },
 ];
 
 /// The settings file's path, resolved the way the LOADER resolves it.
@@ -356,6 +356,7 @@ mod tests {
 
         let word = KNOBS.iter().find(|k| k.key == "EMBED_BACKEND").unwrap();
         assert!(word.kind.fault("tei").is_none());
+        assert!(word.kind.fault("openai").is_none());
         assert!(word.kind.fault("Tei").is_some(), "the reader lowercases nothing on the way in");
 
         // An empty value is not a setting, and `unset` is the way back to the default.

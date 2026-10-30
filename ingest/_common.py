@@ -1,12 +1,16 @@
 """Shared plumbing for HyperMnesia's Python tools: a direct Postgres connection from
-DATABASE_URL and a pluggable embedder (Ollama or TEI). No cluster/ssh assumptions -- this
+DATABASE_URL and a pluggable embedder (Ollama, TEI, or any OpenAI-compatible server). No
+cluster/ssh assumptions -- this
 runs wherever it can reach the DB and the embedder over the network.
 
 Env:
   DATABASE_URL   postgresql://user:pass@host:5432/db
-  EMBED_BACKEND  'ollama' (default) | 'tei'
+  EMBED_BACKEND  'ollama' (default) | 'tei' | 'openai'
   OLLAMA_URL     http://localhost:11434     (+ EMBED_MODEL, default 'bge-m3')
   TEI_URL        http://localhost:8080
+  OPENAI_EMBED_URL  http://localhost:1234/v1  the base of an OpenAI-style /v1/embeddings API --
+                 LM Studio, llama.cpp's llama-server, vLLM, LocalAI (+ EMBED_MODEL: the model id
+                 that server knows bge-m3 by; OPENAI_EMBED_KEY if it wants a bearer key)
 """
 import json, os, sys, urllib.request
 
@@ -28,6 +32,8 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://hm@localhost:5432/hy
 BACKEND = os.environ.get("EMBED_BACKEND", "ollama").lower()
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 TEI_URL = os.environ.get("TEI_URL", "http://localhost:8080").rstrip("/")
+OPENAI_EMBED_URL = os.environ.get("OPENAI_EMBED_URL", "http://localhost:1234/v1").rstrip("/")
+OPENAI_EMBED_KEY = os.environ.get("OPENAI_EMBED_KEY", "")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
 
 
@@ -39,20 +45,32 @@ def connect():
     return psycopg2.connect(DATABASE_URL)
 
 
-def _post(url, payload, timeout=180):
+def _post(url, payload, timeout=180, headers=None):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json", **(headers or {})})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 
 
 def embed_texts(texts, timeout=180):
-    """Return a list of 1024-dim vectors (bge-m3) for the given texts. Ollama and TEI both
-    serve bge-m3 and are cosine-compatible, so you can bulk-embed on one and query on the other."""
+    """Return a list of 1024-dim vectors (bge-m3) for the given texts. Every backend serves the
+    same bge-m3 and the vectors are cosine-compatible, so you can bulk-embed on one and query on
+    another."""
     if not texts:
         return []
     if BACKEND == "tei":
         return _post(f"{TEI_URL}/embed", {"inputs": texts, "truncate": True}, timeout=timeout)
+    if BACKEND == "openai":
+        auth = {"Authorization": f"Bearer {OPENAI_EMBED_KEY}"} if OPENAI_EMBED_KEY else None
+        body = _post(f"{OPENAI_EMBED_URL}/embeddings", {"model": EMBED_MODEL, "input": texts},
+                     timeout=timeout, headers=auth)
+        # The API returns one object per input, each carrying its `index`; the order of the list
+        # is not promised, so it is put back in input order here.
+        rows = sorted(body["data"], key=lambda d: d["index"])
+        if len(rows) != len(texts):
+            raise RuntimeError(f"{OPENAI_EMBED_URL}/embeddings returned {len(rows)} vectors "
+                               f"for {len(texts)} inputs")
+        return [d["embedding"] for d in rows]
     return _post(f"{OLLAMA_URL}/api/embed", {"model": EMBED_MODEL, "input": texts},
                  timeout=timeout)["embeddings"]
 

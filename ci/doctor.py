@@ -11,7 +11,7 @@ tells you until you go looking. This is the going-looking.
     python3 ci/doctor.py            # human-readable, exit 1 if anything FAILED
     python3 ci/doctor.py --json     # same findings as JSON (what the MCP `status` tool serves)
 
-Reads the same env as everything else: DATABASE_URL, EMBED_BACKEND/OLLAMA_URL/TEI_URL,
+Reads the same env as everything else: DATABASE_URL, EMBED_BACKEND/OLLAMA_URL/TEI_URL/OPENAI_EMBED_URL,
 HM_RERANK_URL, HM_REPO, MEM_AUTHOR (and the shared settings file). Checks are read-only and each
 one is bounded by a short timeout, so a dead dependency costs seconds, not a hang.
 HM_EXTRACT_MAX_AGE_HOURS (default 72) is how old the newest extracted memory may be before it
@@ -40,6 +40,8 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://hm@localhost:5432/hy
 BACKEND = os.environ.get("EMBED_BACKEND", "ollama").lower()
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 TEI_URL = os.environ.get("TEI_URL", "http://localhost:8080").rstrip("/")
+OPENAI_EMBED_URL = os.environ.get("OPENAI_EMBED_URL", "http://localhost:1234/v1").rstrip("/")
+OPENAI_EMBED_KEY = os.environ.get("OPENAI_EMBED_KEY", "")
 # Default it, do not leave it empty. The documented .mcp.json sets HM_RERANK (the script path
 # that routes search through the reranker) and never HM_RERANK_URL, whose default lives in
 # rerank/search_reranked.py -- so the reranker check was skipped in exactly the configuration
@@ -93,9 +95,10 @@ def q(sql, timeout=10):
     return [line.split("\x1f") for line in text.splitlines() if line], None
 
 
-def http_ok(url, timeout=5):
+def http_ok(url, timeout=5, headers=None):
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers or {}),
+                                    timeout=timeout) as r:
             return r.status < 400, f"HTTP {r.status}"
     except urllib.error.HTTPError as e:
         return False, f"HTTP {e.code}"
@@ -505,6 +508,12 @@ def check_embedder(out):
     if BACKEND == "tei":
         ok, how = http_ok(f"{TEI_URL}/health")
         name, url = "TEI", TEI_URL
+    elif BACKEND == "openai":
+        # Every OpenAI-style server lists its models here; LM Studio and llama-server answer it
+        # without a key, and the ones that want one get it.
+        ok, how = http_ok(f"{OPENAI_EMBED_URL}/models",
+                          headers={"Authorization": f"Bearer {OPENAI_EMBED_KEY}"} if OPENAI_EMBED_KEY else None)
+        name, url = "OpenAI-compatible", OPENAI_EMBED_URL
     else:
         ok, how = http_ok(f"{OLLAMA_URL}/api/tags")
         name, url = "Ollama", OLLAMA_URL

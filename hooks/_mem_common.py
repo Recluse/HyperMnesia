@@ -112,7 +112,7 @@ _SETTABLE = frozenset((
     "MEM_DREAM_MAX_GROUPS", "MEM_DREAM_MAX_CANDIDATES",
     "MEM_DIALECTIC_TIMEOUT",
     "EMBED_BATCH", "EMBED_MODEL", "EMBED_BACKEND",
-    "OLLAMA_URL", "TEI_URL",
+    "OLLAMA_URL", "TEI_URL", "OPENAI_EMBED_URL", "OPENAI_EMBED_KEY",
 ))
 # Named so the refusal can say WHY, rather than look like a typo: these decide what gets
 # executed, and the settings file is not allowed to decide that.
