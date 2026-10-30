@@ -84,7 +84,11 @@ check("an all-punctuation query matches nothing rather than everything",
       m_no_neg("---") == "zzz-no-lexemes-zzz")
 
 print("\n<private> spans never become a doc search:")
-_ns = {"re": re, "sys": sys}
+import importlib.util as _ilu
+_rs = _ilu.spec_from_file_location("redact_q", os.path.join(ROOT, "ingest/_redact.py"))
+_rm = _ilu.module_from_spec(_rs)
+_rs.loader.exec_module(_rm)
+_ns = {"re": re, "sys": sys, "scrub": _rm.scrub}
 exec(compile(src[src.index("_PRIVATE_TAG = re.compile("):src.index("def main(")], "search.py", "exec"), _ns)
 import io
 _saved, sys.stdin = sys.stdin, io.StringIO("deploy <private>CANARY</private> rules")

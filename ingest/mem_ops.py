@@ -70,11 +70,14 @@ CONTEXT_DEPTHS = {
 _CONTEXT_TAG = re.compile(
     r"<\s*/?\s*(?:personal-memory|system|developer|assistant|tool|user)\b", re.I
 )
+# Every character that can hide or reorder text: C0/C1 controls, bidi and zero-width
+# formatting, invisible fillers, variation selectors, and the tag block. The same set as
+# hooks/_mem_common.py _CTRL (tests/test_secret_redaction.py checks that they agree).
 _CONTEXT_CTRL = re.compile(
-    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u00ad\u180e\u3164"
-    "\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064"
-    "\u2066-\u2069\ufe00-\ufe0f\ufeff\U000e0000-\U000e007f"
-    "\U000e0100-\U000e01ef]"
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5"
+    "\u180b-\u180f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u206f\u3164"
+    "\ufe00-\ufe0f\ufeff\uffa0\ufff9-\ufffb\U0001bca0-\U0001bca3\U0001d173-\U0001d17a"
+    "\U000e0000-\U000e007f\U000e0100-\U000e01ef]"
 )
 _AUTO_EVIDENCE_CUE = re.compile(
     r"\b(?:evidence|source|provenance|audit|trace|proof|доказатель\w*|источник\w*|"
@@ -99,6 +102,10 @@ def embed(text):
     return vec_literal(embed_query(text))
 
 
+_SENSITIVE_KEY = re.compile(r"(?i)(?:password|passwd|passphrase|secret|token|api[_-]?key|"
+                            r"access[_-]?key|private[_-]?key|credentials?)$")
+
+
 def _scrub_deep(obj):
     """scrub() every string inside a nested JSON-ish structure (used for metadata)."""
     if isinstance(obj, str):
@@ -106,7 +113,12 @@ def _scrub_deep(obj):
     if isinstance(obj, list):
         return [_scrub_deep(x) for x in obj]
     if isinstance(obj, dict):
-        return {k: _scrub_deep(v) for k, v in obj.items()}
+        # The key is context the value-level rules never see: {"password": "hunter2hunter2"}
+        # carries no `name=value` text for scrub() to match, so a sensitive key redacts its
+        # string value outright.
+        return {k: ("[REDACTED:credential]" if isinstance(v, str) and v and isinstance(k, str)
+                    and _SENSITIVE_KEY.search(k) else _scrub_deep(v))
+                for k, v in obj.items()}
     return obj
 
 
@@ -2037,6 +2049,10 @@ def main():
         if isinstance(p.get("content"), str) and not p["content"].strip() \
                 and cmd in ("write", "supersede"):
             raise SystemExit("content is empty once its <private> spans are removed")
+        # And a secret in a query: it would be embedded, searched and, for docs, logged. Stored
+        # text is scrubbed on its own way in (do_write); a query has no other gate.
+        if isinstance(p.get("query"), str):
+            p["query"] = scrub(p["query"])
     conn = connect()
     cur = conn.cursor()
     # Before ANY statement: every read surface below filters on this, and a connection that

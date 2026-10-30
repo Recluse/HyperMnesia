@@ -23,7 +23,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _mem_common import defang, mem_ops, strip_private
+from _mem_common import defang, mem_ops, scrub, strip_private
 from _llm import complete
 
 # The author-name rule of _mem_common.identity() and the MCP server's mem_author().
@@ -188,7 +188,7 @@ def answer(payload, generator=None):
         raise ValueError("query must be a non-empty string up to 6000 characters")
     # A <private> span is not part of the question: it would reach the reasoning model and,
     # through the context request, the store.
-    query = strip_private(query).strip()
+    query = scrub(strip_private(query)).strip()     # and no pasted secret reaches the model
     if not query:
         raise ValueError("query is empty once its <private> spans are removed")
     depth = payload.get("depth", "low")

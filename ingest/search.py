@@ -25,6 +25,7 @@ import re
 import os, sys, json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import connect, embed_query, vec_literal
+from _redact import scrub
 
 FTS_LANG = os.environ.get("HM_FTS_LANG", "english")
 if not re.fullmatch(r"[a-z_]+", FTS_LANG):   # it is interpolated into SQL literals
@@ -295,7 +296,7 @@ def _read_query():
     `readline()` silently discarded everything after the first newline, and the MCP server sends
     the query verbatim -- so a multi-line question was quietly answered on its first line only,
     with no sign that the rest had been dropped."""
-    return " ".join(_strip_private(sys.stdin.read()).split())
+    return " ".join(scrub(_strip_private(sys.stdin.read())).split())
 
 
 def main():
@@ -316,7 +317,7 @@ def main():
                          ensure_ascii=False))
         return
     if args and not args[0].isdigit():
-        query = " ".join(_strip_private(args[0]).split())
+        query = " ".join(scrub(_strip_private(args[0])).split())
         k = int(args[1]) if len(args) > 1 and args[1].isdigit() else 8
         repo = args[2] if len(args) > 2 else None
     else:
