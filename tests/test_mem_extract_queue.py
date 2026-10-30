@@ -236,6 +236,18 @@ def main():
           dup("uses docker for local dev", "Uses  docker for local dev on every machine"))
     check("a fragment that flips polarity against its sentence is not",
           not dup("uses docker for local dev", "never uses docker for local dev"))
+    check("a number inside a longer number is not a match (whole words only)",
+          not dup("monthly budget is 100", "monthly\tbudget is 1000"))
+    check("spacing and a closing full stop do not hide a real fragment",
+          dup("Budget is 1000.", "The monthly budget  is 1000 per team"))
+    for cand, held in (("prefers C# for backend development", "prefers C++ for backend development"),
+                       ("target temperature is -20 C", "target temperature is +20 C"),
+                       ("deploys to api-prod", "deploys to api.prod"),
+                       ("request timeout is .5 seconds", "request timeout is 5 seconds"),
+                       ("loads settings from .env on startup", "loads settings from env on startup"),
+                       ("uses glob *.log? for log cleanup.", "uses glob *.log for log cleanup."),
+                       ("the accepted score range is [0,1).", "the accepted score range is [0,1].")):
+        check(f"a symbol is part of the word: {cand!r} is not {held!r}", not dup(cand, held))
 
     with tempfile.TemporaryDirectory() as tmp:
         tps = []

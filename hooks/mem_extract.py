@@ -234,6 +234,25 @@ class DuplicateCheckFailed(RuntimeError):
     transcript stays queued."""
 
 
+def _words(text):
+    """The text's whitespace-separated words, exactly as written apart from case and a full stop
+    that ends the whole text. Nothing inside or around a word is trimmed: punctuation carries
+    meaning too often (C# and C++, -20 and +20, .5 and 5, *.log and *.log?, [0,1) and [0,1]), and
+    a split that erased it dropped real corrections as repeats. What this misses -- the same
+    fragment with different punctuation -- is left to the semantic check below, which has the
+    negation and salient-token guards."""
+    text = text.strip()
+    if text.endswith(".") and not text.endswith(".."):
+        text = text[:-1]
+    return text.split()
+
+
+def _word_run_in(words, other):
+    """True when `words` occurs in `other` as a contiguous run of whole words."""
+    n = len(words)
+    return any(other[i:i + n] == words for i in range(len(other) - n + 1))
+
+
 def is_duplicate(content):
     cand = content.strip().lower()
     if not cand:
@@ -258,10 +277,12 @@ def is_duplicate(content):
     # for a repeat, before the negation and salient-token guards below ever ran, and dropped it
     # while the old row stayed active. A fragment can still flip polarity against the sentence
     # around it, so the negation guard applies here too.
-    norm = " ".join(cand.split())
+    # Compared as whole words, never characters: "budget is 100" is not inside "budget is 1000".
+    words = _words(cand)
     for row in rows:
-        existing = " ".join(str((row or {}).get("content") or "").lower().split())
-        if existing and norm in existing and not _neg_differs(norm, existing):
+        existing = str((row or {}).get("content") or "").lower()
+        if words and _word_run_in(words, _words(existing)) \
+                and not _neg_differs(cand, existing):
             return True
     # (2) tight semantic paraphrase, with the negation guard.
     near = mem_ops("nearest", {"content": content[:400]}, timeout=15)
