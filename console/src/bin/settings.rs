@@ -138,13 +138,17 @@ const HELP: &str = "\
 hypermnesia-settings -- the shared settings of the memory pipeline.
 
     hypermnesia-settings                     the effective values and where each came from
-    hypermnesia-settings set <KEY> <value>   write it into ~/.claude/hypermnesia.env
+    hypermnesia-settings set <KEY> <value>   write it into the settings file
     hypermnesia-settings unset <KEY>         remove it, going back to the default value
 
 Where a value came from matters more than the value itself: a variable set in this shell is
 stronger than the file, the file is stronger than the default -- but this shell is only this
 shell. Jobs started by launchd get a minimal environment, so for them the file's value is the
 one in force.
+
+The settings file is HYPERMNESIA_ENV_FILE when that is set, else hypermnesia.env in
+HYPERMNESIA_HOME (default ~/.HyperMnesia) -- or ~/.claude/hypermnesia.env while that older copy is
+the only one. The hooks and the MCP server resolve it the same way.
 
 The hooks ignore the whole file unless it is your own private file in your own private
 directory. The screen says so when it is not.

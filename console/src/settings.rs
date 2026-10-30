@@ -1,6 +1,7 @@
 //! Pipeline settings: what can be tuned, and what a setting actually reaches.
 //!
-//! The shared file `~/.claude/hypermnesia.env` is the source of truth: the hooks load it when
+//! The shared file `~/.HyperMnesia/hypermnesia.env` (`env_file` has the whole rule) is the
+//! source of truth: the hooks load it when
 //! `_mem_common` is imported, before any module computes its constants, and it does not override
 //! what the environment already holds.
 //!
@@ -123,24 +124,33 @@ pub const KNOBS: &[Knob] = &[
 
 /// The settings file's path, resolved the way the LOADER resolves it.
 ///
-/// Two rules copied from `hooks/_mem_common.py`, because the console reporting a different file
-/// than the one the pipeline reads is the exact failure this screen exists to prevent:
+/// The rules are copied from `hooks/_mem_common.py` (`_env_file`), because the console reporting
+/// a different file than the one the pipeline reads is the exact failure this screen exists to
+/// prevent:
 ///
+///   * `HYPERMNESIA_ENV_FILE` names the file outright; an EMPTY value counts as unset, as it does
+///     in the loader and in the MCP server;
+///   * otherwise `<HYPERMNESIA_HOME>/hypermnesia.env` (`home::hm_home`) -- unless only the copy an
+///     older install kept in `~/.claude` exists, in which case that one. `ci/install.py` moves it
+///     and leaves a link at the old name;
 ///   * a leading `~/` is expanded (Python's `expanduser`). Taken literally, the console reported
-///     "not created yet" over a file the hooks were reading happily;
-///   * a variable that is SET BUT EMPTY is honoured as an empty path, not treated as unset. The
-///     loader reads nothing in that case, so the console must not go on displaying the default
-///     file's contents as the values in force.
+///     "not created yet" over a file the hooks were reading happily.
 pub fn env_file() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-    let raw = match std::env::var("HYPERMNESIA_ENV_FILE") {
-        Ok(p) => p,
-        Err(_) => format!("{home}/.claude/hypermnesia.env"),
-    };
-    PathBuf::from(expand_home(&raw, &home))
+    let explicit = std::env::var("HYPERMNESIA_ENV_FILE").ok();
+    env_file_in(explicit.as_deref(), &home, &crate::home::hm_home())
 }
 
-fn expand_home(p: &str, home: &str) -> String {
+fn env_file_in(explicit: Option<&str>, home: &str, hm_home: &std::path::Path) -> PathBuf {
+    if let Some(raw) = explicit.filter(|s| !s.is_empty()) {
+        return PathBuf::from(expand_home(raw, home));
+    }
+    let new = hm_home.join("hypermnesia.env");
+    let old = PathBuf::from(expand_home("~/.claude/hypermnesia.env", home));
+    if !new.exists() && old.exists() { old } else { new }
+}
+
+pub(crate) fn expand_home(p: &str, home: &str) -> String {
     if p == "~" {
         home.to_string()
     } else if let Some(rest) = p.strip_prefix("~/") {
@@ -258,7 +268,9 @@ pub fn unset(key: &str) -> Result<(), String> {
 fn write_all(map: &BTreeMap<String, String>) -> Result<(), String> {
     let path = env_file();
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        // Private when it is created here: the loader ignores a file whose directory anyone else
+        // can write, and the home ci/install.py makes is 0700 too.
+        crate::home::private_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let mut text = String::from(
         "# Shared settings of the memory pipeline. The hooks read this file at startup.\n\
@@ -400,10 +412,27 @@ mod tests {
 
     /// The path must be resolved the way the loader resolves it, or the console reports on a
     /// different file than the pipeline reads -- which is the one thing this screen exists to
-    /// prevent. Python's expanduser expands a leading `~/`; a variable that is set but empty is
-    /// an empty path there, not an absent one.
+    /// prevent. Python's expanduser expands a leading `~/`; an empty HYPERMNESIA_ENV_FILE is
+    /// unset; the home's file wins, and the ~/.claude copy is read only while it is the only one.
     #[test]
     fn the_settings_path_is_resolved_like_the_loader() {
+        let d = std::env::temp_dir().join(format!("hm-envfile-{}", std::process::id()));
+        let home = d.to_string_lossy().into_owned();
+        let hm = d.join(".HyperMnesia");
+        std::fs::create_dir_all(d.join(".claude")).unwrap();
+        assert_eq!(env_file_in(None, &home, &hm), hm.join("hypermnesia.env"), "nothing yet");
+        assert_eq!(env_file_in(Some(""), &home, &hm), hm.join("hypermnesia.env"),
+                   "an empty variable is unset");
+        assert_eq!(env_file_in(Some("~/x.env"), &home, &hm), d.join("x.env"));
+        std::fs::write(d.join(".claude/hypermnesia.env"), "").unwrap();
+        assert_eq!(env_file_in(None, &home, &hm), d.join(".claude/hypermnesia.env"),
+                   "only the older install's copy exists: that one");
+        std::fs::create_dir_all(&hm).unwrap();
+        std::fs::write(hm.join("hypermnesia.env"), "").unwrap();
+        assert_eq!(env_file_in(None, &home, &hm), hm.join("hypermnesia.env"),
+                   "both exist: the home's");
+        let _ = std::fs::remove_dir_all(&d);
+
         assert_eq!(expand_home("~/.claude/hypermnesia.env", "/Users/x"),
                    "/Users/x/.claude/hypermnesia.env");
         assert_eq!(expand_home("~", "/Users/x"), "/Users/x");

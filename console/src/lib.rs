@@ -13,6 +13,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+pub mod home;
 pub mod jobs;
 pub mod settings;
 pub mod view;

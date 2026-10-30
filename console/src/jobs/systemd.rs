@@ -731,19 +731,19 @@ fn tray_unit(exe: &str, log: &str) -> String {
 
 /// Put the console itself into autostart: a unit pointing at the current binary, enabled but not
 /// started -- starting it now would run a second tray beside the one already open.
+///
+/// The binary is named through `current` when it runs from an installed release
+/// (`crate::home::autostart_exe`): `current_exe` resolves the link to `releases/<sha>/`, which the
+/// installer prunes. The log goes to `<HYPERMNESIA_HOME>/logs/`, beside the pipeline's own.
 pub fn install_self(label: &str) -> Result<String, String> {
     valid_stem(label)?;
     let exe = std::env::current_exe()
-        .map_err(|e| format!("cannot determine the path to myself: {e}"))?
-        .to_string_lossy().to_string();
-    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+        .map_err(|e| format!("cannot determine the path to myself: {e}"))?;
+    let exe = crate::home::autostart_exe(&exe).to_string_lossy().to_string();
     let dir = units_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join(format!("{label}.service"));
-    let log = format!("{home}/.hypermnesia/logs/tray.log");
-    if let Some(d) = PathBuf::from(&log).parent() {
-        let _ = std::fs::create_dir_all(d);
-    }
+    let log = crate::home::log_dir().join("tray.log").to_string_lossy().to_string();
     std::fs::write(&path, tray_unit(&exe, &log)).map_err(|e| format!("{}: {e}", path.display()))?;
 
     if let Err(e) = Command::new("systemctl").args(["--user", "daemon-reload"]).output() {
@@ -799,7 +799,9 @@ pub fn autostart_fault(label: &str) -> Option<String> {
     if !std::path::Path::new(&installed).exists() {
         return Some(format!("autostart points at {installed}, which is not there any more"));
     }
-    let me = std::env::current_exe().ok()?.to_string_lossy().to_string();
+    // The name install_self would write for this binary, not its raw path: started from a
+    // release, the two differ by design.
+    let me = crate::home::autostart_exe(&std::env::current_exe().ok()?).to_string_lossy().to_string();
     if installed != me {
         return Some(format!("autostart starts {installed}, not this binary ({me})"));
     }

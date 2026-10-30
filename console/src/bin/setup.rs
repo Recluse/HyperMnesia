@@ -21,7 +21,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use hypermnesia_console::{config, config_path, jobs, probe, resolve_psql_cmd, save_config,
+use hypermnesia_console::{config, config_path, home, jobs, probe, resolve_psql_cmd, save_config,
                           Target, DEFAULT_PSQL_CMD, PRESETS};
 
 fn main() {
@@ -203,6 +203,11 @@ fn survey() -> Survey {
         Some(p) => println!("  ./hm    found at {}", p.display()),
         None => println!("  ./hm    not found next to this binary (deploy steps unavailable)"),
     }
+    match installed_release() {
+        Some(cur) => println!("  release {} (what the blocks below point at)", cur.display()),
+        None => println!("  release none installed under {} (./hm install)",
+                         home::hm_home().display()),
+    }
     s
 }
 
@@ -225,6 +230,10 @@ fn repo_root() -> Option<PathBuf> {
 
 /// `hm` lives at the repository root, and this binary at console/target/release/. Resolved from
 /// the executable rather than the working directory: the wizard is run from anywhere.
+///
+/// Not the `hm` an installed release carries beside its bin/: `hm init` writes the stack's
+/// generated password into deploy/docker/.env of the tree it runs from, and a release is one
+/// commit, pruned by the next installs -- the password would go with it.
 fn hm_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     for up in [3usize, 4] {
@@ -386,20 +395,57 @@ fn shell_quote(v: &str) -> String {
 
 // -- the two blocks that touch someone else's files ------------------------------------------
 
+/// `<HYPERMNESIA_HOME>/current`, when a release with the MCP server is installed there.
+fn installed_release() -> Option<PathBuf> {
+    let cur = home::hm_home().join("current");
+    cur.join("bin").join("hypermnesia-mcp").exists().then_some(cur)
+}
+
+/// What the blocks below point at: the installed release when there is one -- `current` is what
+/// `./hm install` switches, so a config naming it survives every upgrade and no edit to the
+/// checkout reaches a running session -- else this checkout, else placeholders.
+struct Layout {
+    root: PathBuf,
+    mcp: PathBuf,
+    /// False for a checkout: the paths are real, but tied to a working copy.
+    installed: bool,
+}
+
+fn layout() -> Option<Layout> {
+    if let Some(cur) = installed_release() {
+        return Some(Layout { mcp: cur.join("bin/hypermnesia-mcp"), root: cur, installed: true });
+    }
+    let root = repo_root()?;
+    Some(Layout { mcp: root.join("mcp-server/target/release/hypermnesia-mcp"), root,
+                  installed: false })
+}
+
+/// Said under each block that names a checkout.
+fn checkout_note(l: &Option<Layout>) {
+    if l.as_ref().is_some_and(|l| !l.installed) {
+        println!("These paths point into a checkout, so whatever that tree holds is what runs.");
+        println!("`./hm install --wire` installs a commit under {} and rewrites them to it.",
+                 home::hm_home().join("current").display());
+    }
+}
+
 fn offer_mcp_block(scope: Option<&str>) {
-    let known_root = repo_root();
-    let root = known_root.clone().unwrap_or_else(|| PathBuf::from("/path/to/hypermnesia"));
+    let known = layout();
+    let root = known.as_ref().map_or_else(|| PathBuf::from("/path/to/hypermnesia"),
+                                          |l| l.root.clone());
+    let mcp = known.as_ref().map_or_else(|| root.join("mcp-server/target/release/hypermnesia-mcp"),
+                                         |l| l.mcp.clone());
     // The scope is known if step 3 ingested one; otherwise it stays a placeholder and the text
     // below says so.
     let repo = scope.unwrap_or("myrepo");
     let block = format!(r#"{{ "mcpServers": {{ "hypermnesia": {{
-  "command": "{root}/mcp-server/target/release/hypermnesia-mcp",
+  "command": "{mcp}",
   "env": {{
     "HM_REPO": "{repo}",
     "DATABASE_URL": "postgresql://...",
     "HM_SEARCH":  "{root}/ingest/search.py",
     "HM_MEM_OPS": "{root}/ingest/mem_ops.py"
-  }} }} }} }}"#, root = root.display(), repo = repo);
+  }} }} }} }}"#, mcp = mcp.display(), root = root.display(), repo = repo);
     println!("Add this to your MCP client's config (for Claude Code, the repo's .mcp.json):\n");
     println!("{block}\n");
     if scope.is_some() {
@@ -411,7 +457,8 @@ fn offer_mcp_block(scope: Option<&str>) {
     }
     println!("DATABASE_URL above is still a placeholder: the MCP server connects directly, not");
     println!("through the command this wizard configured. Fill it in before you use the block.");
-    if known_root.is_none() {
+    checkout_note(&known);
+    if known.is_none() {
         println!("! The paths above are placeholders too -- this binary is not next to a checkout,");
         println!("  so the wizard does not know where the repository is.");
     }
@@ -434,14 +481,16 @@ fn offer_mcp_block(scope: Option<&str>) {
         Ok(()) => {
             println!("Written to {target}");
             println!("! It still needs DATABASE_URL filled in{}.",
-                     if known_root.is_none() { ", and the four paths" } else { "" });
+                     if known.is_none() { ", and the four paths" } else { "" });
         }
         Err(e) => println!("! Not written: {e}"),
     }
 }
 
 fn offer_hooks_block() {
-    let root = repo_root().unwrap_or_else(|| PathBuf::from("/path/to/hypermnesia"));
+    let known = layout();
+    let root = known.as_ref().map_or_else(|| PathBuf::from("/path/to/hypermnesia"),
+                                          |l| l.root.clone());
     println!("The hooks are what makes this more than a search index: they deliver without being");
     println!("asked. For Claude Code, add to its settings:\n");
     println!(r#"  "hooks": {{
@@ -452,6 +501,7 @@ fn offer_hooks_block() {
     "SessionStart": [{{ "hooks": [
       {{ "type": "command", "command": "python3 {root}/hooks/mem_profile.py" }} ]}}]
   }}"#, root = root.display());
+    checkout_note(&known);
     println!("\nSee hooks/README.md for the rest (capture, extract, consolidate, reflect) and for");
     println!("the scheduled passes. This wizard does not edit your agent's settings file: it is");
     println!("yours, it has other things in it, and a silent merge is how people lose config.");
