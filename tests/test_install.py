@@ -485,9 +485,14 @@ for text, want in [
     ('"python3 %USERPROFILE%\\\\Work\\\\HyperMnesia\\\\hooks\\\\mem_recall.py"', f'"python3 {c}/hooks/mem_recall.py"'),
     ('"python3 /u/Work/HyperMnesia/hooks/workspace/x.py"', f'"python3 {c}/hooks/workspace/x.py"'),
     ('"python3 /u/Work/HyperMnesia/hooks/other/x.py"', '"python3 /u/Work/HyperMnesia/hooks/other/x.py"'),
+    # A launchd plist given with --wire-file: the path sits between <string> tags.
+    ('<string>/Users/x/Work/HyperMnesia/hooks/mem_recall.py</string>', f'<string>{c}/hooks/mem_recall.py</string>'),
 ]:
     got, _ = inst.rewrite(text, h, shipped)
     assert got == want, (text, got, want)
+
+assert inst._parses("x.plist", '<?xml version="1.0"?><plist version="1.0"><string>a</string></plist>') is True
+assert inst._parses("x.plist", "<plist><string>a</plist>") is False, "a broken plist is never written"
 
 shutil.rmtree(tmp, ignore_errors=True)
 print("test_install: ok")

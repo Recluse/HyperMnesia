@@ -594,7 +594,8 @@ TAIL = re.compile(
 # Where a path can start: `/`, `~/`, a drive (`C:/`, `C:\`, `C:\\` as escaped in a string), or a
 # variable a shell or cmd expands to the home (`$HOME/`, `${HOME}/`, `%USERPROFILE%\`).
 ABSOLUTE = re.compile(r"(?:/|~/|[A-Za-z]:" + S + r"|\$\{?HOME\}?" + S + r"|%[A-Za-z_]+%" + S + ")")
-HARD_STOP = set('"=,[]\n')                   # a path never runs across these (braces can: ${HOME})
+# A path never runs across these (braces can: ${HOME}); < and > end a plist's <string>.
+HARD_STOP = set('"=,[]<>\n')
 SOFT_STOP = set(" \t'")                       # ...but may contain these (a space, an apostrophe)
 
 
@@ -691,11 +692,14 @@ def _parses(path, text):
         elif path.endswith(".toml"):
             import tomllib                    # 3.11+; older Pythons skip the check
             tomllib.loads(text)
+        elif path.endswith(".plist"):
+            import plistlib
+            plistlib.loads(text.encode("utf-8"))
         else:
             return None
     except ImportError:
         return None
-    except ValueError:                        # json.JSONDecodeError and tomllib's error alike
+    except Exception:                         # JSONDecodeError, tomllib and plist (expat) errors
         return False
     return True
 
