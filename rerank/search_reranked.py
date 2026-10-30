@@ -14,7 +14,7 @@ Interface (same as search.py MCP mode):  search_reranked.py <k> [repo]  with que
 Env: HM_RERANK_URL (http://127.0.0.1:8091), RERANK_POOL (30); + search.py's env (DATABASE_URL,
      HM_DOC_MAXDIST, ...).
 """
-import json, os, subprocess, sys, urllib.request
+import json, os, re, subprocess, sys, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SEARCH = os.environ.get("HM_SEARCH", os.path.join(HERE, "..", "ingest", "search.py"))
@@ -50,13 +50,39 @@ def fmt(c):
     return f"[{c['score']}] ({legs}) {c['doc']} # {c['heading']}\n    {(c['text'] or '').strip()[:100]}"
 
 
+# <private>…</private> spans never become a search, a rerank request or an echoed query: the
+# rule of hooks/_mem_common.py strip_private() (nested spans, a stray close dropped, an unclosed
+# tag hiding the rest), copied because this wrapper runs on its own.
+_PRIVATE_TAG = re.compile(r"<(/?)private>", re.I)
+
+
+def _strip_private(text):
+    out, pos, depth = [], 0, 0
+    for tag in _PRIVATE_TAG.finditer(text):
+        if not tag.group(1):
+            if depth == 0:
+                out.append(text[pos:tag.start()])
+            depth += 1
+        elif depth:
+            depth -= 1
+            if depth == 0:
+                pos = tag.end()
+        else:
+            out.append(text[pos:tag.start()])
+            pos = tag.end()
+    if depth:
+        return "".join(out)
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def _read_query():
     """The whole of stdin, as one query.
 
     `readline()` silently discarded everything after the first newline, and the MCP server sends
     the query verbatim -- so a multi-line question was quietly answered on its first line only,
     with no sign that the rest had been dropped."""
-    return " ".join(sys.stdin.read().split())
+    return " ".join(_strip_private(sys.stdin.read()).split())
 
 
 def main():

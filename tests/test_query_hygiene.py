@@ -98,6 +98,17 @@ check("nested and unclosed spans behave as in the hooks",
       and _ns["_strip_private"]("keep <private> rest") == "keep ")
 check("the CLI query is stripped too", '_strip_private(args[0])' in src)
 
+_wsrc = open(os.path.join(ROOT, "rerank", "search_reranked.py"), encoding="utf-8").read()
+_wns = {"re": re, "sys": sys}
+exec(compile(_wsrc[_wsrc.index("_PRIVATE_TAG = re.compile("):_wsrc.index("def main(")],
+             "search_reranked.py", "exec"), _wns)
+_saved, sys.stdin = sys.stdin, io.StringIO("deploy <private>CANARY</private> rules")
+try:
+    _wq = _wns["_read_query"]()
+finally:
+    sys.stdin = _saved
+check("the rerank wrapper strips its query before search, rerank and echo", _wq == "deploy rules")
+
 print(f"\n{ran - len(failures)}/{ran} checks passed"
       + (f"; FAILED: {', '.join(failures)}" if failures else ""))
 sys.exit(1 if failures else 0)
