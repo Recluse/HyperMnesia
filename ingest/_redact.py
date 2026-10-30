@@ -25,10 +25,10 @@ _PATTERNS = [
     # characters, the last one shorter only before END) up to END -- or up to wherever it stops, so a key cut short (a turn clipped mid-key, a paste missing its
     # last line) is still caught, while a sentence that merely MENTIONS the marker loses only it.
     (re.compile(r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----"
-                r"(?:[ \t]*\r?\n[A-Za-z][A-Za-z-]{0,40}:[^\n]{0,200})*"
-                r"(?:\s{1,4}[A-Za-z0-9+/=]{16,})*"
-                r"(?:\s{1,4}[A-Za-z0-9+/=]{1,100}(?=\s{0,4}-----END))?"
-                r"(?:\s{0,4}-----END [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----)?"), "private-key"),
+                r"(?:(?:[ \t]|\\[rn])*(?:\r?\n|\\n)[A-Za-z][A-Za-z-]{0,40}:[^\n\\]{0,200})*"
+                r"(?:(?:\s|\\[rn]){1,6}[A-Za-z0-9+/=]{16,})*"
+                r"(?:(?:\s|\\[rn]){1,6}[A-Za-z0-9+/=]{1,100}(?=(?:\s|\\[rn]){0,6}-----END))?"
+                r"(?:(?:\s|\\[rn]){0,6}-----END [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----)?"), "private-key"),
     (re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}"), "anthropic-key"),
     (re.compile(r"sk-proj-[A-Za-z0-9_\-]{20,}"), "openai-key"),
     (re.compile(r"sk-[A-Za-z0-9]{20,}"), "openai-key"),
@@ -37,21 +37,23 @@ _PATTERNS = [
     (re.compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}"), "slack-token"),
     (re.compile(r"AKIA[0-9A-Z]{16}"), "aws-key"),
     (re.compile(r"AIza[0-9A-Za-z_\-]{35}"), "google-key"),
-    (re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "jwt"),
+    (re.compile(r"(?<![A-Za-z0-9_\-])eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "jwt"),
     # scheme://user:PASSWORD@host -> keep everything but the secret
     (re.compile(r"(?P<pre>(?<![a-zA-Z0-9+.\-])[a-zA-Z][a-zA-Z0-9+.\-]{0,30}://[^\s:/@]{1,200}:)"
                 r"(?P<secret>[^\s:/@]{1,500})(?P<at>@)"), "url-password"),
-    # An HTTP credential header, as typed or inside JSON/YAML: Digest keeps nothing of the rest
-    # of the line (its response= is the credential); the others keep the scheme.
-    (re.compile(r"(?i)(?P<key>\b(?:proxy-)?authorization[\"']?\s*[:=]\s*[\"']?digest\s+)"
-                r"(?!\[REDACTED:)(?P<secret>[^\n]{8,500})"), "credential"),
+    # An HTTP credential header, as typed or inside JSON/YAML; for Digest the credential is the
+    # response= hash, wherever it sits in the parameter list.
+    # (applied only to lines that mention Digest -- see scrub(); a bare `response = 1234...` in
+    # code is not a credential, and a regex looking back for "digest" scanned quadratically)
+    (re.compile(r"(?i)(?P<key>(?<![A-Za-z0-9_])response\s*=\s*\\?[\"']?)(?P<secret>[0-9a-f]{16,128})"),
+     "digest-response"),
     (re.compile(r"(?i)(?P<key>\b(?:proxy-)?authorization[\"']?\s*[:=]\s*[\"']?(?:bearer|basic|token)\s+)"
                 r"(?!\[REDACTED:)(?P<secret>[A-Za-z0-9._~+/=:-]{8,})"), "credential"),
     (re.compile(r"(?P<key>\bBearer\s+)(?!\[REDACTED:)(?P<secret>[A-Za-z0-9._~+/=-]{16,})"), "credential"),
     # Command lines and files that carry a secret without a name=value shape: curl -u user:pass,
     # a .netrc line, a Docker/registry "auth" blob.
-    (re.compile(r"(?P<key>(?<![^\s'\"])(?:-u|--user)\s+[^\s:'\"]{1,100}:)(?!\[REDACTED:)(?P<secret>[^\s'\"]{4,500})"), "credential"),
-    (re.compile(r"(?i)(?P<key>\bmachine\s+\S{1,200}\s+(?:login\s+\S{1,200}\s+)?password\s+)"
+    (re.compile(r"(?P<key>(?<![^\s'\"])(?:-u|--user)(?:\s+|=)[\"']?[^\s:'\"]{1,100}:)(?!\[REDACTED:)(?P<secret>[^\s'\"]{4,500})"), "credential"),
+    (re.compile(r"(?i)(?P<key>\b(?:machine\s+\S{1,200}|default)\s+(?:login\s+\S{1,200}\s+)?password\s+)"
                 r"(?!\[REDACTED:)(?P<secret>\S{1,500})"), "credential"),
     (re.compile(r"(?P<key>[\"']auth[\"']\s*:\s*[\"'])(?!\[REDACTED:)(?P<secret>[A-Za-z0-9+/=]{12,})"), "credential"),
     # name=value, name: value and "name": "value" for a sensitive name -- with any prefix on the
@@ -62,11 +64,18 @@ _PATTERNS = [
     # whole, spaces and punctuation included ("correct horse battery staple"); an unquoted one
     # runs to the next space, quote or separator.
     (re.compile(r"(?i)(?P<key>(?<![A-Za-z0-9_.-])[A-Za-z0-9_.-]{0,64}?(?:password|passwd|passphrase|secret|token|"
-                r"api[_-]?key|access[_-]?key|private[_-]?key|credentials?)[\"']?\s*[:=]\s*(?P<q>[\"']))"
-                r"(?!\[REDACTED:)(?P<secret>[^\"'\n]{4,500})(?=(?P=q))"), "credential"),
+                r"api[_-]?key|access[_-]?key|private[_-]?key|credentials?)[\"']?\s*[:=]\s*\")"
+                r"(?!\[REDACTED:)(?P<secret>[^\"\n]{4,})(?=\")"), "credential"),
+    (re.compile(r"(?i)(?P<key>(?<![A-Za-z0-9_.-])[A-Za-z0-9_.-]{0,64}?(?:password|passwd|passphrase|secret|token|"
+                r"api[_-]?key|access[_-]?key|private[_-]?key|credentials?)[\"']?\s*[:=]\s*')"
+                r"(?!\[REDACTED:)(?P<secret>[^'\n]{4,})(?=')"), "credential"),
+    # Unquoted: up to the next space, quote, comma, ;, }, ) or ] -- and not across an = (only
+    # base64 padding may end a value), which keeps the scan linear and leaves the next pair of a
+    # key=value list alone. A value that runs into ( or [ is code, not a secret (token =
+    # tokenizer.next_token(), password: Optional[str]) and is left alone.
     (re.compile(r"(?i)(?P<key>(?<![A-Za-z0-9_.-])[A-Za-z0-9_.-]{0,64}?(?:password|passwd|passphrase|secret|token|"
                 r"api[_-]?key|access[_-]?key|private[_-]?key|credentials?)[\"']?\s*[:=]\s*)"
-                r"(?![\"'])(?!\[REDACTED:)(?P<secret>[^\s\"',;}]{6,})"), "credential"),
+                r"(?![\"'])(?!\[REDACTED:)(?P<secret>[^\s\"',;}()\[\]=]{6,}={0,2})(?=[\s\"',;})\]]|$)"), "credential"),
     # The libpq variables, whose values can be shorter than the six characters asked above:
     # PGPASSWORD=<literal> is what people type at a shell.
     (re.compile(r"(?i)(?P<key>\bPG(?:PASSWORD|PASSFILE|SSLKEY)\s*=\s*[\"\']?)"
@@ -85,6 +94,9 @@ def scrub(text):
             out = rx.sub(lambda m: f"{m.group('pre')}[REDACTED:url-password]{m.group('at')}", out)
         elif label == "credential":
             out = rx.sub(lambda m: f"{m.group('key')}[REDACTED:credential]", out)
+        elif label == "digest-response":
+            out = "\n".join(rx.sub(lambda m: f"{m.group('key')}[REDACTED:credential]", line)
+                            if "digest" in line.lower() else line for line in out.split("\n"))
         else:
             out = rx.sub(f"[REDACTED:{label}]", out)
     return out

@@ -59,13 +59,27 @@ SECRETS = {
     "a Docker auth blob": '{"auths":{"registry.example.com":{"auth":"YWxpY2U6aHVudGVyMmh1bnRlcjI="}}}',
     "a Digest header": 'Authorization: Digest username="alice", response="abcd1234abcd1234abcd1234"',
     "a Basic header in JSON": '{"Authorization":"Basic YWxpY2U6aHVudGVyMmh1bnRlcjI="}',
+    "a PEM body inside JSON (escaped newlines)":
+        '{"private_key": "-----BEGIN PRIVATE KEY-----\\n' + "MIIEpAIBAAKCAQEA" * 64 + '\\n-----END PRIVATE KEY-----"}',
+    "a double-quoted value with an apostrophe": 'PASSWORD="it\'s a hunter2 password"',
+    "a quoted value longer than 500": 'AWS_SESSION_TOKEN="' + "A" * 501 + '"',
+    "curl -u with quotes": 'curl -u "alice:hunter2hunter2" https://example.com',
+    "curl --user=": "curl --user=alice:hunter2hunter2 https://example.com",
+    "a .netrc default line": "default login alice password hunter2hunter2",
+    "a Digest response after a long nonce":
+        'Authorization: Digest username="alice", nonce="' + "n" * 480 + '", response="' + "abcd1234" * 4 + '"',
+    "a value inside parentheses": "(export PASSWORD=hunter2hunter2)",
+    "a value inside brackets": "[password=hunter2hunter2]",
 }
 BENIGN = ["the password reset flow is broken", "we discussed the auth token design last week",
           "secret sauce of the algorithm is memoization", "max_tokens: 4096",
           "TOKEN_URL=https://example.com/x", "token_type: bearer",
           "set password_reset_url: https://x/y", "the key point: tokens matter",
           "-----BEGIN PUBLIC KEY----- abc -----END PUBLIC KEY-----",
-          "use curl -u to pass credentials", "the auth flow is described below"]
+          "use curl -u to pass credentials", "the auth flow is described below",
+          "token = tokenizer.next_token()", "password: Optional[str] = None",
+          "response = 1234567890123456",
+          '{"Authorization": "Digest username=\\"a\\"", "next": "keep this field"}']
 
 
 def main():
@@ -76,7 +90,9 @@ def main():
             out = scrub(text)
             check(f"{label}: {name} is redacted", "[REDACTED:" in out and "hunter2" not in out
                   and "abcd1234" not in out and "AAAAAAAAAA" not in out and "wJalr" not in out
-                  and "horse" not in out and "YWxpY2U" not in out and "MIIEow" not in out, out[:80])
+                  and "horse" not in out and "YWxpY2U" not in out and "MIIEow" not in out
+                  and "MIIEpAIBAAKCAQEAMIIE" not in out and "AAAAAAAAAAAAAAAAAAAA" not in out
+                  and "abcd1234abcd1234" not in out, out[:80])
         for text in BENIGN:
             check(f"{label}: left alone: {text[:40]!r}", scrub(text) == text, scrub(text))
 
@@ -85,12 +101,18 @@ def main():
               "to detect keys." in mention and "Keep the rest." in mention, mention)
         import time
         for what, text in (("one long run", "A" * 1_000_000), ("dotted names", "a." * 500_000),
-                           ("colons", "x:" * 500_000), ("a key header with spaces", "-----BEGIN PRIVATE KEY-----" + " A" * 400_000)):
+                           ("colons", "x:" * 500_000), ("a key header with spaces", "-----BEGIN PRIVATE KEY-----" + " A" * 400_000),
+                           ("JWT-shaped runs", ("eyJ" * 333_334)[:1_000_000]),
+                           ("repeated names before a bracket", ("token=" * 166_667)[:999_999] + "["),
+                           ("repeated Digest words", ("digest response=" * 62_500)[:1_000_000])):
             started = time.perf_counter()
             scrub(text)
             took = time.perf_counter() - started
             # Linear rules take a few seconds on a megabyte here; a quadratic one took minutes.
             check(f"{label}: no pathological backtracking on {what} (1 MB under 30 s)", took < 30, f"{took:.1f} s")
+
+        kv = scrub("password=hunter2hunter2,enabled=true")
+        check(f"{label}: the next pair of a key=value list survives", kv.endswith(",enabled=true"), kv)
 
     print("== the per-turn cut comes after scrubbing ==")
     mem_extract = load("mem_extract_redaction", ROOT / "hooks" / "mem_extract.py")
@@ -118,6 +140,17 @@ def main():
     ops = load("mem_ops_redaction", ROOT / "ingest" / "mem_ops.py")
     deep = ops._scrub_deep({"password": "hunter2hunter2", "nested": {"api_key": "abcdef123456"},
                             "note": "plain"})
+    deep2 = ops._scrub_deep({"headers": {"Authorization": "Basic YWxpY2U6aHVudGVyMmh1bnRlcjI="},
+                             "password": 12345678, "auths": {"r.example": {"auth": "YWxpY2U6aHVudGVy"}},
+                             "oauth_flow": "pkce", "enabled": True})
+    check("Authorization and auth keys, and a numeric password, are redacted; look-alikes are not",
+          deep2["headers"]["Authorization"].startswith("[REDACTED") and str(deep2["password"]).startswith("[REDACTED")
+          and deep2["auths"]["r.example"]["auth"].startswith("[REDACTED") and deep2["oauth_flow"] == "pkce"
+          and deep2["enabled"] is True, str(deep2))
+    check("review proposals are scrubbed before they are queued",
+          'p["proposal"] = _scrub_deep(' in (ROOT / "ingest" / "mem_ops.py").read_text())
+    check("the reranker wrapper scrubs its query too",
+          "scrub(_strip_private(" in (ROOT / "rerank" / "search_reranked.py").read_text())
     check("a sensitive metadata key redacts its value",
           deep["password"].startswith("[REDACTED") and deep["nested"]["api_key"].startswith("[REDACTED")
           and deep["note"] == "plain", str(deep))

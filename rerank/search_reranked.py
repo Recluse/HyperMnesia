@@ -56,6 +56,12 @@ def fmt(c):
 _PRIVATE_TAG = re.compile(r"<(/?)private>", re.I)
 
 
+# The secret filter the rest of the repo uses (ingest/_redact.py): this wrapper hands the query to
+# the reranker and echoes it back, and the in-pod search scrubbing its own copy does not reach it.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ingest"))
+from _redact import scrub  # noqa: E402
+
+
 def _strip_private(text):
     out, pos, depth = [], 0, 0
     for tag in _PRIVATE_TAG.finditer(text):
@@ -82,7 +88,7 @@ def _read_query():
     `readline()` silently discarded everything after the first newline, and the MCP server sends
     the query verbatim -- so a multi-line question was quietly answered on its first line only,
     with no sign that the rest had been dropped."""
-    return " ".join(_strip_private(sys.stdin.read()).split())
+    return " ".join(scrub(_strip_private(sys.stdin.read())).split())
 
 
 def main():

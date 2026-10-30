@@ -103,7 +103,8 @@ def embed(text):
 
 
 _SENSITIVE_KEY = re.compile(r"(?i)(?:password|passwd|passphrase|secret|token|api[_-]?key|"
-                            r"access[_-]?key|private[_-]?key|credentials?)$")
+                            r"access[_-]?key|private[_-]?key|credentials?|authorization|"
+                            r"(?<![a-z])auth)$")
 
 
 def _scrub_deep(obj):
@@ -116,8 +117,9 @@ def _scrub_deep(obj):
         # The key is context the value-level rules never see: {"password": "hunter2hunter2"}
         # carries no `name=value` text for scrub() to match, so a sensitive key redacts its
         # string value outright.
-        return {k: ("[REDACTED:credential]" if isinstance(v, str) and v and isinstance(k, str)
-                    and _SENSITIVE_KEY.search(k) else _scrub_deep(v))
+        return {k: ("[REDACTED:credential]"
+                    if isinstance(v, (str, int, float)) and not isinstance(v, bool) and v != ""
+                    and isinstance(k, str) and _SENSITIVE_KEY.search(k) else _scrub_deep(v))
                 for k, v in obj.items()}
     return obj
 
@@ -2233,6 +2235,9 @@ def main():
     elif cmd == "review_add":
         if p["action"] not in ("merge", "supersede", "derive"):
             raise SystemExit("review action must be merge, supersede or derive")
+        # The proposal is stored as it is and shown to a reviewer later: scrubbed like any other
+        # text that reaches the table.
+        p["proposal"] = _scrub_deep(p.get("proposal") or {})
         if p["action"] == "derive":
             content = scrub((p.get("proposal") or {}).get("content") or "").strip()
             cur.execute("""SELECT id FROM mem.review_queue

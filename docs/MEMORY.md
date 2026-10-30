@@ -282,6 +282,13 @@ conversation: ingest indexes them as they are in the repo. The tag is about cont
 transcripts, memory texts and the queries handed to memory and doc search; identifiers, paths,
 settings and command-line arguments are taken as given.
 
+**Secret redaction is best-effort.** `ingest/_redact.py` removes the common shapes -- known key
+formats, `name=value`/`"name": "value"` for sensitive names, Authorization headers, `curl -u`,
+`.netrc`, registry `auth` blobs, private-key blocks -- from transcripts before the extractor's model
+sees them, from every query, and from everything stored. It is pattern matching: a secret written
+as prose, split across turns, or in a shape it does not know can get through. Text you know is
+sensitive belongs inside `<private>…</private>`, which is removed whatever it looks like.
+
 **The LLM step is pluggable** (see `hooks/_llm.py`): set `HM_LLM_BACKEND` to `openai`
 (`HM_LLM_URL`/`HM_LLM_KEY`/`HM_LLM_MODEL`), `ollama` (`HM_LLM_MODEL`), or `cli` (`HM_LLM_CMD`).
 Auto-selected if unset: openai when `HM_LLM_URL` is set, else cli when `HM_LLM_CMD` is set, else ollama. It only needs to turn text into a small JSON array of memory items; nothing about the

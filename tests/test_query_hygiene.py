@@ -103,7 +103,7 @@ check("nested and unclosed spans behave as in the hooks",
 check("the CLI query is stripped too", '_strip_private(args[0])' in src)
 
 _wsrc = open(os.path.join(ROOT, "rerank", "search_reranked.py"), encoding="utf-8").read()
-_wns = {"re": re, "sys": sys}
+_wns = {"re": re, "sys": sys, "os": os, "__file__": os.path.join(ROOT, "rerank", "search_reranked.py")}
 exec(compile(_wsrc[_wsrc.index("_PRIVATE_TAG = re.compile("):_wsrc.index("def main(")],
              "search_reranked.py", "exec"), _wns)
 _saved, sys.stdin = sys.stdin, io.StringIO("deploy <private>CANARY</private> rules")
