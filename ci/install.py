@@ -103,6 +103,33 @@ def git(*args):
                           text=True).stdout.strip()
 
 
+# Characters a home may not contain. Its paths are written unquoted into hook commands, systemd
+# units and launchd plists, and read back by the wiring scan below (which stops at = , [ ] { });
+# escaping each format separately is a promise kept in four places, so an unsafe home is refused
+# instead. The console and the setup wizard refuse the same set (console/src/home.rs).
+UNSAFE_IN_HOME = set('%&"\'<>;$`|*=,[]{}')
+
+
+def home_fault(raw, home):
+    """Why `home` (resolved from `raw`, the value as given) cannot be used, or None."""
+    if raw and raw.startswith("~") and raw[1:2] not in ("", "/", "\\"):
+        return "uses the ~user form, which not every reader expands the same way"
+    try:
+        home.encode("utf-8")
+    except UnicodeEncodeError:
+        return "is not valid UTF-8"
+    for c in home:
+        if c.isspace():
+            return "contains whitespace"
+        if ord(c) < 32 or 127 <= ord(c) < 160:
+            return "contains a control character"
+        if c in UNSAFE_IN_HOME:
+            return f"contains {c!r}"
+        if c == "\\" and not WINDOWS:
+            return "contains a backslash"
+    return None
+
+
 def default_home():
     return os.path.abspath(os.path.expanduser(os.environ.get("HYPERMNESIA_HOME") or "~/.HyperMnesia"))
 
@@ -764,6 +791,11 @@ def main():
     if os.path.exists(os.path.join(REPO, "RELEASE")):
         die(f"{REPO} is an installed release, not a checkout: run this from a working copy")
     home = os.path.abspath(os.path.expanduser(a.home)) if a.home else default_home()
+    why = home_fault(a.home or os.environ.get("HYPERMNESIA_HOME"), home)
+    if why:
+        die(f"the home {home!r} {why}. Its paths go unquoted into hook commands, autostart "
+            "entries and the wired configs, so it is refused rather than escaped. Use a plain "
+            "path -- letters, digits and / . _ - + -- such as the default ~/.HyperMnesia.")
     try:
         sha = git("rev-parse", "--short=12", f"{a.ref}^{{commit}}")
     except (OSError, subprocess.CalledProcessError):
@@ -776,8 +808,6 @@ def main():
         # processes at another.
         die("--wire is for the default home (~/.HyperMnesia) only; for another home, point the "
             "configs at it yourself and give every process HYPERMNESIA_HOME")
-    if a.wire and re.search(r"\s", home):
-        die(f"--wire: {home} contains whitespace, which an unquoted hook command would split")
     running = legacy_jobs_running()
     if running and not os.path.isdir(os.path.join(home, "state")):
         die(f"a job of the old layout is running ({', '.join(running)}): its state would be moved "

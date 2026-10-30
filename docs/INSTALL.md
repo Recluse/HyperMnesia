@@ -233,6 +233,16 @@ What it does, in order (the full account is at the top of `ci/install.py`):
   than the default: a hook started by its client has no `HYPERMNESIA_HOME` in its environment
   and would read the default home's state.
 
+**The home has to be a plain path.** Its paths are written unquoted into hook commands, systemd
+units, launchd plists and the wired configs, so rather than escape each format separately, the
+installer, the console's autostart and the setup wizard refuse a home that contains whitespace, a
+control character, any of `% & " ' < > ; $ ` | * = , [ ] { }`, a backslash (except as the Windows
+separator), or bytes that are not valid UTF-8, or that is given in the `~user` form. The error
+says which; `~/.HyperMnesia`, or any path of letters, digits and `/ . _ - +`, is fine. (The
+hooks themselves do not refuse: an existing install keeps working while you move it.) On
+Windows, `~user` in `HYPERMNESIA_ENV_FILE` is expanded by Python's guess from `USERNAME` but
+left literal by the MCP server and the console; give that file as a full path there.
+
 Open sessions keep the MCP process they started (it pins the release it was launched from) and
 pick up the new one when they restart. A checkout is still fine for development: point a config
 at `mcp-server/target/release/hypermnesia-mcp` and the server finds its scripts in that tree, as
@@ -593,7 +603,7 @@ the file is what is in force.
 | `HM_SEARCH` | bundled `ingest/search.py` | document-search script path; environment only |
 | `HM_MEM_OPS` | bundled `ingest/mem_ops.py` | memory operation script path; environment only |
 | `HM_DIALECTIC` | bundled `hooks/mem_dialectic.py` | grounded Q&A script path; environment only |
-| `HYPERMNESIA_HOME` | `~/.HyperMnesia` | this machine's HyperMnesia directory: the settings file, `current`, `state/`, `logs/` ([Installing a release](#installing-a-release)). Read the same way by the hooks, the MCP server, the console and `./hm install`; empty counts as unset |
+| `HYPERMNESIA_HOME` | `~/.HyperMnesia` | this machine's HyperMnesia directory: the settings file, `current`, `state/`, `logs/` ([Installing a release](#installing-a-release)). Read the same way by the hooks, the MCP server, the console and `./hm install`; empty counts as unset. Must be a plain path (see there) |
 | `HYPERMNESIA_ENV_FILE` | `$HYPERMNESIA_HOME/hypermnesia.env` | the settings file, named outright ([the shared settings file](#the-shared-settings-file)); empty counts as unset |
 | `HM_RERANK_BIND` | `127.0.0.1` | address the reranker listens on (the endpoint has no auth) |
 | `HM_DB_TIMEOUT_SECS` | `30` | MCP server: ceiling on one `psql` call |

@@ -450,6 +450,13 @@ pub fn install_self(label: &str) -> Result<String, String> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("cannot determine the path to myself: {e}"))?;
     let exe = crate::home::autostart_exe(&exe).to_string_lossy().to_string();
+    // The entry names these paths unquoted; one that needs quoting is refused, not escaped.
+    if let Some(why) = crate::home::home_fault() { return Err(why); }
+    if let Some(why) = crate::home::path_fault(std::path::Path::new(&exe)) {
+        return Err(format!("this binary's path {exe} {why}: an autostart entry cannot name it \
+                            safely. Run the tray from a plain path (./hm install --console puts \
+                            it under the home)."));
+    }
     let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
     let dir = PathBuf::from(&home).join("Library/LaunchAgents");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;

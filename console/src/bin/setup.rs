@@ -205,6 +205,9 @@ fn survey() -> Survey {
                                      steps need a checkout", p.display()),
         (None, None) => println!("  ./hm    not found next to this binary (deploy steps unavailable)"),
     }
+    if let Some(why) = home::home_fault() {
+        println!("  home    ! {why}");
+    }
     match installed_release() {
         Some(cur) => println!("  release {} (what the blocks below point at)", cur.display()),
         None => println!("  release none installed under {} (./hm install)",
@@ -467,8 +470,22 @@ fn checkout_note(l: &Option<Layout>) {
     }
 }
 
+/// Why the blocks cannot be printed, or None: an unsafe home, or a layout whose paths would need
+/// quoting in a hook command. Refused rather than escaped -- see home::UNSAFE_IN_HOME.
+fn blocks_fault(known: &Option<Layout>) -> Option<String> {
+    if let Some(why) = home::home_fault() { return Some(why); }
+    let l = known.as_ref()?;
+    let why = home::path_fault(&l.root).or_else(|| home::path_fault(&l.mcp))?;
+    Some(format!("{} {why}: the blocks name it unquoted. Install a release (./hm install) under \
+                  a plain home, or move the checkout to a plain path.", l.root.display()))
+}
+
 fn offer_mcp_block(scope: Option<&str>) {
     let known = layout();
+    if let Some(why) = blocks_fault(&known) {
+        println!("! {why}\n  No MCP block printed.");
+        return;
+    }
     let root = known.as_ref().map_or_else(|| PathBuf::from("/path/to/hypermnesia"),
                                           |l| l.root.clone());
     let mcp = known.as_ref().map_or_else(|| root.join("mcp-server/target/release").join(MCP_EXE),
@@ -570,6 +587,10 @@ fn hooks_block(root: &Path, hm_home: Option<&Path>) -> String {
 
 fn offer_hooks_block() {
     let known = layout();
+    if let Some(why) = blocks_fault(&known) {
+        println!("! {why}\n  No hooks block printed.");
+        return;
+    }
     let root = known.as_ref().map_or_else(|| PathBuf::from("/path/to/hypermnesia"),
                                           |l| l.root.clone());
     println!("The hooks are what makes this more than a search index: they deliver without being");

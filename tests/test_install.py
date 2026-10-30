@@ -216,7 +216,27 @@ assert not (tmp / "custom").exists()
 spaced = tmp / "with space"
 (spaced / ".claude").mkdir(parents=True)
 r = run(spaced, "--mcp-binary", str(fake), "--wire", ok=False)
-assert r.returncode != 0 and "whitespace" in r.stderr, r.stderr
+assert r.returncode != 0 and "whitespace" in r.stderr and "plain path" in r.stderr, r.stderr
+assert not (spaced / ".HyperMnesia").exists(), "a refused home was created"
+# An unsafe home is refused whatever the flags, however it is given.
+for bad, why in (("/srv/a b", "whitespace"), ("/srv/a%b", "'%'"), ("/srv/a&b", "'&'"),
+                 ("/srv/a\nb", "whitespace"), ("/srv/a\x01b", "control character"),
+                 ('/srv/a"b', "'\"'"), ("/srv/a'b", '"\'"'), ("/srv/a;b", "';'"),
+                 ("/srv/a$b", "'$'"), ("/srv/a`b", "'`'"), ("/srv/a|b", "'|'"),
+                 ("/srv/a*b", "'*'"), ("/srv/a<b", "'<'"), ("/srv/a=b", "'='"),
+                 ("/srv/a\\b", "backslash"), ("~root/hm", "~user form")):
+    r = run(home, "--mcp-binary", str(fake), "--home", bad, "--dry-run", ok=False)
+    assert r.returncode != 0 and why in r.stderr, (bad, r.stderr)
+    r = run(home, "--mcp-binary", str(fake), "--dry-run", ok=False,
+            env_extra={"HYPERMNESIA_HOME": bad})
+    assert r.returncode != 0 and why in r.stderr, (bad, r.stderr)
+r = subprocess.run([sys.executable, str(INSTALL), "--dry-run", "--mcp-binary", str(fake)],
+                   env={**{k: v for k, v in os.environ.items() if k != "HYPERMNESIA_HOME"},
+                        "HOME": str(home), "HYPERMNESIA_HOME": os.fsdecode(b"/srv/hm-\xff")},
+                   capture_output=True, text=True)
+assert r.returncode != 0 and "UTF-8" in r.stderr, r.stderr
+r = run(home, "--mcp-binary", str(fake), "--home", "/srv/plain-home_1.2+x", "--dry-run")
+assert "refused" not in r.stderr
 # Without --wire another home is fine.
 run(home, "--mcp-binary", str(fake), "--home", str(tmp / "custom"))
 assert (tmp / "custom" / "current" / "bin" / BIN).exists()

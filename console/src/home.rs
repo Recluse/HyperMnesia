@@ -154,8 +154,64 @@ pub fn posix_home() -> Option<String> {
 /// server its hm_home(): `abspath(expanduser(HYPERMNESIA_HOME or "~/.HyperMnesia"))`; an empty
 /// variable is unset.
 pub fn hm_home() -> PathBuf {
-    PathBuf::from(hm_home_from(std::env::var("HYPERMNESIA_HOME").ok().as_deref(),
-                               posix_home().as_deref()))
+    let var = std::env::var_os("HYPERMNESIA_HOME").filter(|v| !v.is_empty());
+    let home = std::env::var_os("HOME");
+    match (var.as_ref().map(|v| v.to_str()), home.as_ref().map(|h| h.to_str())) {
+        (Some(Some(v)), Some(Some(_)) | None) => PathBuf::from(hm_home_from(Some(v), posix_home().as_deref())),
+        (None, Some(Some(_)) | None) => PathBuf::from(hm_home_from(None, posix_home().as_deref())),
+        // Not valid UTF-8 somewhere: the bytes are kept, as Python keeps them, rather than
+        // converted lossily into a different directory. home_fault() refuses such a home for
+        // anything this console generates; reading the settings still finds the right file.
+        _ => raw_home(var.as_deref(), home.as_deref()),
+    }
+}
+
+/// `abspath(expanduser(...))` for the rare home that is not valid UTF-8, on the raw bytes: a
+/// leading `~/` (or a missing variable) takes HOME as it is; a relative path joins the working
+/// directory. Nothing is folded -- `..` in such a path stays as written.
+fn raw_home(var: Option<&std::ffi::OsStr>, home: Option<&std::ffi::OsStr>) -> PathBuf {
+    let home = home.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(hm_home_from(None, None))
+        .parent().map(Path::to_path_buf).unwrap_or_default());
+    let Some(v) = var else { return home.join(".HyperMnesia") };
+    let v = PathBuf::from(v);
+    if let Ok(rest) = v.strip_prefix("~") { return home.join(rest); }
+    if v.is_absolute() { v } else { std::env::current_dir().unwrap_or_default().join(v) }
+}
+
+/// Characters a home may not contain: its paths go unquoted into hook commands, systemd units
+/// and launchd plists, and the installer's wiring scan stops at `= , [ ] { }`. Escaping each
+/// format separately would be a promise kept in four places, so an unsafe home is refused
+/// instead -- the same set ci/install.py refuses (UNSAFE_IN_HOME there).
+pub const UNSAFE_IN_HOME: &str = "%&\"'<>;$`|*=,[]{}";
+
+/// Why this path cannot be written unquoted into a generated command or entry, or None.
+pub fn path_fault(p: &Path) -> Option<String> {
+    let Some(s) = p.to_str() else { return Some("is not valid UTF-8".into()) };
+    for c in s.chars() {
+        if c.is_whitespace() { return Some("contains whitespace".into()); }
+        if c.is_control() { return Some("contains a control character".into()); }
+        if UNSAFE_IN_HOME.contains(c) { return Some(format!("contains '{c}'")); }
+        if c == '\\' && !cfg!(windows) { return Some("contains a backslash".into()); }
+    }
+    None
+}
+
+/// Why the home cannot be used for anything this console generates (an autostart entry, a client
+/// config block), as a sentence that says what to do instead -- or None when it is fine.
+pub fn home_fault() -> Option<String> {
+    home_fault_of(std::env::var_os("HYPERMNESIA_HOME").filter(|v| !v.is_empty()).as_deref(),
+                  &hm_home())
+}
+
+fn home_fault_of(raw: Option<&std::ffi::OsStr>, home: &Path) -> Option<String> {
+    let why = match raw.and_then(|r| r.to_str()) {
+        Some(r) if r.starts_with('~') && !matches!(r[1..].chars().next(), None | Some('/' | '\\')) =>
+            Some("uses the ~user form, which not every reader expands the same way".to_string()),
+        _ => path_fault(home),
+    }?;
+    Some(format!("the home {} {why}. Its paths go unquoted into hook commands and autostart \
+                  entries, so it is refused rather than escaped. Use a plain path -- letters, \
+                  digits and / . _ - + -- such as the default ~/.HyperMnesia.", home.display()))
 }
 
 fn hm_home_from(var: Option<&str>, home: Option<&str>) -> String {
@@ -256,6 +312,37 @@ mod tests {
 
     /// The same cases the MCP server's tests pin for its copy of these functions, and what
     /// Python's abspath(expanduser()) answers for each.
+    /// The same characters ci/install.py refuses, for the same reason.
+    #[test]
+    fn an_unsafe_path_is_refused_and_a_plain_one_is_not() {
+        for bad in ["/srv/a b", "/srv/a\tb", "/srv/a\nb", "/srv/a\u{1}b", "/srv/a%b", "/srv/a&b",
+                    "/srv/a\"b", "/srv/a'b", "/srv/a<b", "/srv/a>b", "/srv/a;b", "/srv/a$b",
+                    "/srv/a`b", "/srv/a|b", "/srv/a*b", "/srv/a=b", "/srv/a,b", "/srv/a[b"] {
+            assert!(path_fault(Path::new(bad)).is_some(), "{bad:?} was accepted");
+        }
+        assert_eq!(path_fault(Path::new("/srv/a\\b")).is_some(), !cfg!(windows));
+        assert_eq!(path_fault(Path::new("/home/u/.HyperMnesia/current/bin/hypermnesia")), None);
+        assert_eq!(path_fault(Path::new("/srv/plain-home_1.2+x@y")), None);
+        let ok = Path::new("/srv/hm");
+        assert_eq!(home_fault_of(Some(std::ffi::OsStr::new("/srv/hm")), ok), None);
+        assert_eq!(home_fault_of(Some(std::ffi::OsStr::new("~/hm")), ok), None);
+        let why = home_fault_of(Some(std::ffi::OsStr::new("~root/hm")), ok).unwrap();
+        assert!(why.contains("~user form") && why.contains("plain path"), "{why}");
+        let why = home_fault_of(None, Path::new("/srv/a b")).unwrap();
+        assert!(why.contains("whitespace") && why.contains("/srv/a b"), "{why}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = std::ffi::OsStr::from_bytes(b"/srv/hm-\xff");
+            assert_eq!(path_fault(Path::new(raw)).as_deref(), Some("is not valid UTF-8"));
+            // ...and such a home is kept byte for byte, not turned into another directory.
+            assert_eq!(raw_home(Some(raw), None), PathBuf::from(raw));
+            let h = std::ffi::OsStr::from_bytes(b"/home/\xfe");
+            assert_eq!(raw_home(None, Some(h)), Path::new(h).join(".HyperMnesia"));
+            assert_eq!(raw_home(Some(std::ffi::OsStr::new("~/x")), Some(h)), Path::new(h).join("x"));
+        }
+    }
+
     #[test]
     fn the_home_is_resolved_like_the_loader() {
         assert_eq!(abs_path("/a/./b/../c"), "/a/c");

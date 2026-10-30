@@ -61,6 +61,9 @@ fn show() {
     let path = settings::env_file();
     println!("Settings file: {}{}", path.display(),
              if path.exists() { "" } else { "  (not created yet)" });
+    if let Some(why) = hypermnesia_console::home::home_fault() {
+        println!("! {why}");
+    }
     // The loader refuses the whole file on this, so every value in it is out of force. Without
     // this line the screen showed each one as "file" while the pipeline ran on defaults.
     let ignored = settings::fault();
