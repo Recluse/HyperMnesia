@@ -157,7 +157,7 @@ def load_env_file(path=None):
         return applied
     refused = []
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:   # a BOM (Windows editors) is not part of the first key
             for line in fh:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:

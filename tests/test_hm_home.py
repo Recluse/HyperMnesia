@@ -277,5 +277,18 @@ for f in sorted((ROOT / "hooks").glob("*.py")) + [ROOT / "ci" / "doctor.py"]:
         if re.search(r"""expanduser\(\s*f?["']~/\.claude/""", code):
             raise AssertionError(f"{f.name}:{n}: a ~/.claude path outside state_path(): {line.strip()}")
 
+# A settings file saved with a UTF-8 BOM (Windows editors) still yields its first key.
+bom = tmp / "bom"
+(bom / ".HyperMnesia").mkdir(parents=True)
+(bom / ".HyperMnesia").chmod(0o700)
+(bom / ".HyperMnesia" / "hypermnesia.env").write_bytes(b"\xef\xbb\xbfMEM_AUTHOR=alice\n")
+(bom / ".HyperMnesia" / "hypermnesia.env").chmod(0o600)
+code = ("import sys; sys.path.insert(0, %r); import _mem_common as m; m.load_env_file(); "
+        "print(m.identity())" % str(ROOT / "hooks"))
+r = subprocess.run([sys.executable, "-c", code], env={**{k: v for k, v in os.environ.items()
+                   if k not in ("HYPERMNESIA_HOME", "HYPERMNESIA_ENV_FILE", "MEM_AUTHOR")},
+                   "HOME": str(bom), "USERPROFILE": str(bom)}, capture_output=True, text=True)
+assert r.returncode == 0 and r.stdout.strip().splitlines()[-1] == "alice", (r.stdout, r.stderr)
+
 shutil.rmtree(tmp, ignore_errors=True)
 print("test_hm_home: ok")

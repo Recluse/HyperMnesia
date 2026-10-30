@@ -189,6 +189,8 @@ pub fn fault() -> Option<String> { None }
 pub fn read() -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let Ok(text) = std::fs::read_to_string(env_file()) else { return out };
+    // A UTF-8 BOM (Windows editors write one) is not part of the first key, as in the hooks.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') { continue; }

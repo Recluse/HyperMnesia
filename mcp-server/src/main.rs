@@ -1521,6 +1521,8 @@ fn env_file_value(key: &str) -> Option<String> {
         }
     }
     let text = std::fs::read_to_string(&path).ok()?;
+    // A UTF-8 BOM (Windows editors write one) is not part of the first key, as in the Python loader.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     // Python reads the file with universal newlines: \n, \r\n and a lone \r all end a line.
     for line in text.split(['\n', '\r']) {
         let line = line.trim_matches(py_space);
@@ -2119,6 +2121,7 @@ const GLOB_CASES: &[(&str, &str, bool)] = &[
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     fn sh(script: &str) -> std::process::Child {
@@ -2264,6 +2267,11 @@ mod tests {
         std::env::remove_var("MEM_DIALECTIC_TIMEOUT");
         std::env::remove_var("HM_DIALECTIC_TIMEOUT_SECS");
         assert_eq!(mem_author().as_deref(), Some("alice"));
+        // A UTF-8 BOM (Windows editors write one) is not part of the first key.
+        let kept = std::fs::read(&file).unwrap();
+        std::fs::write(&file, b"\xef\xbb\xbfMEM_AUTHOR=alice\n").unwrap();
+        assert_eq!(mem_author().as_deref(), Some("alice"), "a BOM hid the first key");
+        std::fs::write(&file, kept).unwrap();
         // A set-but-invalid MEM_AUTHOR is no identity at all, NOT the file's author.
         std::env::set_var("MEM_AUTHOR", "not a name");
         assert_eq!(mem_author(), None, "invalid env identity must not fall back to the file");
