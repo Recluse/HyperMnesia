@@ -118,6 +118,12 @@ jobs:
       - name: Console unit tests
         working-directory: console
         run: cargo test --locked
+      # The console, the hooks and the MCP server must name one settings file; this compares the
+      # built console against the Python loader, expanduser cases included.
+      - name: Console and hooks agree on the home and the settings file
+        env:
+          HM_REQUIRE_CONSOLE: "1"
+        run: python tests/test_hm_home.py
       # The Linux tray, behind its feature: exercises the `tray-icon` + GTK path this runner does
       # not otherwise touch. Its own dependencies need real headers, hence the apt step -- and
       # that step is confined to here so the two steps above stay proof that nothing else in this

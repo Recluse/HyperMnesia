@@ -207,6 +207,40 @@ finish = ("import sys; sys.path.insert(0, %r); import mem_extract as e; "
 assert py(finish, lw, MEM_AUTHOR="t") == "1"
 assert not (lw / ".claude" / "mem-queue.jsonl.retiring").exists()
 
+# The console resolves the settings file by the same rule, expanduser included: HOME unset means
+# the passwd home, `~user` that user's home, an empty variable is unset. Checked against the built
+# binary when there is one (CI's Rust job builds it and sets HM_REQUIRE_CONSOLE).
+def console_bin():
+    for d in ("release", "debug"):
+        p = ROOT / "console" / "target" / d / "hypermnesia-settings"
+        if p.exists():
+            return p
+    return None
+
+
+cb = console_bin()
+if cb is None:
+    assert not os.environ.get("HM_REQUIRE_CONSOLE"), "HM_REQUIRE_CONSOLE is set but the console is not built"
+    print("test_hm_home: console parity skipped (console not built)")
+elif os.name != "nt":
+    import pwd
+    me = pwd.getpwuid(os.getuid()).pw_name
+    base = {k: v for k, v in os.environ.items()
+            if k not in ("HYPERMNESIA_HOME", "HYPERMNESIA_ENV_FILE", "MEM_AUTHOR", "HOME")}
+    for extra in ({}, {"HOME": str(home)}, {"HOME": str(home), "HYPERMNESIA_HOME": ""},
+                  {"HOME": str(home), "HYPERMNESIA_HOME": f"~{me}/hm-parity"},
+                  {"HOME": str(home), "HYPERMNESIA_HOME": "rel/../hm2"},
+                  {"HOME": str(home), "HYPERMNESIA_ENV_FILE": "~/named.env"},
+                  {"HOME": str(home), "HYPERMNESIA_ENV_FILE": ""}):
+        env = {**base, **extra}
+        r = subprocess.run([sys.executable, "-c", PROBE], env=env, capture_output=True, text=True,
+                           timeout=60, cwd=str(tmp))
+        want = json.loads(r.stdout.strip().splitlines()[-1])["env"]
+        c = subprocess.run([str(cb)], env=env, capture_output=True, text=True, timeout=60,
+                           cwd=str(tmp))
+        got = re.search(r"^Settings file: (.*?)(?:  \(not created yet\))?$", c.stdout, re.M)
+        assert got and got.group(1) == want, (extra, c.stdout[:200], want)
+
 # Every test that imports or runs the hooks isolates HYPERMNESIA_HOME too (tests/_isolate.py), or
 # builds its subprocess environment without it: a test overriding HOME alone would otherwise
 # write caches and fault markers -- or retire a queue -- in the real home of whoever runs it.

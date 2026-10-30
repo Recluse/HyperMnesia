@@ -133,31 +133,24 @@ pub const KNOBS: &[Knob] = &[
 ///   * otherwise `<HYPERMNESIA_HOME>/hypermnesia.env` (`home::hm_home`) -- unless only the copy an
 ///     older install kept in `~/.claude` exists, in which case that one. `ci/install.py` moves it
 ///     and leaves a link at the old name;
-///   * a leading `~/` is expanded (Python's `expanduser`). Taken literally, the console reported
-///     "not created yet" over a file the hooks were reading happily.
+///   * a leading `~` is expanded exactly as Python's `expanduser` does it (`home::expand_user`:
+///     HOME, else the passwd home; `~user`; USERPROFILE on Windows). Taken literally, the console
+///     reported "not created yet" over a file the hooks were reading happily.
 pub fn env_file() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+    let home = crate::home::posix_home();
     let explicit = std::env::var("HYPERMNESIA_ENV_FILE").ok();
-    env_file_in(explicit.as_deref(), &home, &crate::home::hm_home())
+    env_file_in(explicit.as_deref(), &crate::home::hm_home(),
+                &|p| crate::home::expand_user(p, home.as_deref()))
 }
 
-fn env_file_in(explicit: Option<&str>, home: &str, hm_home: &std::path::Path) -> PathBuf {
+fn env_file_in(explicit: Option<&str>, hm_home: &std::path::Path, expand: &dyn Fn(&str) -> String)
+    -> PathBuf {
     if let Some(raw) = explicit.filter(|s| !s.is_empty()) {
-        return PathBuf::from(expand_home(raw, home));
+        return PathBuf::from(expand(raw));
     }
     let new = hm_home.join("hypermnesia.env");
-    let old = PathBuf::from(expand_home("~/.claude/hypermnesia.env", home));
+    let old = PathBuf::from(expand("~/.claude/hypermnesia.env"));
     if !new.exists() && old.exists() { old } else { new }
-}
-
-pub(crate) fn expand_home(p: &str, home: &str) -> String {
-    if p == "~" {
-        home.to_string()
-    } else if let Some(rest) = p.strip_prefix("~/") {
-        format!("{home}/{rest}")
-    } else {
-        p.to_string()
-    }
 }
 
 /// Why the hooks will ignore this file, if they will.
@@ -419,6 +412,8 @@ mod tests {
         let d = std::env::temp_dir().join(format!("hm-envfile-{}", std::process::id()));
         let home = d.to_string_lossy().into_owned();
         let hm = d.join(".HyperMnesia");
+        let x = |p: &str| crate::home::expand_user(p, Some(&home));
+        let env_file_in = |e: Option<&str>, _h: &str, hm: &std::path::Path| env_file_in(e, hm, &x);
         std::fs::create_dir_all(d.join(".claude")).unwrap();
         assert_eq!(env_file_in(None, &home, &hm), hm.join("hypermnesia.env"), "nothing yet");
         assert_eq!(env_file_in(Some(""), &home, &hm), hm.join("hypermnesia.env"),
@@ -433,11 +428,17 @@ mod tests {
                    "both exist: the home's");
         let _ = std::fs::remove_dir_all(&d);
 
+        #[cfg(unix)]
+        let expand_home = |p: &str, h: &str| crate::home::expand_user(p, Some(h));
+        #[cfg(unix)]
         assert_eq!(expand_home("~/.claude/hypermnesia.env", "/Users/x"),
                    "/Users/x/.claude/hypermnesia.env");
+        #[cfg(unix)]
         assert_eq!(expand_home("~", "/Users/x"), "/Users/x");
+        #[cfg(unix)]
         assert_eq!(expand_home("/etc/hm.env", "/Users/x"), "/etc/hm.env");
         // Not expanded by expanduser either: only a leading ~ or ~user is.
+        #[cfg(unix)]
         assert_eq!(expand_home("./~/x", "/Users/x"), "./~/x");
     }
 
