@@ -177,11 +177,12 @@ def read_release(rel):
 
 def console_of(rel):
     """The cargo features the console in this release was built with ("" for none), or None when
-    the release has no console -- or has one from before the features were recorded, which is
-    rebuilt rather than guessed at."""
+    the release has no console. A release from before the features were recorded (a `console=`
+    line and no `console_features=`) has the console with the default features: an upgrade from
+    it keeps the console rather than dropping it."""
     if not os.path.isfile(os.path.join(rel, "bin", CONSOLE_BINS[1])):
         return None
-    return read_release(rel).get("console_features")
+    return read_release(rel).get("console_features", "")
 
 
 def wanted_console(home, requested, no_console):

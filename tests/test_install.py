@@ -410,6 +410,18 @@ run(home12, "--mcp-binary", str(fake), "--ref", "HEAD", "--no-console", env_extr
 assert not (rels12 / head / "bin" / "hypermnesia").exists()
 r = run(home12, "--mcp-binary", str(fake), "--console", "--no-console", ok=False, env_extra=cg)
 assert r.returncode != 0 and "contradict" in r.stderr, r.stderr
+# A release from the installer before features were recorded (`console=`, no
+# `console_features=`) has a console with the default features, and an upgrade keeps it.
+home14 = tmp / "home14"
+(home14 / ".claude").mkdir(parents=True)
+rels14 = home14 / ".HyperMnesia" / "releases"
+run(home14, "--mcp-binary", str(fake), "--ref", "HEAD~1", "--console", env_extra=cg)
+rec = rels14 / prev / "RELEASE"
+rec.write_text("".join(l for l in rec.read_text().splitlines(True) if not l.startswith("console_features=")))
+r = run(home14, "--mcp-binary", str(fake), "--ref", "HEAD", env_extra=cg)
+assert (rels14 / head / "bin" / "hypermnesia").read_text() == "console features=\n", r.stdout
+assert "replaced release has the console" in r.stdout, r.stdout
+
 # Without --mcp-binary the MCP server is built by cargo too, into the home's build directory.
 home13 = tmp / "home13"
 (home13 / ".claude").mkdir(parents=True)
