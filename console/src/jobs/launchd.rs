@@ -408,7 +408,13 @@ fn plutil(args: &[&str]) -> Result<(), String> {
 }
 
 /// The autostart plist, as text. A function so a test can read what is actually written.
-fn tray_plist(label: &str, exe: &str, log: &str) -> String {
+/// `home` is HYPERMNESIA_HOME when it is not the default: launchd starts the tray with none of
+/// this shell's variables, so without it a tray installed under a custom home would read the
+/// default home's settings and state at every login.
+fn tray_plist(label: &str, exe: &str, log: &str, home: Option<&str>) -> String {
+    let env = home.map(|h| format!(
+        "  <key>EnvironmentVariables</key><dict><key>HYPERMNESIA_HOME</key><string>{}</string></dict>\n",
+        h.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"))).unwrap_or_default();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -416,7 +422,7 @@ fn tray_plist(label: &str, exe: &str, log: &str) -> String {
 <dict>
   <key>Label</key><string>{label}</string>
   <key>ProgramArguments</key><array><string>{exe}</string></array>
-  <key>RunAtLoad</key><true/>
+{env}  <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>
   <key>StandardOutPath</key><string>{log}</string>
@@ -449,7 +455,8 @@ pub fn install_self(label: &str) -> Result<String, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join(format!("{label}.plist"));
     let log = crate::home::log_dir().join("tray.log").to_string_lossy().to_string();
-    let plist = tray_plist(label, &exe, &log);
+    let hm_home = crate::home::non_default_home().map(|h| h.to_string_lossy().into_owned());
+    let plist = tray_plist(label, &exe, &log, hm_home.as_deref());
     std::fs::write(&path, plist).map_err(|e| format!("{}: {e}", path.display()))?;
     if let Err(e) = plutil(&["-lint", &path.to_string_lossy()]) {
         let _ = std::fs::remove_file(&path);
@@ -629,7 +636,10 @@ mod tests {
 
     #[test]
     fn autostart_restarts_a_crash_but_not_a_deliberate_quit() {
-        let plist = tray_plist("com.hypermnesia.tray", "/opt/hm/hypermnesia", "/tmp/tray.log");
+        let plist = tray_plist("com.hypermnesia.tray", "/opt/hm/hypermnesia", "/tmp/tray.log", None);
+        assert!(!plist.contains("HYPERMNESIA_HOME"), "the default home needs no variable");
+        let custom = tray_plist("com.hypermnesia.tray", "/x", "/tmp/tray.log", Some("/srv/a&b"));
+        assert!(custom.contains("<key>HYPERMNESIA_HOME</key><string>/srv/a&amp;b</string>"), "{custom}");
         let keep = plist.lines().find(|l| l.contains("KeepAlive")).expect("KeepAlive");
         assert!(keep.contains("SuccessfulExit"), "KeepAlive must be conditional: {keep}");
         assert!(!keep.contains("<true/>"), "unconditional KeepAlive defeats Quit: {keep}");

@@ -502,8 +502,11 @@ be in -- old releases are pruned, and an entry naming one would stop starting at
 a checkout, it names that checkout's binary, as before. Either way its log is
 `~/.HyperMnesia/logs/tray.log`. The setup wizard's MCP and hook blocks point into `current` when a
 release is installed, and into this checkout (with a note) when not. Its deploy steps (`hm init`,
-`hm ingest`, `hm doctor`) need a checkout: `hm init` writes the stack's generated password into
-the tree it runs from, and a release is pruned.
+`hm ingest`, `hm doctor`) refuse an `hm` inside an installed release, however it is reached:
+`hm init` writes the stack's generated password into the tree it runs from, and a release is
+pruned. Under a home other than the default, the tray's autostart entry and the wizard's MCP and
+hook blocks carry `HYPERMNESIA_HOME`, since the processes they start get none of your shell's
+variables.
 
 The four command-line tools build the same way everywhere; the data layer has no dependencies at
 all. The tray itself needs a GUI toolkit, declared per platform so a machine with none of it

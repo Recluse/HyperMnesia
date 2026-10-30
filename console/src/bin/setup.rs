@@ -199,9 +199,11 @@ fn survey() -> Survey {
     let s = Survey { psql: which("psql"), docker: which("docker") };
     println!("  psql    {}", mark(s.psql));
     println!("  docker  {}", mark(s.docker));
-    match hm_path() {
-        Some(p) => println!("  ./hm    found at {}", p.display()),
-        None => println!("  ./hm    not found next to this binary (deploy steps unavailable)"),
+    match (hm_path(), release_hm()) {
+        (Some(p), _) => println!("  ./hm    found at {}", p.display()),
+        (None, Some(p)) => println!("  ./hm    {} is in an installed release: refused, deploy \
+                                     steps need a checkout", p.display()),
+        (None, None) => println!("  ./hm    not found next to this binary (deploy steps unavailable)"),
     }
     match installed_release() {
         Some(cur) => println!("  release {} (what the blocks below point at)", cur.display()),
@@ -231,10 +233,14 @@ fn repo_root() -> Option<PathBuf> {
 /// `hm` lives at the repository root, and this binary at console/target/release/. Resolved from
 /// the executable rather than the working directory: the wizard is run from anywhere.
 ///
-/// Not the `hm` an installed release carries beside its bin/: `hm init` writes the stack's
-/// generated password into deploy/docker/.env of the tree it runs from, and a release is one
-/// commit, pruned by the next installs -- the password would go with it.
+/// Never the `hm` of an installed release (`release_hm`): every step it runs writes into the tree
+/// it runs from, and `hm init` writes the stack's generated password there.
 fn hm_path() -> Option<PathBuf> {
+    hm_candidate().filter(|p| !in_release(p))
+}
+
+/// The `hm` this wizard would use, before the release check.
+fn hm_candidate() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     for up in [3usize, 4] {
         if let Some(root) = exe.ancestors().nth(up) {
@@ -246,12 +252,37 @@ fn hm_path() -> Option<PathBuf> {
     if p.exists() { Some(p) } else { None }
 }
 
+/// The `hm` that was found but refused, because it lives in an installed release -- reached
+/// through `current`, from the working directory, or in a release of another home.
+fn release_hm() -> Option<PathBuf> {
+    hm_candidate().filter(|p| in_release(p)).map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+}
+
+/// Is this file inside an installed release? A release is one commit that a later install prunes,
+/// so deployment data written there (the generated database password above all) would go with
+/// it. A release is a tree with a RELEASE file at its root -- of any home -- or anything under
+/// this machine's <home>/releases/, compared canonically so `current` and links count.
+fn in_release(file: &Path) -> bool {
+    in_release_of(file, &home::hm_home())
+}
+
+fn in_release_of(file: &Path, hm_home: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let file = canon(file);
+    let Some(dir) = file.parent() else { return false };
+    dir.join("RELEASE").is_file() || file.starts_with(canon(&hm_home.join("releases")))
+}
+
 /// Run `./hm <args>` with its output going straight to the terminal, and say plainly whether it
 /// worked. Inheriting stdio rather than capturing: these steps take minutes and a silent wizard
 /// looks hung.
 fn run_hm(args: &[&str]) -> bool {
     let Some(hm) = hm_path() else {
-        println!("! ./hm not found, skipping");
+        match release_hm() {
+            Some(p) => println!("! {} is in an installed release, which a later install prunes \
+                                 -- run this from a checkout. Skipping.", p.display()),
+            None => println!("! ./hm not found, skipping"),
+        }
         return false;
     };
     println!("Running: {} {}\n", hm.display(), args.join(" "));
@@ -395,10 +426,17 @@ fn shell_quote(v: &str) -> String {
 
 // -- the two blocks that touch someone else's files ------------------------------------------
 
+/// The MCP server's file name, as ci/install.py and cargo name it on this platform.
+const MCP_EXE: &str = if cfg!(windows) { "hypermnesia-mcp.exe" } else { "hypermnesia-mcp" };
+
 /// `<HYPERMNESIA_HOME>/current`, when a release with the MCP server is installed there.
 fn installed_release() -> Option<PathBuf> {
-    let cur = home::hm_home().join("current");
-    cur.join("bin").join("hypermnesia-mcp").exists().then_some(cur)
+    installed_release_in(&home::hm_home(), MCP_EXE)
+}
+
+fn installed_release_in(hm_home: &Path, exe: &str) -> Option<PathBuf> {
+    let cur = hm_home.join("current");
+    cur.join("bin").join(exe).exists().then_some(cur)
 }
 
 /// What the blocks below point at: the installed release when there is one -- `current` is what
@@ -413,10 +451,10 @@ struct Layout {
 
 fn layout() -> Option<Layout> {
     if let Some(cur) = installed_release() {
-        return Some(Layout { mcp: cur.join("bin/hypermnesia-mcp"), root: cur, installed: true });
+        return Some(Layout { mcp: cur.join("bin").join(MCP_EXE), root: cur, installed: true });
     }
     let root = repo_root()?;
-    Some(Layout { mcp: root.join("mcp-server/target/release/hypermnesia-mcp"), root,
+    Some(Layout { mcp: root.join("mcp-server/target/release").join(MCP_EXE), root,
                   installed: false })
 }
 
@@ -433,19 +471,12 @@ fn offer_mcp_block(scope: Option<&str>) {
     let known = layout();
     let root = known.as_ref().map_or_else(|| PathBuf::from("/path/to/hypermnesia"),
                                           |l| l.root.clone());
-    let mcp = known.as_ref().map_or_else(|| root.join("mcp-server/target/release/hypermnesia-mcp"),
+    let mcp = known.as_ref().map_or_else(|| root.join("mcp-server/target/release").join(MCP_EXE),
                                          |l| l.mcp.clone());
     // The scope is known if step 3 ingested one; otherwise it stays a placeholder and the text
     // below says so.
     let repo = scope.unwrap_or("myrepo");
-    let block = format!(r#"{{ "mcpServers": {{ "hypermnesia": {{
-  "command": "{mcp}",
-  "env": {{
-    "HM_REPO": "{repo}",
-    "DATABASE_URL": "postgresql://...",
-    "HM_SEARCH":  "{root}/ingest/search.py",
-    "HM_MEM_OPS": "{root}/ingest/mem_ops.py"
-  }} }} }} }}"#, mcp = mcp.display(), root = root.display(), repo = repo);
+    let block = mcp_block(&mcp, &root, repo, home::non_default_home().as_deref());
     println!("Add this to your MCP client's config (for Claude Code, the repo's .mcp.json):\n");
     println!("{block}\n");
     if scope.is_some() {
@@ -487,20 +518,63 @@ fn offer_mcp_block(scope: Option<&str>) {
     }
 }
 
+/// A string as a JSON string literal: these blocks are pasted into JSON configs, and a Windows
+/// path's backslashes or a quote in a directory name would otherwise break them.
+fn json_str(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The MCP client block. A home other than the default is passed on as HYPERMNESIA_HOME: the
+/// client starts the server with its own environment, not this shell's, and without it the
+/// server would read the default home's settings file.
+fn mcp_block(mcp: &Path, root: &Path, repo: &str, hm_home: Option<&Path>) -> String {
+    let p = |x: &Path| json_str(&x.to_string_lossy());
+    let home = hm_home.map(|h| format!(",\n    \"HYPERMNESIA_HOME\": {}", p(h))).unwrap_or_default();
+    format!(r#"{{ "mcpServers": {{ "hypermnesia": {{
+  "command": {mcp},
+  "env": {{
+    "HM_REPO": {repo},
+    "DATABASE_URL": "postgresql://...",
+    "HM_SEARCH":  {search},
+    "HM_MEM_OPS": {mem_ops}{home}
+  }} }} }} }}"#, mcp = p(mcp), repo = json_str(repo), search = p(&root.join("ingest/search.py")),
+            mem_ops = p(&root.join("ingest/mem_ops.py")))
+}
+
+/// The hooks block. A home other than the default is set in front of each command, for the same
+/// reason as in `mcp_block`: the agent runs its hooks with its own environment.
+fn hooks_block(root: &Path, hm_home: Option<&Path>) -> String {
+    let prefix = hm_home.map(|h| format!("HYPERMNESIA_HOME={} ", shell_quote(&h.to_string_lossy())))
+        .unwrap_or_default();
+    let cmd = |hook: &str| json_str(&format!("{prefix}python3 {}",
+                                             root.join("hooks").join(hook).display()));
+    format!(r#"  "hooks": {{
+    "PreToolUse": [{{ "matcher": "Edit|Write|MultiEdit", "hooks": [
+      {{ "type": "command", "command": {a} }} ]}}],
+    "UserPromptSubmit": [{{ "hooks": [
+      {{ "type": "command", "command": {r} }} ]}}],
+    "SessionStart": [{{ "hooks": [
+      {{ "type": "command", "command": {s} }} ]}}]
+  }}"#, a = cmd("arch_invariants.py"), r = cmd("mem_recall.py"), s = cmd("mem_profile.py"))
+}
+
 fn offer_hooks_block() {
     let known = layout();
     let root = known.as_ref().map_or_else(|| PathBuf::from("/path/to/hypermnesia"),
                                           |l| l.root.clone());
     println!("The hooks are what makes this more than a search index: they deliver without being");
     println!("asked. For Claude Code, add to its settings:\n");
-    println!(r#"  "hooks": {{
-    "PreToolUse": [{{ "matcher": "Edit|Write|MultiEdit", "hooks": [
-      {{ "type": "command", "command": "python3 {root}/hooks/arch_invariants.py" }} ]}}],
-    "UserPromptSubmit": [{{ "hooks": [
-      {{ "type": "command", "command": "python3 {root}/hooks/mem_recall.py" }} ]}}],
-    "SessionStart": [{{ "hooks": [
-      {{ "type": "command", "command": "python3 {root}/hooks/mem_profile.py" }} ]}}]
-  }}"#, root = root.display());
+    println!("{}", hooks_block(&root, home::non_default_home().as_deref()));
     checkout_note(&known);
     println!("\nSee hooks/README.md for the rest (capture, extract, consolidate, reflect) and for");
     println!("the scheduled passes. This wizard does not edit your agent's settings file: it is");
@@ -652,6 +726,65 @@ mod tests {
         assert_eq!(shell_quote("$HOME"), "'$HOME'");
         // The one case single quotes cannot hold on their own.
         assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
+    }
+
+    /// The deploy steps never run an `hm` that lives in an installed release, whichever way it
+    /// is reached: a tree with a RELEASE file, or anything under <home>/releases/ -- through the
+    /// `current` link too. A checkout's `hm` is used.
+    #[test]
+    fn an_hm_inside_a_release_is_refused() {
+        let d = std::env::temp_dir().join(format!("hm-setup-rel-{}", std::process::id()));
+        let home = d.join("hm");
+        let rel = home.join("releases/abc");
+        std::fs::create_dir_all(&rel).unwrap();
+        std::fs::write(rel.join("hm"), "").unwrap();
+        assert!(in_release_of(&rel.join("hm"), &home), "under releases/");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("releases/abc", home.join("current")).unwrap();
+            assert!(in_release_of(&home.join("current/hm"), &home), "through current");
+        }
+        let other = d.join("other-home/releases/x");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("hm"), "").unwrap();
+        std::fs::write(other.join("RELEASE"), "commit=x\n").unwrap();
+        assert!(in_release_of(&other.join("hm"), &home), "another home's release: its RELEASE");
+        let checkout = d.join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(checkout.join("hm"), "").unwrap();
+        assert!(!in_release_of(&checkout.join("hm"), &home), "a checkout is used");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The installer names the binary hypermnesia-mcp.exe on Windows; a release carrying only
+    /// that is still a release.
+    #[test]
+    fn a_release_is_recognised_by_this_platforms_binary_name() {
+        let d = std::env::temp_dir().join(format!("hm-setup-exe-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("current/bin")).unwrap();
+        std::fs::write(d.join("current/bin/hypermnesia-mcp.exe"), "").unwrap();
+        assert_eq!(installed_release_in(&d, "hypermnesia-mcp.exe"), Some(d.join("current")));
+        assert_eq!(installed_release_in(&d, "hypermnesia-mcp"), None);
+        assert_eq!(MCP_EXE.ends_with(".exe"), cfg!(windows));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A home other than the default reaches the server and the hooks through their own
+    /// environment, which is not this shell's; the default adds nothing.
+    #[test]
+    fn the_blocks_carry_a_custom_home_and_stay_valid_json() {
+        let root = Path::new("/hm/current");
+        let mcp = Path::new("/hm/current/bin/hypermnesia-mcp");
+        let plain = mcp_block(mcp, root, "myrepo", None);
+        assert!(!plain.contains("HYPERMNESIA_HOME"), "{plain}");
+        let custom = mcp_block(mcp, root, "myrepo", Some(Path::new("/srv/a \"b\"")));
+        assert!(custom.contains(r#""HYPERMNESIA_HOME": "/srv/a \"b\"""#), "{custom}");
+        let win = mcp_block(Path::new(r"C:\hm\bin\hypermnesia-mcp.exe"), root, "r", None);
+        assert!(win.contains(r#""command": "C:\\hm\\bin\\hypermnesia-mcp.exe""#), "{win}");
+        let hooks = hooks_block(root, Some(Path::new("/srv/my home")));
+        assert!(hooks.contains(r#""command": "HYPERMNESIA_HOME='/srv/my home' python3 /hm/current/hooks/mem_recall.py""#),
+                "{hooks}");
+        assert!(!hooks_block(root, None).contains("HYPERMNESIA_HOME"));
     }
 
     /// launchd starts the tray with a minimal environment. A command resting on a variable this

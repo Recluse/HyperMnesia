@@ -712,13 +712,22 @@ pub fn set_enabled(job: &Job, enabled: bool) -> Result<String, String> {
 /// `launchd.rs`'s `KeepAlive` comment documents for the plist side of this same unit.
 /// `WantedBy=default.target` rather than a graphical-session target: not every desktop environment
 /// reaches the latter, and `default.target` is the one every session manager pulls in.
-fn tray_unit(exe: &str, log: &str) -> String {
+///
+/// `home` is HYPERMNESIA_HOME when it is not the default: the user manager starts the tray with
+/// none of this shell's variables, so without it a tray installed under a custom home would read
+/// the default home's settings and state at every login.
+fn tray_unit(exe: &str, log: &str, home: Option<&str>) -> String {
+    // Quoted for systemd: `%` is a specifier, `\` and `"` escapes, inside the double quotes.
+    let env = home.map(|h| format!("Environment=\"HYPERMNESIA_HOME={}\"\n",
+                                   h.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%")))
+        .unwrap_or_default();
     format!(
         "[Unit]\n\
          Description=HyperMnesia tray\n\
          \n\
          [Service]\n\
          Type=simple\n\
+         {env}\
          ExecStart={exe}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
@@ -744,7 +753,9 @@ pub fn install_self(label: &str) -> Result<String, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join(format!("{label}.service"));
     let log = crate::home::log_dir().join("tray.log").to_string_lossy().to_string();
-    std::fs::write(&path, tray_unit(&exe, &log)).map_err(|e| format!("{}: {e}", path.display()))?;
+    let hm_home = crate::home::non_default_home().map(|h| h.to_string_lossy().into_owned());
+    std::fs::write(&path, tray_unit(&exe, &log, hm_home.as_deref()))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
 
     if let Err(e) = Command::new("systemctl").args(["--user", "daemon-reload"]).output() {
         let _ = std::fs::remove_file(&path);
@@ -1080,11 +1091,25 @@ mod tests {
     /// lies, the same trap `launchd.rs`'s `KeepAlive` comment documents for the plist side.
     #[test]
     fn tray_unit_restarts_on_failure_only_and_points_at_the_binary() {
-        let unit = tray_unit("/usr/local/bin/hypermnesia", "/home/you/.hypermnesia/logs/tray.log");
+        let unit = tray_unit("/usr/local/bin/hypermnesia", "/home/you/.hypermnesia/logs/tray.log",
+                             None);
+        assert!(!unit.contains("HYPERMNESIA_HOME"), "the default home needs no variable: {unit}");
         assert!(unit.contains("Restart=on-failure"), "{unit}");
         assert!(!unit.contains("Restart=always"), "{unit}");
         assert!(unit.contains("ExecStart=/usr/local/bin/hypermnesia"), "{unit}");
         assert!(unit.contains("WantedBy=default.target"), "{unit}");
+    }
+
+    /// A tray installed under a custom home must find that home at login, when the user manager
+    /// gives it none of the installing shell's variables.
+    #[test]
+    fn tray_unit_carries_a_custom_home() {
+        let unit = tray_unit("/hm/current/bin/hypermnesia", "/hm/logs/tray.log",
+                             Some("/srv/my 100% \"home\""));
+        assert!(unit.contains(r#"Environment="HYPERMNESIA_HOME=/srv/my 100%% \"home\"""#), "{unit}");
+        let env = unit.find("Environment=").unwrap();
+        assert!(env > unit.find("[Service]").unwrap() && env < unit.find("ExecStart=").unwrap(),
+                "{unit}");
     }
 
     /// A unit that was never installed is an honest "nothing to report", not a fault -- the same
