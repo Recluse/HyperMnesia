@@ -220,18 +220,16 @@ fn database_url() -> String {
 }
 fn py() -> String { std::env::var("HM_PYTHON").unwrap_or_else(|_| "python3".to_string()) }
 
-/// Path to a bundled script: explicit env, else resolved from the binary's own location
-/// (`<repo>/mcp-server/target/release/hypermnesia-mcp` -> `<repo>/<rel>`). Only if neither works
-/// does it fall back to a cwd-relative path, and it says so on stderr when it does.
+/// Path to a bundled script: explicit env, else resolved from the binary's own location (see
+/// `release_root`). Only if neither works does it fall back to a cwd-relative path, and it says
+/// so on stderr when it does.
 fn script_path(env_key: &str, rel: &str) -> String {
     if let Ok(p) = std::env::var(env_key) {
         if !p.is_empty() { return p; }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(root) = exe.ancestors().nth(4) {   // exe/release/target/mcp-server/<root>
-            let p = root.join(rel);
-            if p.exists() { return p.to_string_lossy().into_owned(); }
-        }
+    if let Some(root) = release_root() {
+        let p = root.join(rel);
+        if p.exists() { return p.to_string_lossy().into_owned(); }
     }
     // Last resort: a path relative to the SERVER PROCESS's cwd, which the doc comment above
     // says is not used -- and it should not be, because the cwd is the client's, so this can
@@ -242,6 +240,44 @@ fn script_path(env_key: &str, rel: &str) -> String {
                falling back to a path relative to the working directory, which may belong to a \
                different checkout. Set {env_key} to be sure.");
     rel.to_string()
+}
+
+/// The tree the bundled scripts belong to: the directory above `bin/` when the binary sits in an
+/// installed release (`<HYPERMNESIA_HOME>/releases/<sha>/bin/`, reached through `current`; see
+/// ci/install.py), else the checkout a `cargo build` left it in
+/// (`<repo>/mcp-server/target/release/`). The executable path is canonicalized, which resolves
+/// the `current` link (a junction on Windows), so a session keeps the release it started with
+/// when the installer switches.
+fn release_root() -> Option<std::path::PathBuf> {
+    // Resolved once, and main() asks before anything else: resolved per call, a session started
+    // through `current` would run the NEXT release's scripts after a switch (macOS reports the
+    // launch path, link included, so canonicalizing later finds the new target).
+    static ROOT: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let exe = std::env::current_exe().ok()?;
+        let exe = std::fs::canonicalize(&exe).map(strip_verbatim).unwrap_or(exe);
+        release_root_of(&exe)
+    }).clone()
+}
+
+/// Windows canonical paths come back in verbatim form (`\\?\C:\...`), which python and many
+/// tools refuse; a drive path is turned back into the ordinary form. A UNC or other verbatim path
+/// is kept as it is. Elsewhere this is the identity.
+fn strip_verbatim(p: std::path::PathBuf) -> std::path::PathBuf {
+    let plain = p.to_string_lossy().strip_prefix(r"\\?\")
+        .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
+        .map(std::path::PathBuf::from);
+    plain.unwrap_or(p)
+}
+
+fn release_root_of(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let bin = exe.parent()?;
+    if let Some(root) = bin.parent() {
+        if bin.file_name().is_some_and(|n| n == "bin") && root.join("hooks").is_dir() {
+            return Some(root.to_path_buf());
+        }
+    }
+    exe.ancestors().nth(4).map(std::path::Path::to_path_buf)   // exe/release/target/mcp-server/<root>
 }
 
 /// This workspace's repo name -- explicit env, else the cwd's folder name (matches how
@@ -1343,24 +1379,65 @@ fn expand_user(path: &str, home: Option<&str>) -> String {
     if out.is_empty() { "/".to_string() } else { out }
 }
 
-/// Elsewhere: the leading `~` (alone or before `/`) is HOME, as before. Python's ntpath rules
-/// (USERPROFILE, HOMEDRIVE/HOMEPATH) are not reproduced.
+/// Elsewhere, Python's ntpath.expanduser: a leading `~` (alone, or before `/` or `\\`) is
+/// USERPROFILE, else HOMEDRIVE+HOMEPATH; HOME is not consulted (Python stopped in 3.8). `home`
+/// is ignored here -- it stands for the POSIX variable -- so that the hooks and this server find
+/// one settings file on Windows too. `~user` is left literal.
 #[cfg(not(unix))]
-fn expand_user(path: &str, home: Option<&str>) -> String {
-    let home = home.unwrap_or("");
-    if path == "~" { home.to_string() }
-    else if let Some(rest) = path.strip_prefix('~').filter(|r| r.starts_with('/')) { format!("{home}{rest}") }
-    else { path.to_string() }
+fn expand_user(path: &str, _home: Option<&str>) -> String {
+    let rest = match path.strip_prefix('~') {
+        Some(r) if r.is_empty() || r.starts_with('/') || r.starts_with('\\') => r,
+        _ => return path.to_string(),
+    };
+    // Set counts, even set to "": Python checks `'USERPROFILE' in os.environ`, not its value.
+    let home = std::env::var("USERPROFILE").ok().or_else(|| {
+        let path = std::env::var("HOMEPATH").ok()?;
+        Some(format!("{}{path}", std::env::var("HOMEDRIVE").unwrap_or_default()))
+    });
+    match home { Some(h) => format!("{h}{rest}"), None => path.to_string() }
 }
 
-/// The settings file's path, as hooks/_mem_common.py resolves it:
-/// `expanduser(HYPERMNESIA_ENV_FILE or "~/.claude/hypermnesia.env")` -- the default goes
-/// through the same expansion, so it too follows the passwd home when HOME is unset.
+/// Python's os.path.abspath: a relative path joins the working directory, then `.` and `..` are
+/// folded lexically (symlinks are not resolved, as there).
+fn abs_path(p: &str) -> String {
+    use std::path::{Component, Path, PathBuf};
+    let joined = if Path::new(p).is_absolute() { PathBuf::from(p) }
+                 else { std::env::current_dir().unwrap_or_default().join(p) };
+    let mut out = PathBuf::new();
+    for c in joined.components() {
+        match c {
+            Component::ParentDir => { out.pop(); }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out.to_string_lossy().into_owned()
+}
+
+fn posix_home() -> Option<String> {
+    std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned())
+}
+
+/// This machine's HyperMnesia directory, as hooks/_mem_common.py resolves HOME_DIR:
+/// `abspath(expanduser(HYPERMNESIA_HOME or "~/.HyperMnesia"))`; an empty variable is unset.
+fn hm_home() -> String {
+    let raw = std::env::var("HYPERMNESIA_HOME").ok().filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "~/.HyperMnesia".to_string());
+    abs_path(&expand_user(&raw, posix_home().as_deref()))
+}
+
+/// The settings file's path, as hooks/_mem_common.py resolves it: HYPERMNESIA_ENV_FILE
+/// (expanded; empty is unset), else `<hm_home>/hypermnesia.env`, else -- while only the copy an
+/// older install kept there exists -- `~/.claude/hypermnesia.env`. Both defaults go through the
+/// same expansion, so they too follow the passwd home when HOME is unset.
 fn env_file_path() -> String {
-    let raw = std::env::var("HYPERMNESIA_ENV_FILE")
-        .unwrap_or_else(|_| "~/.claude/hypermnesia.env".to_string());
-    let home = std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned());
-    expand_user(&raw, home.as_deref())
+    let home = posix_home();
+    if let Some(raw) = std::env::var("HYPERMNESIA_ENV_FILE").ok().filter(|s| !s.is_empty()) {
+        return expand_user(&raw, home.as_deref());
+    }
+    let new = std::path::Path::new(&hm_home()).join("hypermnesia.env").to_string_lossy().into_owned();
+    let old = expand_user("~/.claude/hypermnesia.env", home.as_deref());
+    if !std::path::Path::new(&new).exists() && std::path::Path::new(&old).exists() { old } else { new }
 }
 
 /// One value from the shared settings file, or None. The same file, the same gate and the same
@@ -1897,6 +1974,8 @@ fn drain_and_stop() {
 }
 
 fn main() {
+    // Pin the release this process belongs to before the installer can switch `current`.
+    let _ = release_root();
     // Everything the stdin thread sends goes through the writer thread; start it before the
     // first line is read.
     let _ = out_queue();
@@ -2088,7 +2167,38 @@ mod tests {
             let pw_home = pw_home.trim_end_matches('/').to_string();
             assert_eq!(env_file_path(), format!("{pw_home}/hypermnesia.env"));
             std::env::remove_var("HYPERMNESIA_ENV_FILE");
-            assert_eq!(env_file_path(), format!("{pw_home}/.claude/hypermnesia.env"));
+            std::env::remove_var("HYPERMNESIA_HOME");
+            assert_eq!(hm_home(), format!("{pw_home}/.HyperMnesia"));
+            // The default file: <HYPERMNESIA_HOME>/hypermnesia.env, and the ~/.claude copy an
+            // older install left only while it is the only one -- the order hooks/_mem_common.py
+            // uses.
+            let h = dir.join("h");
+            std::fs::create_dir_all(h.join(".claude")).unwrap();
+            std::env::set_var("HOME", &h);
+            let hs = h.to_string_lossy().into_owned();
+            assert_eq!(env_file_path(), format!("{hs}/.HyperMnesia/hypermnesia.env"));
+            std::fs::write(h.join(".claude/hypermnesia.env"), "").unwrap();
+            assert_eq!(env_file_path(), format!("{hs}/.claude/hypermnesia.env"));
+            std::fs::create_dir_all(h.join(".HyperMnesia")).unwrap();
+            std::fs::write(h.join(".HyperMnesia/hypermnesia.env"), "").unwrap();
+            assert_eq!(env_file_path(), format!("{hs}/.HyperMnesia/hypermnesia.env"));
+            std::env::set_var("HYPERMNESIA_HOME", h.join("elsewhere"));
+            assert_eq!(env_file_path(), format!("{hs}/.claude/hypermnesia.env"),
+                       "a home with no file yet still falls back to the ~/.claude copy");
+            std::fs::remove_file(h.join(".claude/hypermnesia.env")).unwrap();
+            assert_eq!(env_file_path(), format!("{hs}/elsewhere/hypermnesia.env"),
+                       "HYPERMNESIA_HOME moves the file");
+            std::env::set_var("HYPERMNESIA_HOME", "rel/../x");
+            assert_eq!(hm_home(), format!("{}/x", std::env::current_dir().unwrap().display()),
+                       "a relative home is made absolute and folded, as os.path.abspath does");
+            std::env::set_var("HYPERMNESIA_HOME", "~/y/./z");
+            assert_eq!(hm_home(), format!("{hs}/y/z"), "and a leading ~ is expanded first");
+            std::env::set_var("HYPERMNESIA_HOME", "");
+            assert_eq!(hm_home(), format!("{hs}/.HyperMnesia"), "an empty variable is unset");
+            std::env::remove_var("HYPERMNESIA_HOME");
+            std::env::set_var("HYPERMNESIA_ENV_FILE", "");
+            assert_eq!(env_file_path(), format!("{hs}/.HyperMnesia/hypermnesia.env"),
+                       "an empty HYPERMNESIA_ENV_FILE is unset too");
             // Set but empty is NOT unset in Python: `~` becomes "", so the path is root-relative.
             std::env::set_var("HOME", "");
             std::env::set_var("HYPERMNESIA_ENV_FILE", "~/hypermnesia.env");
@@ -2134,6 +2244,33 @@ mod tests {
         std::env::remove_var("MEM_DIALECTIC_TIMEOUT");
         std::env::remove_var("HYPERMNESIA_ENV_FILE");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Where the bundled scripts are looked for: beside `bin/` in an installed release, four
+    /// levels up from a cargo build, and never a lone `bin/` that has no hooks next to it.
+    #[test]
+    fn release_root_finds_installed_and_cargo_layouts() {
+        let d = std::env::temp_dir().join(format!("hm-relroot-{}", std::process::id()));
+        let rel = d.join("releases/abc123");
+        std::fs::create_dir_all(rel.join("bin")).unwrap();
+        std::fs::create_dir_all(rel.join("hooks")).unwrap();
+        assert_eq!(release_root_of(&rel.join("bin/hypermnesia-mcp")), Some(rel.clone()),
+                   "an installed release: the directory above bin/");
+        let repo = d.join("repo");
+        std::fs::create_dir_all(repo.join("hooks")).unwrap();
+        assert_eq!(release_root_of(&repo.join("mcp-server/target/release/hypermnesia-mcp")),
+                   Some(repo.clone()), "a cargo build: four levels up, as before");
+        let lone = d.join("lone/bin");
+        std::fs::create_dir_all(&lone).unwrap();
+        assert_ne!(release_root_of(&lone.join("hypermnesia-mcp")), Some(d.join("lone")),
+                   "a bin/ without hooks/ beside it is not mistaken for a release");
+        let _ = std::fs::remove_dir_all(&d);
+        use std::path::PathBuf;
+        assert_eq!(strip_verbatim(PathBuf::from(r"\\?\C:\Users\u\.HyperMnesia")),
+                   PathBuf::from(r"C:\Users\u\.HyperMnesia"), "a verbatim drive path is made plain");
+        assert_eq!(strip_verbatim(PathBuf::from(r"\\?\UNC\srv\share")),
+                   PathBuf::from(r"\\?\UNC\srv\share"), "a verbatim UNC path is kept");
+        assert_eq!(strip_verbatim(PathBuf::from("/home/u/x")), PathBuf::from("/home/u/x"));
     }
 
     /// The shared Tier-1 contract (tests/fixtures/tier1_cases.json), the same file
