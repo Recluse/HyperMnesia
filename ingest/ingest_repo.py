@@ -74,7 +74,7 @@ _SKIP_DIRS = {'.git', 'node_modules', '.venv', 'venv', 'target', 'dist', 'build'
               'coverage', 'bin', 'obj', '.pytest_cache', 'site-packages'}
 
 
-def list_md(repo_dir, walk=False):
+def list_md(repo_dir, walk=False, onerror=None):
     """(commit, [rel paths]) -- tracked *.md if a git repo, else a filtered os.walk.
 
     `walk=True` forces the filesystem walk. It has to be explicit rather than inferred: the
@@ -86,6 +86,11 @@ def list_md(repo_dir, walk=False):
 
     Walking reports the commit as 'nogit' on purpose: an untracked file's content has no
     relationship to HEAD, and freshness checks exempt 'nogit' rather than calling it stale.
+
+    The walk never enters a directory the ignore file excludes: a workspace that keeps tens of
+    thousands of scratch files under one excluded folder would otherwise be read in full just to
+    throw the result away. `onerror` goes to os.walk, whose default is to skip a directory it
+    cannot read without a word.
     """
     commit, files = "nogit", None
     if not walk:
@@ -105,16 +110,20 @@ def list_md(repo_dir, walk=False):
             files = [f for f in files.split("\0") if f]
         except Exception:
             commit, files = "nogit", None
+    pats = read_ignore(repo_dir)
     if files is None:
         files = []
-        for root, dirs, fs in os.walk(repo_dir):
-            dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+        for root, dirs, fs in os.walk(repo_dir, onerror=onerror):
+            rel_root = os.path.relpath(root, repo_dir).replace("\\", "/")
+            base = "" if rel_root == "." else rel_root + "/"
+            dirs[:] = [d for d in dirs if d not in _SKIP_DIRS
+                       and not ignored_dir(base + d + "/", pats)]
             for fn in fs:
                 if fn.lower().endswith(".md"):
                     files.append(os.path.relpath(os.path.join(root, fn), repo_dir).replace("\\", "/"))
     # drop anything under a skip dir (covers tracked-but-vendored too)
     files = [f for f in files if not (set(f.replace("\\", "/").split("/")) & _SKIP_DIRS)]
-    return commit, _apply_ignore(repo_dir, files)
+    return commit, [f for f in files if not ignored(f.replace("\\", "/"), pats)]
 
 
 IGNORE_FILE = ".hmignore"
@@ -152,17 +161,21 @@ def read_ignore(repo_dir):
     return out
 
 
-def _apply_ignore(repo_dir, files):
-    pats = read_ignore(repo_dir)
-    if not pats:
-        return files
-    keep = []
-    for f in files:
-        rel = f.replace("\\", "/")
-        if any(rel.startswith(p) if p.endswith("/") else fnmatch.fnmatch(rel, p) for p in pats):
-            continue
-        keep.append(f)
-    return keep
+def ignored_dir(rel, pats):
+    """Whether a directory pattern takes `rel` (a path ending in '/' for a directory itself).
+
+    A directory pattern may carry a glob too -- `scratch-*/` -- matched against the start of
+    the path; fnmatch's `*` crosses '/', so `p*` covers everything under whatever `p` named.
+    Case-sensitive like the plain prefix test, and only for a pattern that has glob characters,
+    so a pattern without them means on Windows exactly what it meant before."""
+    return any(p.endswith("/") and (rel.startswith(p) or (
+        any(c in p for c in "*?[") and fnmatch.fnmatchcase(rel, p + "*"))) for p in pats)
+
+
+def ignored(rel, pats):
+    """Whether the ignore patterns take the repo-relative file path `rel`."""
+    return ignored_dir(rel, pats) or any(not p.endswith("/") and fnmatch.fnmatch(rel, p)
+                                         for p in pats)
 
 
 def dq(s: str) -> str:

@@ -5,15 +5,14 @@ Uses the ingester's enumeration and raw-byte hashes; no SQL, embeddings or write
 """
 import hashlib
 import json
-import os
-import subprocess
 import re
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from ingest.ingest_repo import list_md, MAX_FILE_BYTES, _SKIP_DIRS
+from ingest.ingest_repo import list_md, IGNORE_FILE, MAX_FILE_BYTES
 
 
 def now():
@@ -55,16 +54,24 @@ def collect(root, repo, snapshot):
         return path
 
     try:
-        # Same candidate list as normal ingest: tracked markdown in Git, walk elsewhere.
-        # os.walk normally suppresses permission errors; they must not imply freshness.
+        # Same candidate list as normal ingest: tracked markdown in Git, walk elsewhere, one pass,
+        # never entering what the ignore file excludes. os.walk would skip a directory it cannot
+        # read without a word, and the ingester does exactly that, so such a directory is no gap
+        # in the index -- but it must not pass for checked either: the reason counts them and names
+        # the first. Any other failure to list a directory -- the root itself included: then
+        # nothing about the inventory is known -- leaves the state unknown.
+        unreadable = []
+
+        def walk_error(exc):
+            where = Path(exc.filename) if isinstance(exc.filename, str) else None
+            if (not isinstance(exc, PermissionError) or where is None or where == root
+                    or not where.is_relative_to(root)):
+                raise exc
+            unreadable.append(where.relative_to(root).as_posix())
+        # Git discovery keeps its own short timeout: a hung git must not outlast the caller.
         in_git = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", "HEAD"],
                                 capture_output=True, timeout=5).returncode == 0
-        if not in_git:
-            def walk_error(exc):
-                raise exc
-            for _, dirs, _ in os.walk(root, onerror=walk_error):
-                dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
-        _, enumerated = list_md(str(root))
+        _, enumerated = list_md(str(root), walk=not in_git, onerror=walk_error)
         indexed = {row["path"] for row in stored}
         stale = missing = unindexed = 0
         for row in stored:
@@ -101,8 +108,15 @@ def collect(root, repo, snapshot):
             unindexed += 1
         fresh.update(state="stale" if stale or missing or unindexed else "fresh",
                      checked_at=now(), stale=stale, missing=missing, unindexed=unindexed)
+        reasons = []
         if not stored and not unindexed:
-            fresh.update(state="unknown", reason="No indexed or eligible source documents")
+            fresh["state"] = "unknown"
+            reasons.append("No indexed or eligible source documents")
+        if unreadable:
+            reasons.append(f"{len(unreadable)} director{'y' if len(unreadable) == 1 else 'ies'} "
+                           f"could not be read (first: {unreadable[0]}) and were not checked, as "
+                           f"the ingester skips them too; {IGNORE_FILE} can exclude them")
+        fresh["reason"] = "; ".join(reasons) or None
     except (OSError, ValueError, subprocess.TimeoutExpired):
         fresh["reason"] = "Source files could not be checked safely or changed during check"
     return result

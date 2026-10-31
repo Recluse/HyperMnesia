@@ -13,7 +13,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ingest.ingest_repo import list_md, read_ignore  # noqa: E402
+from ingest.ingest_repo import ignored_dir, list_md, read_ignore  # noqa: E402
 
 ok = fail = 0
 
@@ -70,6 +70,34 @@ with tempfile.TemporaryDirectory() as d:
     check("git branch: subtree excluded", not any(f.startswith("legacy/") for f in tracked))
     check("git branch: file excluded", "secret.md" not in tracked)
     check("git branch: everything else survives", sorted(tracked) == ["a.md", "keep.md"])
+
+with tempfile.TemporaryDirectory() as d:
+    # A directory pattern may be a glob, and the walk must not even enter what it excludes: a
+    # workspace with tens of thousands of scratch files under one such folder was read in full
+    # (16 s) only for the result to be thrown away. An unreadable directory inside the excluded
+    # tree proves it -- os.walk would have to list it to descend, and onerror would hear of it.
+    tree(d, "preview-*/\n")
+    for sub in ("preview-01", "preview-02/locked"):
+        os.makedirs(os.path.join(d, sub))
+        with open(os.path.join(d, sub, "x.md"), "w", encoding="utf-8") as f:
+            f.write("# x\n")
+    os.makedirs(os.path.join(d, "previews"))
+    with open(os.path.join(d, "previews", "kept.md"), "w", encoding="utf-8") as f:
+        f.write("# x\n")
+    locked = os.path.join(d, "preview-02", "locked")
+    os.chmod(locked, 0)
+    errors = []
+    try:
+        _, walked = list_md(d, walk=True, onerror=errors.append)
+    finally:
+        os.chmod(locked, 0o700)
+    check("a glob directory pattern takes every folder it matches",
+          not any(f.startswith("preview-") for f in walked))
+    check("and only those: previews/ is not preview-*/", "previews/kept.md" in walked)
+    check("the walk never enters an excluded folder", errors == [])
+    check("ignored_dir: prefix and glob forms, and only directory patterns",
+          ignored_dir("legacy/sub/", ["legacy/"]) and ignored_dir("preview-9/", ["preview-*/"])
+          and not ignored_dir("legacy/", ["legacy"]) and not ignored_dir("previews/", ["preview-*/"]))
 
 with tempfile.TemporaryDirectory() as d:
     # Mutation: remove the ignore file and the same call must return everything again --

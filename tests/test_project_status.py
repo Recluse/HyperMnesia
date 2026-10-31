@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,48 @@ def main():
         (root / IGNORE_FILE).write_text("ignored.md\n")
         (root / "ignored.md").write_text("# Excluded\n")
         assert collect(root, "myrepo", snapshot)["freshness"]["state"] == "fresh"
+
+        # Outside Git the check walks, as the ingester does. A directory nobody can read (one a
+        # root-run tool left behind) is skipped by the ingester too, so it is no gap: the state
+        # is still computed and the reason says what was not checked. An excluded folder is not
+        # entered at all, readable or not.
+        # (Not under tests/: git would find this repository above it and take the Git branch.)
+        with tempfile.TemporaryDirectory() as plain_tmp:
+            plain = Path(plain_tmp)
+            (plain / doc.name).write_text("# Current\n")
+            (plain / IGNORE_FILE).write_text("scratch-*/\n")
+            for sub in ("scratch-1/locked", "work/locked"):
+                (plain / sub).mkdir(parents=True)
+                (plain / sub / "hidden.md").write_text("# Hidden\n")
+                (plain / sub).chmod(0)
+            try:
+                walked = collect(plain, "myrepo", snapshot)["freshness"]
+            finally:
+                for sub in ("scratch-1/locked", "work/locked"):
+                    (plain / sub).chmod(0o700)
+            assert walked["state"] == "fresh", walked
+            assert walked["reason"].startswith("1 directory could not be read (first: work/locked)"), walked
+            # Nothing indexed and nothing eligible: unknown, and the reason still says what was
+            # not checked.
+            (plain / doc.name).rename(plain / "parked.txt")
+            (plain / "work/locked").chmod(0)
+            try:
+                nothing = collect(plain, "myrepo", {"documents": [], "chunks": 0, "components": 0})
+            finally:
+                (plain / "work/locked").chmod(0o700)
+                (plain / "parked.txt").rename(plain / doc.name)
+            assert nothing["freshness"]["state"] == "unknown"
+            assert "1 directory could not be read" in nothing["freshness"]["reason"], nothing
+            shutil.rmtree(plain / "work")
+            assert collect(plain, "myrepo", snapshot)["freshness"]["reason"] is None
+            # A root that cannot be listed says nothing about the inventory, even with every
+            # indexed file still readable by its known path.
+            plain.chmod(0o311)
+            try:
+                blind = collect(plain, "myrepo", snapshot)["freshness"]
+            finally:
+                plain.chmod(0o700)
+            assert blind["state"] == "unknown", blind
 
         prefix = "HM"
         fake = root / "psql"

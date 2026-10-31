@@ -28,7 +28,6 @@ Usage: ci/freshness.py <repo_dir> <repo> [--mark] [--accept-sources]
         with their current hash)
 Exit 1 if any map orphans or cross-repo edges.
 """
-import fnmatch
 import hashlib
 import os
 import posixpath
@@ -36,7 +35,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ingest.ingest_repo import list_md, read_ignore, _SKIP_DIRS, MAX_FILE_BYTES  # noqa: E402
+from ingest.ingest_repo import list_md, read_ignore, ignored, _SKIP_DIRS, MAX_FILE_BYTES  # noqa: E402
 from hooks._arch import _glob_matches         # noqa: E402
 
 
@@ -289,17 +288,13 @@ def main():
     # DECISION that something stays out of the corpus -- a credentials file, a superseded set of
     # documents. Listing it here under "re-run with --walk to include them" advertises the one
     # action that would undo the decision, on every single run.
-    ignored = read_ignore(repo_dir)
-
-    def is_ignored(rel):
-        return any(rel.startswith(p) if p.endswith("/") else fnmatch.fnmatch(rel, p)
-                   for p in ignored)
+    patterns = read_ignore(repo_dir)
 
     seen_md = set(enumerated)
     beyond = [f for f in files
               if f.lower().endswith(".md") and f not in seen_md and f not in indexed
               and not (set(f.split("/")) & _SKIP_DIRS)
-              and not is_ignored(f)
+              and not ignored(f, patterns)
               and why_skipped(f) is None]
 
     # 3. constraint sources. The rule names its document by (repo, path, hash), which survives

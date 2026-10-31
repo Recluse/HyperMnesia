@@ -276,7 +276,8 @@ files keep their chunks and their embeddings. `./hm refresh` does every scope at
 thing to put on a timer; `ci/freshness.py` reports when the index has fallen behind.
 
 If something in that folder must stay OUT of the corpus, list it in a `.hmignore` beside
-it — one pattern per line, a trailing `/` for a whole subtree. Two kinds of thing belong there:
+it — one pattern per line, a trailing `/` for a whole subtree (`scratch-*/` works too, and
+indexing and status checks never enter such a folder). Two kinds of thing belong there:
 a file of credentials, and a superseded set of documents that near-duplicates the current one.
 The second matters more than it looks. An obviously old document is harmless; one that says
 almost the same thing with a different answer ranks right beside the correct one and gives no
