@@ -6,6 +6,10 @@
 
 [![CI](https://github.com/Recluse/HyperMnesia/actions/workflows/ci.yml/badge.svg)](https://github.com/Recluse/HyperMnesia/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.14](https://img.shields.io/badge/python-3.14-blue.svg)](.github/workflows/ci.yml)
+[![MCP](https://img.shields.io/badge/MCP-compatible-8A2BE2.svg)](https://modelcontextprotocol.io)
+[![Postgres + pgvector](https://img.shields.io/badge/Postgres-pgvector-336791.svg)](https://github.com/pgvector/pgvector)
+[![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/Recluse/badge.svg)](https://hub.xerj.org/contributors/Recluse)
 
 *The opposite of amnesia* (Greek *hypermnesia* — abnormally complete recall). Self-hosted long-term
 memory for AI coding agents — a
