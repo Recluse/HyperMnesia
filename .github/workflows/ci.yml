@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
+        with: { python-version: "3.14" }
       - name: Syntax check (compile all)
         run: python -m compileall -q ingest hooks rerank ci eval
       - name: Lint (real errors only -- undefined names, syntax)
@@ -98,7 +98,7 @@ jobs:
         working-directory: mcp-server
         run: cargo build --release --locked
       - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
+        with: { python-version: "3.14" }
       - name: Project status (source hashes, scope and real MCP transport)
         run: python tests/test_project_status.py
       - name: Rust unit tests (glob parity with the Python hook)
@@ -180,7 +180,7 @@ jobs:
           psql -h localhost -U hm -d hypermnesia -tAc \
             "SELECT count(*) FROM constraints WHERE repo='myapp'" | grep -qx 2
       - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
+        with: { python-version: "3.14" }
       - name: Golden -- the hook's GRAPH_SQL is valid and returns the seed shape
         run: |
           # Run the exact query the PreToolUse hook uses; assert it loads the map (not just that
