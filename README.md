@@ -22,8 +22,9 @@ Postgres-backed store that gives an agent (Claude Code, or any MCP client) two t
    and available in later ones, instead of being re-explained.
 
 One store (Postgres + [pgvector](https://github.com/pgvector/pgvector)), local-model friendly
-(embeddings via [Ollama](https://ollama.com) or [TEI](https://github.com/huggingface/text-embeddings-inference)),
-no cloud dependency. Runs on a laptop, one server, or Kubernetes.
+(embeddings via [Ollama](https://ollama.com), [TEI](https://github.com/huggingface/text-embeddings-inference),
+or anything that speaks the OpenAI `/v1/embeddings` API — LM Studio, llama.cpp's `llama-server`,
+vLLM), no cloud dependency. Runs on a laptop, one server, or Kubernetes.
 
 **Two interfaces, and they are not the same thing.** Search, the map and memory are exposed as
 MCP tools, so any MCP client can *ask* for them. The automatic half — constraints injected before
@@ -183,6 +184,22 @@ flowchart TB
   same review queue used by consolidation.
 - **Capture/recall** run as Claude Code hooks: session profile injected at start, relevant
   memories injected per prompt, transcripts distilled to memories by a small LLM on a schedule.
+  A malformed transcript line or a model answer with a `null` where a number belongs costs that
+  one item, not the whole queue behind it, and a correction is never filed away as a duplicate
+  of the fact it corrects — `100` is not `1000` with a digit missing
+  ([#4](https://github.com/Recluse/HyperMnesia/issues/4), [#5](https://github.com/Recluse/HyperMnesia/issues/5)).
+- **Reading memory without paying for all of it.** `memory_search` with `brief` returns one line
+  per hit — id, type, date, project, and roughly how many tokens reading it would cost — and
+  `memory_get` then takes up to twenty ids in one call; `memory_timeline` shows what the same
+  author learned just before and after one memory, for the hit that makes no sense on its own.
+  The index-first reading path is borrowed from [claude-mem](https://github.com/thedotmack/claude-mem).
+- **Keeping things out of memory.** `<private>...</private>` in a prompt or a message keeps that
+  span out whatever it looks like: it is stripped first, before anything is cut, sent to a model,
+  searched for or stored, and spans nest. Under that, capture redacts secrets — key shapes,
+  `name=value` credentials, authorization headers, PEM blocks, credentials in URLs — before a
+  model or the store sees them. That part is pattern matching, so it catches the shapes it knows
+  and says so in the docs instead of calling itself a guarantee; anything known to be sensitive
+  belongs inside the tags ([docs/MEMORY.md](docs/MEMORY.md)).
 - **Constraint injection** is a hook too: a `PreToolUse` hook (`hooks/arch_invariants.py`) resolves
   the file you're about to edit to its component and injects the applicable `must` invariants
   before the edit — so Tier 1 is delivered deterministically, not left to the agent to ask for.
@@ -227,9 +244,9 @@ See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full system picture
 
 | Path | What |
 |------|------|
-| `hm` | one wrapper over the documented steps: `init` (compose + migrations), `migrate` (the one apply order, recorded with checksums; a second run is a no-op, an edited applied file is refused), `author` (per-author logins), `ingest` (ingest -> embed -> ANN index, incremental when the scope already exists), `refresh`, `doctor`, `latency` |
+| `hm` | one wrapper over the documented steps: `init` (compose + migrations), `install` (a commit as the machine's release under `~/.HyperMnesia`, with a rollback), `migrate` (the one apply order, recorded with checksums; a second run is a no-op, an edited applied file is refused), `author` (per-author logins), `ingest` (ingest -> embed -> ANN index, incremental when the scope already exists), `refresh`, `doctor`, `latency` |
 | `sql/` | doc-RAG and personal-memory schemas, the migrations `./hm migrate` applies and records in order, and the roles + row-level security behind memory visibility: a filter on the shared `hm_app` login, an enforced boundary with one login per author ([trust](docs/DESIGN.md#trust)) |
-| `ingest/` | markdown chunker, embedder (Ollama/TEI), hybrid RRF search, `mem_ops`; incremental re-ingest via `--known-hashes` (unchanged docs keep their embeddings) |
+| `ingest/` | markdown chunker, embedder (Ollama, TEI or OpenAI-compatible), secret redaction, hybrid RRF search, `mem_ops`; incremental re-ingest via `--known-hashes` (unchanged docs keep their embeddings) |
 | `rerank/` | optional cross-encoder reranker service + search orchestrator |
 | `hooks/` | Claude Code hooks plus model-backed maintenance: constraint/profile/recall injection, capture, extract, consolidate, reflect, review-gated Dreamer, and grounded Dialectic Q&A |
 | `ci/` | `doctor.py` — health check for faults that leave an install answering normally (missing index or migration, partial embeddings, mixed or drifted models, wrong scope, a connection that bypasses row-level security, a stalled extractor); `latency.py` — where the time goes (hook, embedder, database, reranker); `freshness.py` — map-staleness / orphan-glob checker (run against a target repo); `check_graph_sql_parity.py` — keeps the Python and Rust copies of the graph query identical |
@@ -266,6 +283,13 @@ export DATABASE_URL=...            # init prints the exact line
 ./hm install --wire                # this commit as ~/.HyperMnesia/current: the MCP server built,
                                    # agent configs pointed at it rather than at this checkout
 ```
+
+`./hm install` is what keeps a working machine from running whatever the checkout happens to be
+on this afternoon. It copies a commit into `~/.HyperMnesia/releases/<sha>` and points `current` at
+it; hooks, the MCP server, scheduled jobs and the console all run from there. Settings
+(`hypermnesia.env`) and state live in the same folder, `previous` is kept for a rollback
+(`./hm install --ref <sha>`), and the layout is the same on macOS, Linux and Windows
+(`HYPERMNESIA_HOME` moves it). The details are in [docs/INSTALL.md](docs/INSTALL.md).
 
 **Have a folder of notes wired into `CLAUDE.md`?** Ingest it and then take it out of `CLAUDE.md`.
 That is the fastest thing here and it needs neither the map nor the hooks: the notes stop riding
