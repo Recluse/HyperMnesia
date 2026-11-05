@@ -1,0 +1,30 @@
+---
+argument_specs:
+  main:
+    short_description: Reconcile the HyperMnesia Kubernetes data plane
+    options:
+      hypermnesia_kubeconfig: {type: path}
+      hypermnesia_kube_context: {type: str}
+      hypermnesia_namespace: {type: str}
+      hypermnesia_create_namespace: {type: bool}
+      hypermnesia_storage_class: {type: str}
+      hypermnesia_postgres_storage: {type: str}
+      hypermnesia_postgres_image: {type: str}
+      hypermnesia_require_image_digests: {type: bool}
+      hypermnesia_postgres_existing_secret: {type: str}
+      hypermnesia_postgres_create_secret: {type: bool}
+      hypermnesia_postgres_password: {type: str}
+      hypermnesia_tei_enabled: {type: bool}
+      hypermnesia_tei_image: {type: str}
+      hypermnesia_tei_model: {type: str}
+      hypermnesia_reranker_enabled: {type: bool}
+      hypermnesia_reranker_image: {type: str}
+      hypermnesia_vllm_enabled: {type: bool}
+      hypermnesia_vllm_image: {type: str}
+      hypermnesia_vllm_model: {type: str}
+      hypermnesia_network_policies_enabled: {type: bool}
+      hypermnesia_worker_image: {type: str}
+      hypermnesia_migrations_enabled: {type: bool}
+      hypermnesia_migration_id: {type: str}
+      hypermnesia_migration_existing_secret: {type: str}
+      hypermnesia_memory_cronjobs: {type: list, elements: dict}

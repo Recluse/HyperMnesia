@@ -253,7 +253,7 @@ See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full system picture
 | `tests/` | contract tests, all wired into CI: hook I/O, ingest behavior, memory perspectives/evidence/context/Dreamer/Dialectic, glob parity, query hygiene, diagnostics, settings and the live SQL boundary |
 | `mcp-server/` | Rust MCP server exposing project map, constraints, doc search, scoped memory, grounded context/Q&A, `project_status`, and install `status` |
 | `console/` | the operator's side: a menu-bar tray and four command-line tools (`stats`, `jobs`, `settings`, `setup`) over any deployment — volumes, scheduled jobs, tunables, and a first-run wizard |
-| `deploy/` | Docker Compose for one box + the Kubernetes deployment runbook |
+| `deploy/` | Docker Compose, Kubernetes runbooks, and reusable Ansible roles |
 | `examples/` | an example structural-tier seed for a project |
 | `skills/` | `onboard-project` — the six steps to connect a new repo; `just` — answer-only / audit mode (agent-readable skills) |
 
@@ -271,6 +271,8 @@ variant:
   CLI adapters and model-sizing guidance;
 - **[Kubernetes](deploy/k8s/README.md)** — Postgres/PVC, TEI, optional reranker and vLLM,
   Jobs/CronJobs, client connectivity and network boundaries.
+- **[Ansible](deploy/ansible/README.md)** — immutable releases, fresh Claude Code/Codex
+  registration, one-box servers, and a digest-pinned Kubernetes data plane.
 
 TL;DR (single box). This ends at the first thing you can *see*: an invariant arriving before an
 edit.

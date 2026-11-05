@@ -1,0 +1,12 @@
+---
+hypermnesia_user: "{{ ansible_user_id }}"
+hypermnesia_repo_url: https://github.com/Recluse/HyperMnesia.git
+hypermnesia_version: ""
+hypermnesia_home: "{{ ansible_env.HOME }}/.HyperMnesia"
+hypermnesia_source_dir: "{{ ansible_env.HOME }}/.cache/hypermnesia/source"
+hypermnesia_mcp_binary: ""
+hypermnesia_install_console: false
+hypermnesia_console_features: tray
+hypermnesia_keep_releases: 3
+hypermnesia_prune_age_days: 30
+hypermnesia_wire_existing_configs: false

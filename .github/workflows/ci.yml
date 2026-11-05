@@ -89,6 +89,25 @@ jobs:
       - name: Novelty gate and its negation guard
         run: python hooks/mem_extract.py --selfcheck
 
+  ansible:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.14"}
+      - name: Install Ansible and role collections
+        run: |
+          pip install --quiet ansible-core==2.19.* ansible-lint==25.*
+          ansible-galaxy collection install -r deploy/ansible/requirements.yml
+      - name: Structural registration helper
+        run: python deploy/ansible/tests/test_config_merge.py
+      - name: Kubernetes template contract
+        run: python deploy/ansible/tests/test_kubernetes_templates.py
+      - name: Ansible role lint
+        env:
+          ANSIBLE_ROLES_PATH: deploy/ansible/roles
+        run: ansible-lint -c deploy/ansible/.ansible-lint deploy/ansible
+
   rust:
     runs-on: ubuntu-latest
     steps:

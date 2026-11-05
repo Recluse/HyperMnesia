@@ -1,0 +1,21 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hypermnesia-migrate-{{ hypermnesia_migration_id }}
+  namespace: {{ hypermnesia_namespace }}
+  labels: {app.kubernetes.io/part-of: hypermnesia}
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: {app.kubernetes.io/part-of: hypermnesia, hypermnesia.io/database-client: "true"}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: {{ hypermnesia_worker_image }}
+          args: [hm, migrate, --owner, {{ hypermnesia_migration_owner }}]
+          envFrom: [{secretRef: {name: {{ hypermnesia_migration_existing_secret }}}}]
+          resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 1Gi}}
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}

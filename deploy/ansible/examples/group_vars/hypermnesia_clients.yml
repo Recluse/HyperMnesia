@@ -1,0 +1,9 @@
+---
+hypermnesia_version: 0123456789abcdef0123456789abcdef01234567
+hypermnesia_clients: [claude, codex]
+hypermnesia_memory_author: recluse
+hypermnesia_settings:
+  MEM_STALE_DAYS: "45"
+hypermnesia_smoke_enabled: true
+hypermnesia_smoke_repo: example-project
+hypermnesia_smoke_root: /home/recluse/Work/example-project

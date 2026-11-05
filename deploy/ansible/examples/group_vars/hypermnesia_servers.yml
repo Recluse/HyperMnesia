@@ -1,0 +1,6 @@
+---
+hypermnesia_version: 0123456789abcdef0123456789abcdef01234567
+hypermnesia_postgres_password: "{{ vault_hypermnesia_postgres_password }}"
+hypermnesia_server_bind: 127.0.0.1
+hypermnesia_reranker_enabled: false
+hypermnesia_migrations_enabled: true

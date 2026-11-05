@@ -1,0 +1,7 @@
+---
+- name: Install the HyperMnesia Kubernetes data plane
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  roles:
+    - role: hypermnesia_kubernetes

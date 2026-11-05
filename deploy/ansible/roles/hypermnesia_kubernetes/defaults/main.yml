@@ -1,0 +1,36 @@
+---
+hypermnesia_kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default('~/.kube/config', true) }}"
+hypermnesia_kube_context: ""
+hypermnesia_namespace: hypermnesia
+hypermnesia_create_namespace: true
+hypermnesia_storage_class: ""
+hypermnesia_postgres_storage: 20Gi
+hypermnesia_postgres_image: pgvector/pgvector:0.8.5-pg16
+hypermnesia_require_image_digests: true
+hypermnesia_postgres_existing_secret: hypermnesia-postgres
+hypermnesia_postgres_create_secret: false
+hypermnesia_postgres_user: hm
+hypermnesia_postgres_database: hypermnesia
+hypermnesia_postgres_password: ""
+hypermnesia_tei_enabled: true
+hypermnesia_tei_image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.7
+hypermnesia_tei_model: BAAI/bge-m3
+hypermnesia_tei_storage: 10Gi
+hypermnesia_tei_memory_request: 7Gi
+hypermnesia_tei_memory_limit: 10Gi
+hypermnesia_reranker_enabled: false
+hypermnesia_reranker_image: ""
+hypermnesia_vllm_enabled: false
+hypermnesia_vllm_image: ""
+hypermnesia_vllm_model: ""
+hypermnesia_vllm_existing_secret: hypermnesia-vllm
+hypermnesia_vllm_resources:
+  requests: {cpu: "2", memory: 8Gi}
+  limits: {memory: 16Gi}
+hypermnesia_network_policies_enabled: true
+hypermnesia_worker_image: ""
+hypermnesia_migrations_enabled: false
+hypermnesia_migration_id: ""
+hypermnesia_migration_owner: hypermnesia
+hypermnesia_migration_existing_secret: hypermnesia-runtime
+hypermnesia_memory_cronjobs: []

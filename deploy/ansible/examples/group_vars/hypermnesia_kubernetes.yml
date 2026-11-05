@@ -1,0 +1,11 @@
+---
+hypermnesia_namespace: hypermnesia
+hypermnesia_storage_class: fast-rwo
+hypermnesia_postgres_image: pgvector/pgvector@sha256:REPLACE_ME
+hypermnesia_tei_image: ghcr.io/huggingface/text-embeddings-inference@sha256:REPLACE_ME
+hypermnesia_postgres_existing_secret: hypermnesia-postgres
+hypermnesia_migration_existing_secret: hypermnesia-runtime
+hypermnesia_postgres_create_secret: false
+hypermnesia_migrations_enabled: false
+hypermnesia_reranker_enabled: false
+hypermnesia_vllm_enabled: false

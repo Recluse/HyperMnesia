@@ -1,0 +1,85 @@
+---
+- name: Kubernetes | Validate storage, images and optional components
+  ansible.builtin.assert:
+    that:
+      - hypermnesia_namespace is match('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+      - hypermnesia_storage_class | length > 0
+      - not hypermnesia_postgres_create_secret or hypermnesia_postgres_password is match('^[A-Fa-f0-9]{32,128}$')
+      - not hypermnesia_reranker_enabled or hypermnesia_reranker_image | length > 0
+      - not hypermnesia_vllm_enabled or (hypermnesia_vllm_image | length > 0 and hypermnesia_vllm_model | length > 0)
+      - not hypermnesia_migrations_enabled or (hypermnesia_worker_image | length > 0 and hypermnesia_migration_id is match('^[a-z0-9-]+$'))
+      - hypermnesia_memory_cronjobs | length == 0 or hypermnesia_worker_image | length > 0
+      - not hypermnesia_require_image_digests or '@sha256:' in hypermnesia_postgres_image
+      - not hypermnesia_require_image_digests or not hypermnesia_tei_enabled or '@sha256:' in hypermnesia_tei_image
+      - not hypermnesia_require_image_digests or not hypermnesia_reranker_enabled or '@sha256:' in hypermnesia_reranker_image
+      - not hypermnesia_require_image_digests or not hypermnesia_vllm_enabled or '@sha256:' in hypermnesia_vllm_image
+      - >-
+        not hypermnesia_require_image_digests or
+        (not hypermnesia_migrations_enabled and hypermnesia_memory_cronjobs | length == 0) or
+        '@sha256:' in hypermnesia_worker_image
+    fail_msg: >-
+      Kubernetes storage and every optional image are explicit. Migrations additionally need a
+      digest-pinned images, a worker image for jobs, and a DNS-safe migration id. Set
+      hypermnesia_require_image_digests=false only for an explicit evaluation environment.
+
+- name: Kubernetes | Create the namespace
+  kubernetes.core.k8s:
+    kubeconfig: "{{ hypermnesia_kubeconfig }}"
+    context: "{{ hypermnesia_kube_context | default(omit, true) }}"
+    state: present
+    apply: true
+    server_side_apply: {field_manager: hypermnesia-ansible}
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ hypermnesia_namespace }}"
+        labels: {app.kubernetes.io/part-of: hypermnesia}
+  when: hypermnesia_create_namespace
+
+- name: Kubernetes | Create the database Secret from a protected variable
+  kubernetes.core.k8s:
+    kubeconfig: "{{ hypermnesia_kubeconfig }}"
+    context: "{{ hypermnesia_kube_context | default(omit, true) }}"
+    state: present
+    apply: true
+    server_side_apply: {field_manager: hypermnesia-ansible}
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ hypermnesia_postgres_existing_secret }}"
+        namespace: "{{ hypermnesia_namespace }}"
+        labels: {app.kubernetes.io/part-of: hypermnesia}
+      type: Opaque
+      stringData:
+        POSTGRES_USER: "{{ hypermnesia_postgres_user }}"
+        POSTGRES_DB: "{{ hypermnesia_postgres_database }}"
+        POSTGRES_PASSWORD: "{{ hypermnesia_postgres_password }}"
+  no_log: true
+  when: hypermnesia_postgres_create_secret
+
+- name: Kubernetes | Reconcile the data plane
+  kubernetes.core.k8s:
+    kubeconfig: "{{ hypermnesia_kubeconfig }}"
+    context: "{{ hypermnesia_kube_context | default(omit, true) }}"
+    state: present
+    apply: true
+    server_side_apply: {field_manager: hypermnesia-ansible}
+    definition: "{{ lookup('template', 'data-plane.yml.j2') | from_yaml_all | list }}"
+    wait: true
+    wait_timeout: 600
+
+- name: Kubernetes | Apply a release-scoped migration Job
+  kubernetes.core.k8s:
+    kubeconfig: "{{ hypermnesia_kubeconfig }}"
+    context: "{{ hypermnesia_kube_context | default(omit, true) }}"
+    state: present
+    apply: true
+    server_side_apply: {field_manager: hypermnesia-ansible}
+    definition: "{{ lookup('template', 'migration-job.yml.j2') | from_yaml }}"
+    wait: true
+    wait_condition: {type: Complete, status: "True"}
+    wait_timeout: 900
+  no_log: true
+  when: hypermnesia_migrations_enabled

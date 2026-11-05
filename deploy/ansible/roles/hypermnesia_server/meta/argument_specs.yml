@@ -1,0 +1,13 @@
+---
+argument_specs:
+  main:
+    short_description: Run the HyperMnesia Compose data plane
+    options:
+      hypermnesia_postgres_password: {type: str}
+      hypermnesia_server_bind: {type: str}
+      hypermnesia_postgres_port: {type: int}
+      hypermnesia_tei_port: {type: int}
+      hypermnesia_tei_threads: {type: int}
+      hypermnesia_reranker_enabled: {type: bool}
+      hypermnesia_migrations_enabled: {type: bool}
+      hypermnesia_migration_owner: {type: str}

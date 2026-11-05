@@ -1,0 +1,33 @@
+---
+argument_specs:
+  main:
+    short_description: Install one immutable HyperMnesia release
+    options:
+      hypermnesia_version:
+        type: str
+        required: true
+        description: An immutable Git commit or release tag; floating branches are refused.
+      hypermnesia_user:
+        type: str
+        required: true
+      hypermnesia_home:
+        type: path
+        required: true
+      hypermnesia_repo_url:
+        type: str
+        required: true
+      hypermnesia_source_dir:
+        type: path
+        required: true
+      hypermnesia_mcp_binary:
+        type: path
+      hypermnesia_install_console:
+        type: bool
+      hypermnesia_console_features:
+        type: str
+      hypermnesia_keep_releases:
+        type: int
+      hypermnesia_prune_age_days:
+        type: int
+      hypermnesia_wire_existing_configs:
+        type: bool

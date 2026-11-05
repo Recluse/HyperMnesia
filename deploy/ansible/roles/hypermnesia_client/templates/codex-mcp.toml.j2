@@ -1,0 +1,5 @@
+[mcp_servers.hypermnesia]
+command = "{{ hypermnesia_home }}/current/bin/hypermnesia-mcp"
+env_vars = {{ hypermnesia_client_env_vars | to_json }}
+enabled_tools = {{ hypermnesia_readonly_tools | to_json }}
+tool_timeout_sec = 130

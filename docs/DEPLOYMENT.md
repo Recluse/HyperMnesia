@@ -7,6 +7,8 @@ not need an LLM in the request path unless you use a model-backed memory feature
 This page helps choose a topology. Follow [COMPONENTS.md](COMPONENTS.md) to start one component
 at a time, [LLM_BACKENDS.md](LLM_BACKENDS.md) to choose the model service, and
 [deploy/k8s/README.md](../deploy/k8s/README.md) for Kubernetes.
+For reproducible installation, the [Ansible roles](../deploy/ansible/README.md) keep workstation
+clients, a Compose server, an all-in-one host, and the Kubernetes data plane as explicit playbooks.
 
 ## What is required
 

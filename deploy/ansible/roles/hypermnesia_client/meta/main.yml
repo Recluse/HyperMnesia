@@ -1,0 +1,13 @@
+---
+galaxy_info:
+  role_name: hypermnesia_client
+  author: Recluse
+  description: Register an installed HyperMnesia release with local agent clients.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Debian
+      versions: [bookworm]
+    - name: Ubuntu
+      versions: [jammy, noble]
+dependencies: []

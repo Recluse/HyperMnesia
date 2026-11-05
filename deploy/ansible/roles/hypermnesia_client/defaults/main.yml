@@ -1,0 +1,66 @@
+---
+hypermnesia_user: "{{ ansible_user_id }}"
+hypermnesia_home: "{{ ansible_env.HOME }}/.HyperMnesia"
+hypermnesia_clients: []
+hypermnesia_memory_author: "{{ hypermnesia_user }}"
+hypermnesia_settings: {}
+hypermnesia_setting_names:
+  - HM_LLM_MODEL
+  - HM_LLM_BACKEND
+  - HM_LLM_URL
+  - HM_LLM_KEY
+  - MEM_NOVELTY_MAXDIST
+  - MEM_REVIEW_THRESHOLD
+  - MEM_REFLECT_MIN
+  - MEM_REFLECT_MAX
+  - MEM_STALE_DAYS
+  - MEM_SEM_MAXDIST
+  - MEM_LEX_MAXDIST
+  - MEM_DREAM_MIN_MEMORIES
+  - MEM_DREAM_MAX_MEMORIES
+  - MEM_DREAM_MAX_GROUPS
+  - MEM_DREAM_MAX_CANDIDATES
+  - MEM_DIALECTIC_TIMEOUT
+  - EMBED_BATCH
+  - EMBED_MODEL
+  - EMBED_BACKEND
+  - OLLAMA_URL
+  - TEI_URL
+  - OPENAI_EMBED_URL
+  - OPENAI_EMBED_KEY
+hypermnesia_hooks_profile: false
+hypermnesia_hooks_recall: false
+hypermnesia_hooks_capture: false
+hypermnesia_extract_timer_enabled: false
+hypermnesia_linger_enabled: false
+hypermnesia_force_client_merge: false
+hypermnesia_codex_config: "{{ ansible_env.HOME }}/.codex/config.toml"
+hypermnesia_codex_hooks: "{{ ansible_env.HOME }}/.codex/hooks.json"
+hypermnesia_claude_config: "{{ ansible_env.HOME }}/.claude.json"
+hypermnesia_claude_settings: "{{ ansible_env.HOME }}/.claude/settings.json"
+hypermnesia_python: python3
+hypermnesia_mcp_binary_path: "{{ hypermnesia_home }}/current/bin/hypermnesia-mcp"
+hypermnesia_mcp_server_name: hypermnesia
+hypermnesia_smoke_enabled: false
+hypermnesia_smoke_repo: ""
+hypermnesia_smoke_root: ""
+hypermnesia_client_env_vars:
+  - DATABASE_URL
+  - EMBED_BACKEND
+  - MEM_AUTHOR
+hypermnesia_readonly_tools:
+  - project_status
+  - get_project_map
+  - get_constraints
+  - locate
+  - get_document
+  - search_docs
+  - memory_search
+  - memory_perspectives
+  - memory_evidence
+  - memory_peer_card
+  - memory_context
+  - memory_ask
+  - memory_get
+  - memory_timeline
+  - status

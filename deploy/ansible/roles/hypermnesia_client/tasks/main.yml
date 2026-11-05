@@ -1,0 +1,160 @@
+---
+- name: Client | Validate the requested clients
+  ansible.builtin.assert:
+    that:
+      - hypermnesia_clients | difference(['claude', 'codex']) | length == 0
+      - hypermnesia_memory_author is match('^[A-Za-z0-9._-]+$')
+    fail_msg: Client names or MEM_AUTHOR are invalid.
+
+- name: Client | Validate settings-file entries
+  ansible.builtin.assert:
+    that:
+      - item.key is match('^[A-Z][A-Z0-9_]*$')
+      - item.key in hypermnesia_setting_names
+      - "'\n' not in item.value | string"
+      - "'\r' not in item.value | string"
+    fail_msg: Settings keys must be environment names and values must fit on one line.
+  loop: "{{ hypermnesia_settings | dict2items }}"
+  no_log: true
+
+- name: Client | Create the private settings directory
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ hypermnesia_user }}"
+    mode: "0700"
+  loop:
+    - "{{ hypermnesia_home }}"
+    - "{{ hypermnesia_home }}/state"
+    - "{{ ansible_env.HOME }}/.config/systemd/user"
+
+- name: Client | Write non-connection settings
+  ansible.builtin.template:
+    src: hypermnesia.env.j2
+    dest: "{{ hypermnesia_home }}/hypermnesia.env"
+    owner: "{{ hypermnesia_user }}"
+    mode: "0600"
+    backup: true
+  no_log: true
+
+- name: Client | Install the structural JSON merger
+  ansible.builtin.copy:
+    src: merge_json_config.py
+    dest: "{{ hypermnesia_home }}/state/ansible-merge-json.py"
+    owner: "{{ hypermnesia_user }}"
+    mode: "0700"
+
+- name: Client | Check the Codex MCP table
+  ansible.builtin.shell: |
+    set -eu
+    test ! -f {{ hypermnesia_codex_config | quote }} && exit 0
+    if grep -q '^\[mcp_servers\.hypermnesia\]' {{ hypermnesia_codex_config | quote }}; then
+      grep -q '^# BEGIN ANSIBLE MANAGED HYPERMNESIA MCP$' {{ hypermnesia_codex_config | quote }}
+    fi
+  args:
+    executable: /bin/sh
+  changed_when: false
+  when:
+    - "'codex' in hypermnesia_clients"
+    - not hypermnesia_force_client_merge
+
+- name: Client | Register the Codex MCP server
+  ansible.builtin.blockinfile:
+    path: "{{ hypermnesia_codex_config }}"
+    create: true
+    mode: "0600"
+    marker: "# {mark} ANSIBLE MANAGED HYPERMNESIA MCP"
+    block: "{{ lookup('template', 'codex-mcp.toml.j2') }}"
+    backup: true
+  when: "'codex' in hypermnesia_clients"
+
+- name: Client | Register the Claude MCP server
+  ansible.builtin.command:
+    argv: >-
+      {{ [hypermnesia_home ~ '/state/ansible-merge-json.py', '--kind', 'claude',
+          '--path', hypermnesia_claude_config, '--home', hypermnesia_home]
+         + (['--force'] if hypermnesia_force_client_merge else []) }}
+  register: hypermnesia_claude_merge
+  changed_when: "'changed' in hypermnesia_claude_merge.stdout"
+  when:
+    - "'claude' in hypermnesia_clients"
+    - not ansible_check_mode
+
+- name: Client | Register Claude hooks
+  ansible.builtin.command:
+    argv: >-
+      {{ [hypermnesia_home ~ '/state/ansible-merge-json.py', '--kind', 'claude-hooks',
+          '--path', hypermnesia_claude_settings, '--home', hypermnesia_home]
+         + (['--profile'] if hypermnesia_hooks_profile else [])
+         + (['--recall'] if hypermnesia_hooks_recall else [])
+         + (['--capture'] if hypermnesia_hooks_capture else []) }}
+  register: hypermnesia_claude_hooks_merge
+  changed_when: "'changed' in hypermnesia_claude_hooks_merge.stdout"
+  when:
+    - "'claude' in hypermnesia_clients"
+    - hypermnesia_hooks_profile or hypermnesia_hooks_recall or hypermnesia_hooks_capture
+    - not ansible_check_mode
+
+- name: Client | Register Codex hooks
+  ansible.builtin.command:
+    argv: >-
+      {{ [hypermnesia_home ~ '/state/ansible-merge-json.py', '--kind', 'codex-hooks',
+          '--path', hypermnesia_codex_hooks, '--home', hypermnesia_home]
+         + (['--profile'] if hypermnesia_hooks_profile else [])
+         + (['--recall'] if hypermnesia_hooks_recall else []) }}
+  register: hypermnesia_codex_hooks_merge
+  changed_when: "'changed' in hypermnesia_codex_hooks_merge.stdout"
+  when:
+    - "'codex' in hypermnesia_clients"
+    - hypermnesia_hooks_profile or hypermnesia_hooks_recall
+    - not ansible_check_mode
+
+- name: Client | Install the extractor user units
+  ansible.builtin.copy:
+    src: "{{ hypermnesia_home }}/current/systemd/{{ item }}"
+    dest: "{{ ansible_env.HOME }}/.config/systemd/user/{{ item }}"
+    remote_src: true
+    mode: "0644"
+  loop: [hypermnesia-extract.service, hypermnesia-extract.timer]
+  when: ansible_system == 'Linux'
+  notify: Client | Reload the user service manager
+
+- name: Client | Arm or disarm the extractor timer
+  ansible.builtin.systemd_service:
+    name: hypermnesia-extract.timer
+    scope: user
+    enabled: "{{ hypermnesia_extract_timer_enabled }}"
+    state: "{{ 'started' if hypermnesia_extract_timer_enabled else 'stopped' }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
+  when:
+    - ansible_system == 'Linux'
+    - not ansible_check_mode
+
+- name: Client | Configure lingering for unattended user jobs
+  ansible.builtin.command:
+    argv: [loginctl, "{{ 'enable-linger' if hypermnesia_linger_enabled else 'disable-linger' }}",
+           "{{ hypermnesia_user }}"]
+  become: true
+  changed_when: true
+  when:
+    - ansible_system == 'Linux'
+    - hypermnesia_linger_enabled
+    - not ansible_check_mode
+
+- name: Client | Run a read-only MCP smoke
+  ansible.builtin.command:
+    argv:
+      - "{{ hypermnesia_python }}"
+      - "{{ role_path }}/files/smoke.py"
+      - "{{ hypermnesia_mcp_binary_path }}"
+      - "{{ hypermnesia_mcp_server_name }}"
+  environment:
+    HM_REPO: "{{ hypermnesia_smoke_repo }}"
+    HM_ROOT: "{{ hypermnesia_smoke_root }}"
+  changed_when: false
+  when:
+    - hypermnesia_smoke_enabled
+    - hypermnesia_smoke_repo | length > 0
+    - hypermnesia_smoke_root | length > 0
+    - not ansible_check_mode

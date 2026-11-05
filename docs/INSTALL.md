@@ -39,6 +39,11 @@ the scope already has documents.
 
 Read on for the manual steps, for the non-Docker paths, and for Kubernetes.
 
+For repeatable host enrollment, use the
+**[Ansible roles and example playbooks](../deploy/ansible/README.md)**. They use the same
+`hm install` transaction, keep hooks and timers opt-in, preserve foreign client configuration, and
+finish with a read-only MCP smoke.
+
 ## Hardware / OS / software requirements
 
 | | **A. Laptop / local** | **B. Single server** | **C. Kubernetes** | **D. CPU-only minimal** |

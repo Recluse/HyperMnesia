@@ -1,0 +1,15 @@
+---
+hypermnesia_user: "{{ ansible_user_id }}"
+hypermnesia_home: "{{ ansible_env.HOME }}/.HyperMnesia"
+hypermnesia_postgres_user: hm
+hypermnesia_postgres_database: hypermnesia
+hypermnesia_postgres_password: ""
+hypermnesia_server_bind: 127.0.0.1
+hypermnesia_postgres_port: 5432
+hypermnesia_tei_port: 8080
+hypermnesia_tei_threads: 4
+hypermnesia_reranker_enabled: false
+hypermnesia_reranker_port: 8091
+hypermnesia_reranker_idle_seconds: 600
+hypermnesia_migrations_enabled: true
+hypermnesia_migration_owner: "{{ hypermnesia_user }}"

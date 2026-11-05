@@ -1,0 +1,7 @@
+---
+- name: Install HyperMnesia for agent clients
+  hosts: hypermnesia_clients
+  gather_facts: true
+  roles:
+    - role: hypermnesia_release
+    - role: hypermnesia_client

@@ -1,0 +1,35 @@
+---
+argument_specs:
+  main:
+    short_description: Register HyperMnesia clients and optional local jobs
+    options:
+      hypermnesia_clients:
+        type: list
+        elements: str
+        choices: [claude, codex]
+      hypermnesia_memory_author:
+        type: str
+      hypermnesia_settings:
+        type: dict
+      hypermnesia_hooks_profile:
+        type: bool
+      hypermnesia_hooks_recall:
+        type: bool
+      hypermnesia_hooks_capture:
+        type: bool
+      hypermnesia_extract_timer_enabled:
+        type: bool
+      hypermnesia_linger_enabled:
+        type: bool
+      hypermnesia_force_client_merge:
+        type: bool
+      hypermnesia_smoke_enabled:
+        type: bool
+      hypermnesia_mcp_binary_path:
+        type: path
+      hypermnesia_mcp_server_name:
+        type: str
+      hypermnesia_smoke_repo:
+        type: str
+      hypermnesia_smoke_root:
+        type: path

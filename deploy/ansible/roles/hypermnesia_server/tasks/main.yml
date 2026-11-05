@@ -1,0 +1,53 @@
+---
+- name: Server | Validate explicit credentials and exposure
+  ansible.builtin.assert:
+    that:
+      - ansible_system == 'Linux'
+      - hypermnesia_postgres_password is match('^[A-Fa-f0-9]{32,128}$')
+      - hypermnesia_migration_owner is match('^[A-Za-z0-9._-]+$')
+    fail_msg: >-
+      The Compose role supports Linux and requires an explicit 32+ character hex database
+      password. Hex keeps the generated DATABASE_URL unambiguous without logging or encoding it.
+
+- name: Server | Check for Docker Compose
+  ansible.builtin.command:
+    argv: [docker, compose, version]
+  changed_when: false
+
+- name: Server | Write the private Compose environment
+  ansible.builtin.template:
+    src: server.env.j2
+    dest: "{{ hypermnesia_home }}/server.env"
+    owner: "{{ hypermnesia_user }}"
+    mode: "0600"
+    backup: true
+  no_log: true
+
+- name: Server | Reconcile the Compose data plane
+  community.docker.docker_compose_v2:
+    project_src: "{{ hypermnesia_home }}/current/deploy/docker"
+    project_name: hypermnesia
+    env_files: ["{{ hypermnesia_home }}/server.env"]
+    profiles: "{{ ['rerank'] if hypermnesia_reranker_enabled else [] }}"
+    state: present
+    wait: true
+    wait_timeout: 300
+  become: true
+  become_user: "{{ hypermnesia_user }}"
+
+- name: Server | Apply pending schema migrations
+  ansible.builtin.command:
+    argv: ["{{ hypermnesia_home }}/current/hm", migrate, --owner, "{{ hypermnesia_migration_owner }}"]
+  environment:
+    HM_ADMIN_URL: >-
+      {{ ['postgresql://', hypermnesia_postgres_user, ':', hypermnesia_postgres_password,
+          '@127.0.0.1:', hypermnesia_postgres_port, '/',
+          hypermnesia_postgres_database] | join }}
+  register: hypermnesia_migration_result
+  changed_when: "'nothing to apply' not in hypermnesia_migration_result.stdout"
+  no_log: true
+  when:
+    - hypermnesia_migrations_enabled
+    - not ansible_check_mode
+  become: true
+  become_user: "{{ hypermnesia_user }}"
