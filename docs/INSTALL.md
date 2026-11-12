@@ -430,6 +430,100 @@ MCP registration does not install automatic profile, per-prompt recall or transc
 capture. Those need an OpenCode V2 event adapter; the Claude/Codex hook configuration
 below does not register them with OpenCode. No such adapter is included here.
 
+### Hermes Agent
+
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) starts stdio MCP servers from the
+`mcp_servers` block of `~/.hermes/config.yaml` and keeps secrets in `~/.hermes/.env`, so the
+store's connection string goes into the second file and the config only refers to it:
+
+```bash
+# ~/.hermes/.env
+DATABASE_URL=postgresql://hm_app:<password>@localhost:5432/hypermnesia
+```
+
+```yaml
+# ~/.hermes/config.yaml
+mcp_servers:
+  hypermnesia:
+    command: "/home/you/.HyperMnesia/current/bin/hypermnesia-mcp"
+    env:
+      DATABASE_URL: "${DATABASE_URL}"
+      EMBED_BACKEND: "ollama"          # or tei / openai, as for the rest of the store
+      MEM_AUTHOR: "you"
+    protocol: legacy
+    timeout: 430
+    tools:
+      exclude: [memory_write, memory_supersede]
+      resources: false
+      prompts: false
+```
+
+None of those lines is decoration:
+
+- **`env` is everything the server will ever know.** Hermes hands a stdio server a filtered
+  environment — `PATH`, `HOME`, `USER`, the locale, `TMPDIR`, `XDG_*` — plus whatever `env`
+  lists, so a variable you exported in your shell stops at Hermes and never reaches the server.
+  List each one the store needs, including the embedder's address when it is not the default
+  (`OLLAMA_URL`, `TEI_URL`, `OPENAI_EMBED_URL`). `MEM_AUTHOR` can be left out when
+  `~/.HyperMnesia/hypermnesia.env` already sets it.
+- **`protocol: legacy`** pins Hermes to the classic `initialize` handshake, which is the only one
+  this server implements. The default, `auto`, tries that same handshake first, so the entry
+  works without the line too; with it, the config says what actually happens.
+- **`timeout: 430`** is there for `memory_ask`, whose server-side deadline is
+  `MEM_DIALECTIC_TIMEOUT` plus 120 seconds. Hermes' default of 300 covers every other tool,
+  `status` included.
+- **`tools.exclude`** keeps the reading tools and withholds the two that write. Take the line
+  out if the agent should save memories: nothing captures a Hermes session's transcript, so
+  `memory_write` is then the only way anything it learns reaches the store, and a write is
+  refused without `MEM_AUTHOR`.
+- **`resources` and `prompts`** are off because this server has tools and nothing else.
+
+Then check it:
+
+```bash
+hermes mcp test hypermnesia     # connects, completes the handshake, lists the tools
+hermes mcp list
+```
+
+`hermes mcp test` prints all 17 tools the server offers, whatever `tools.exclude` says, because
+the filter is applied later, when a session registers them — so the two writing tools in that
+list do not mean the exclusion failed. A running session picks the entry up on `/reload-mcp`.
+The tools arrive as `mcp__hypermnesia__<tool>`: ask the agent to call
+`mcp__hypermnesia__status`, then `mcp__hypermnesia__memory_search`, then
+`mcp__hypermnesia__memory_get` on an id the search returned. `status` answers from the store,
+so its reply vouches for the database and the embedder, while `hermes mcp test` vouches only
+for the process and the handshake.
+
+To pin a project's exact ingested tag, add `HM_REPO: "myrepo"` to `env`. Without it the server
+takes the name of the directory Hermes was started in, and opens its scoped answers with a
+`(!) SCOPE:` line saying that it guessed.
+
+On 2026-11-12, Hermes Agent v0.23.1 on Linux connected to this server with the entry above:
+the handshake completed, 15 of the 17 tools were registered under `mcp__hypermnesia__` with the
+two writing ones withheld, and `project_status` and `status`, called through Hermes' tool
+registry, both answered. There was no store behind the server and no model turn in that check,
+so it validates the client path and the hand-off of the environment, not retrieval; the three
+calls above, against your own store, are still yours to run.
+
+This registers tools and nothing more. Hermes' built-in memory keeps working beside it, and the
+automatic half — the profile at session start, recall per prompt, transcript capture,
+constraints before an edit — does not come with it: that takes a Hermes memory-provider
+plugin, and none is included here. Until one exists the agent has to be told when to ask, and
+since Hermes reads `AGENTS.md` from the project directory, a few lines there do it:
+
+```markdown
+## Memory
+- Before assuming a preference or an earlier decision, call `mcp__hypermnesia__memory_search`.
+- Before editing a file, call `mcp__hypermnesia__get_constraints` with its repo-relative path.
+- For "how / why / where" questions about this project, call `mcp__hypermnesia__search_docs`.
+```
+
+It will still forget sometimes, which is the weakness the hooks exist to remove.
+
+`./hm install --wire` does not touch Hermes' config and does not need to: the path through
+`current` stays valid across releases, and a session that is already running keeps the server
+process it started until it reconnects (`/reload-mcp`).
+
 ### Other MCP clients
 
 The server is a plain **stdio** MCP server. It has no client-specific behaviour, reads its whole
