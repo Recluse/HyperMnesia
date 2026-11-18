@@ -394,7 +394,7 @@ What is in the menu:
   pressing one does not mean waiting out the idle cadence to see whether it worked.
 - **the volumes** — memories active of total, knowledge pages, documents and chunks, how many
   chunks have no embedding, how many embedding models are in the store, the review queue, the
-  stale count, the database size.
+  count of old unused personal memories, and database size.
 - **Run now** — every scheduled pass, with its schedule, when it last wrote to its log, and its
   last exit code. Pressing one runs it — through launchd on macOS, through `systemctl --user start
   --no-block` on Linux — and reports what the service manager then did, not that the request was
@@ -412,10 +412,26 @@ What is in the menu:
   its schedule, full stop — so there is nothing here to switch on macOS.
 - **Refresh now** and **Quit**.
 
-The tray carries one mark for "something here needs a look", derived from the lines below rather
-than computed beside them: anything the menu would show with a `!` raises it. That is the whole
-design in one detail — the mark is where a problem is noticed, so it must not be able to disagree
-with the menu. The embedded icon is calm green or warned red; its tooltip names the status.
+The icon distinguishes three states. **Green** means no problems were observed. **Amber**
+means attention is needed, such as a pending review decision, an embedding backlog or an
+unknown job timestamp. **Red** means a failed reading, a nonzero job exit, an overdue job or
+invalid configuration. Errors take precedence over review items. The top of the menu lists
+the reasons, so the color never has to stand in for an explanation.
+
+The review queue does not become an error as it ages. “Old unused memories (180+ days)” counts
+old personal memory records, not documents whose index is out of date. A freshness job with
+exit 10 reports a completed check with findings and appears amber. Exit 1 stays red:
+older sweeps use it for both discrepancies and failed checks, which the console cannot
+distinguish from that code alone. Its log contains the details.
+The outcome of the last button press remains visible until the next press; a failed action is
+explicitly named as a reason.
+
+While a worker request is pending, automatic reads wait and button actions report that they
+were not queued. The original deadline remains in effect, including for a jobs-only read.
+Use `hypermnesia --status` for a read-only report with the same status classification without
+opening another tray. The command reports observed problems as text; its exit code is not a
+monitoring severity code.
+
 On macOS, background updates wait until the open menu closes, so refreshing data does not
 dismiss it while you read or navigate a submenu.
 

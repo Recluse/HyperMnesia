@@ -33,7 +33,7 @@ fn agents_dir() -> Result<PathBuf, String> {
 /// console's list said nothing at all about it.
 pub fn list(prefix: &str) -> Result<Vec<Job>, String> {
     let dir = agents_dir()?;
-    let states = launchctl_states();
+    let states = launchctl_states()?;
     let mut out = Vec::new();
     let entries = std::fs::read_dir(&dir)
         .map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
@@ -172,16 +172,26 @@ fn runs_of(label: &str) -> Option<u64> {
 }
 
 /// `launchctl list` -> label => (pid, exit code of the last run).
-fn launchctl_states() -> BTreeMap<String, (Option<u32>, Option<i32>)> {
+fn launchctl_states() -> Result<BTreeMap<String, (Option<u32>, Option<i32>)>, String> {
+    let output = Command::new("launchctl").arg("list").output()
+        .map_err(|e| format!("cannot run launchctl list: {e}"))?;
+    parse_launchctl_states(output)
+}
+
+fn parse_launchctl_states(o: std::process::Output)
+    -> Result<BTreeMap<String, (Option<u32>, Option<i32>)>, String> {
+    if !o.status.success() {
+        return Err(format!("launchctl list failed ({}): {}", o.status,
+                           String::from_utf8_lossy(&o.stderr).trim()));
+    }
     let mut out = BTreeMap::new();
-    let Ok(o) = Command::new("launchctl").arg("list").output() else { return out };
     for line in String::from_utf8_lossy(&o.stdout).lines().skip(1) {
         let mut f = line.split('\t');
         let (pid, st, label) = (f.next(), f.next(), f.next());
         let (Some(pid), Some(st), Some(label)) = (pid, st, label) else { continue };
         out.insert(label.trim().to_string(), (pid.trim().parse().ok(), st.trim().parse().ok()));
     }
-    out
+    Ok(out)
 }
 
 /// Run the job immediately, without touching its schedule.
@@ -211,7 +221,7 @@ pub fn run_now(label: &str) -> Result<String, String> {
     // A short look back. Long enough for a program that is not there to have failed, short
     // enough that a person does not notice the wait.
     std::thread::sleep(Duration::from_millis(600));
-    let states = launchctl_states();
+    let states = launchctl_states()?;
     let (pid, last_exit) = states.get(label).cloned().unwrap_or((None, None));
     let after = runs_of(label);
     if pid.is_some() {
@@ -535,6 +545,20 @@ pub fn uninstall_self(label: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_launchctl_listing_is_not_an_empty_job_list() {
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf 'service manager unavailable' >&2; exit 1"])
+            .output().unwrap();
+        let error = super::parse_launchctl_states(output).unwrap_err();
+        assert!(error.contains("service manager unavailable"));
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf 'PID\\tStatus\\tLabel\\n-\\t1\\tcom.example.ingest\\n'"])
+            .output().unwrap();
+        let rows = super::parse_launchctl_states(output).unwrap();
+        assert_eq!(rows.get("com.example.ingest"), Some(&(None, Some(1))));
+    }
+
     use super::*;
 
     // Real output of `plutil -convert json` for our reflect job, shortened.

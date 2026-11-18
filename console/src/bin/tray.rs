@@ -27,7 +27,7 @@ mod app {
     use std::time::{Duration, Instant, SystemTime};
 
     use hypermnesia_console::jobs::{self, Job};
-    use hypermnesia_console::view;
+    use hypermnesia_console::view::{self, Severity, StatusLine};
     use hypermnesia_console::{fetch, Stats, Target};
 
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
@@ -67,6 +67,7 @@ mod app {
 hypermnesia — the memory console in the menu bar / system tray.
 
     hypermnesia              run the tray
+    hypermnesia --status     print the current status and reasons without opening a tray
     hypermnesia --install    add to autostart
     hypermnesia --uninstall  remove from autostart
 
@@ -81,6 +82,7 @@ still for a little while after a button is pressed.
     /// (the caller should return without building the tray), `false` to proceed.
     pub fn handle_early_args(args: &[String]) -> bool {
         match args.first().map(String::as_str) {
+            Some("--status") => { print_status(); true }
             Some("--install") => { finish(jobs::install_self(jobs::DEFAULT_TRAY_LABEL)); true }
             Some("--uninstall") => { finish(jobs::uninstall_self(jobs::DEFAULT_TRAY_LABEL)); true }
             Some("-h") | Some("--help") => { print!("{HELP}"); true }
@@ -89,6 +91,24 @@ still for a little while after a button is pressed.
                 std::process::exit(1);
             }
             None => false,
+        }
+    }
+
+    fn print_status() {
+        let (jobs, error) = read_jobs();
+        let reading = Target::from_env().and_then(|t| fetch(&t));
+        let mut health = view::health(reading.as_ref().ok(), &jobs, error.as_deref());
+        if let Err(why) = &reading {
+            health.push(StatusLine::new(Severity::Error, format!("Store reading failed: {why}")));
+        }
+        if let Some(why) = jobs::autostart_fault(jobs::DEFAULT_TRAY_LABEL) {
+            health.push(StatusLine::new(Severity::Error, format!("Autostart: {why}")));
+        }
+        health.reasons.sort_by_key(|r| std::cmp::Reverse(r.severity));
+        println!("Status: {}", health.title());
+        for reason in health.reasons { println!("{}", reason.marked()); }
+        if let Ok(s) = reading {
+            for line in view::summary(&s) { println!("{line}"); }
         }
     }
 
@@ -110,6 +130,8 @@ still for a little while after a button is pressed.
         Note(String),
         /// A jobs-only reading: local and cheap, refreshed on its own cadence from the store's.
         Jobs(Vec<Job>, Option<String>),
+        Autostart(Option<String>),
+        Done(Pending),
     }
 
     pub struct Snapshot {
@@ -120,16 +142,27 @@ still for a little while after a button is pressed.
         at: SystemTime,
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Pending { Reading, Jobs, Action }
+
     pub enum Command {
         /// Both the store and the jobs.
         Refresh,
-        /// The jobs alone -- local, fast, and asked for far more often than `Refresh`. Does not
-        /// touch `awaiting`: this is a background heartbeat, not a question the watchdog should
-        /// hold the tray to.
+        /// The jobs alone, with their own watchdog deadline when no other request is pending.
         RefreshJobs,
         RunJob(String),
         SetSchedule(String, jobs::Schedule),
         SetEnabled(String, bool),
+    }
+
+    impl Command {
+        fn kind(&self) -> Pending {
+            match self {
+                Self::Refresh => Pending::Reading,
+                Self::RefreshJobs => Pending::Jobs,
+                _ => Pending::Action,
+            }
+        }
     }
 
     fn read_jobs() -> (Vec<Job>, Option<String>) {
@@ -161,8 +194,10 @@ still for a little while after a button is pressed.
             let read_jobs_into = |tx: &mpsc::Sender<Update>| {
                 let (jobs, err) = read_jobs();
                 let _ = tx.send(Update::Jobs(jobs, err));
+                let _ = tx.send(Update::Autostart(jobs::autostart_fault(jobs::DEFAULT_TRAY_LABEL)));
             };
             while let Ok(cmd) = rx.recv() {
+                let kind = cmd.kind();
                 match cmd {
                     Command::Refresh => {
                         // Jobs first: they are local and fast, and worth showing even if the
@@ -207,6 +242,7 @@ still for a little while after a button is pressed.
                         read_jobs_into(&tx);
                     }
                 }
+                let _ = tx.send(Update::Done(kind));
             }
         });
     }
@@ -219,11 +255,23 @@ still for a little while after a button is pressed.
     struct Items {
         refresh: Option<MenuItem>,
         quit: Option<MenuItem>,
+        /// Informational rows use normal system text contrast, but never dispatch actions.
+        info: Vec<MenuItem>,
         run: Vec<(MenuItem, String)>,
         sched: Vec<(MenuItem, String, jobs::Schedule)>,
         /// One item per job that can be armed/disarmed, carrying the label and the state a click
         /// on it should set (the opposite of what it currently is).
         enable: Vec<(MenuItem, String, bool)>,
+    }
+
+    impl Items {
+        fn append_info(&mut self, menu: &Menu, text: impl AsRef<str>) {
+            // Disabled NSMenuItems use dimmed text that is unreadable on translucent menus.
+            // Keep the normal theme-aware foreground and explicitly ignore their selections.
+            let item = MenuItem::new(text, true, None);
+            let _ = menu.append(&item);
+            self.info.push(item);
+        }
     }
 
     pub struct App {
@@ -238,7 +286,9 @@ still for a little while after a button is pressed.
         /// Schedule submenus and a calm title -- "no jobs readable" and "every job healthy"
         /// looked identical.
         jobs_error: Option<String>,
+        autostart_fault: Option<String>,
         status: String,
+        store_error: Option<String>,
         /// The outcome of the last button press, on its own line and with its own age.
         ///
         /// It used to share one field with the status line, and the refresh that every button
@@ -246,18 +296,13 @@ still for a little while after a button is pressed.
         /// "updated just now". The outcome of something a person did is the last thing that
         /// should be overwritten.
         note: Option<(String, SystemTime)>,
-        /// What the worker was last asked, and when. Cleared by any answer to it. Only `Refresh`
-        /// and the write commands set this -- a background `RefreshJobs` tick is not a question
-        /// the watchdog should hold the tray to.
+        /// One admitted command at a time; only its matching reply clears the deadline.
         awaiting: Option<(String, Instant)>,
+        awaiting_kind: Option<Pending>,
         /// The worker thread is gone: nothing will ever be read again.
         worker_dead: bool,
         last_refresh: Instant,
         last_jobs_refresh: Instant,
-        /// A `RefreshJobs` was sent and no `Update::Jobs` has answered it yet. Without this a
-        /// worker stuck on a slow `systemctl`/`launchctl` call would be sent a new request every
-        /// tick, piling up behind the one already running.
-        jobs_in_flight: bool,
         /// Poll the jobs at `BURST_REFRESH` rather than `JOBS_REFRESH` until this instant --
         /// set after every write command, so its result shows up in a couple of seconds rather
         /// than waiting out the idle cadence.
@@ -267,7 +312,7 @@ still for a little while after a button is pressed.
         /// -- for no visible difference.
         last_render: Option<String>,
         render_pending: bool,
-        icon_warned: Option<bool>,
+        icon_severity: Option<Severity>,
         #[cfg(target_os = "macos")]
         menu_tracking: super::menu_tracking::Tracking,
     }
@@ -291,17 +336,19 @@ still for a little while after a button is pressed.
                 last: None,
                 jobs: Vec::new(),
                 jobs_error: None,
+                autostart_fault: None,
                 status: "loading…".to_string(),
+                store_error: None,
                 note: None,
                 awaiting: Some(("the first reading".into(), now)),
+                awaiting_kind: Some(Pending::Reading),
                 worker_dead: false,
                 last_refresh: now,
                 last_jobs_refresh: now,
-                jobs_in_flight: false,
                 burst_until: now,
                 last_render: None,
                 render_pending: false,
-                icon_warned: None,
+                icon_severity: None,
                 #[cfg(target_os = "macos")]
                 menu_tracking: super::menu_tracking::Tracking::new(),
             }
@@ -310,58 +357,98 @@ still for a little while after a button is pressed.
         /// Post a command and remember that an answer is owed. Every path to the worker that the
         /// watchdog should track goes through here.
         fn ask(&mut self, cmd: Command, status: &str, what: &str) {
+            if self.worker_dead || self.awaiting.is_some() {
+                self.note = Some(("Reader busy or unavailable; command was not queued".into(),
+                                  SystemTime::now()));
+                return;
+            }
             self.status = status.to_string();
+            self.awaiting_kind = Some(cmd.kind());
             self.awaiting = Some((what.to_string(), Instant::now()));
-            self.burst_until = Instant::now() + BURST_WINDOW;
-            let _ = self.cmd.send(cmd);
+            if cmd.kind() == Pending::Action {
+                self.burst_until = Instant::now() + BURST_WINDOW;
+            }
+            if self.cmd.send(cmd).is_err() {
+                self.worker_dead = true;
+                self.status = "! the reader thread has died; restart the tray".into();
+            }
         }
 
-        /// Not one blocking call in here: a non-blocking channel read and a timer. Called on a
-        /// ~200ms tick by whichever platform loop is driving this `App`.
-        pub fn tick(&mut self) -> Tick {
-            if self.tray.is_none() {
-                self.rebuild();
-                self.last_render = Some(self.content_fingerprint());
+        fn answered(&mut self, kind: Pending) {
+            if self.awaiting_kind == Some(kind) {
+                self.awaiting = None;
+                self.awaiting_kind = None;
+                if self.status.starts_with("! no answer")
+                    || (kind == Pending::Action && !self.status.starts_with('!')) {
+                    self.status.clear();
+                }
             }
+        }
 
+        fn queue_periodic(&mut self) {
+            if self.worker_dead || self.awaiting.is_some() { return; }
+            if self.last_refresh.elapsed() >= REFRESH {
+                self.last_refresh = Instant::now();
+                self.last_jobs_refresh = Instant::now();
+                self.ask(Command::Refresh, &self.status.clone(), "a reading");
+                return;
+            }
+            let cadence = if Instant::now() < self.burst_until { BURST_REFRESH }
+                          else { JOBS_REFRESH };
+            if self.last_jobs_refresh.elapsed() >= cadence {
+                self.last_jobs_refresh = Instant::now();
+                self.ask(Command::RefreshJobs, &self.status.clone(), "job status");
+            }
+        }
+
+        fn check_watchdog(&mut self) -> bool {
+            if let Some((what, since)) = &self.awaiting {
+                if !self.worker_dead && since.elapsed() > WORKER_PATIENCE {
+                    let status = format!("! no answer about {what} for {} -- the reader is stuck",
+                                         view::ago(since.elapsed()));
+                    if self.status != status {
+                        self.status = status;
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        fn receive_updates(&mut self) -> bool {
             let mut dirty = false;
             loop {
                 match self.rx.try_recv() {
                     Ok(Update::Data(s)) => {
-                        self.awaiting = None;
                         // Not a sentence: the sentence is rendered at rebuild time from `last.at`.
                         // Frozen, it said "updated just now" for the whole refresh cycle -- and
                         // after the machine slept, for as long as the nap lasted, because the
                         // refresh timer is monotonic and stops with it.
                         self.status = String::new();
                         self.last = Some(*s);
+                        self.store_error = None;
                         dirty = true;
                     }
                     Ok(Update::Failed(e)) => {
-                        self.awaiting = None;
-                        // The old numbers stay -- they beat an empty screen -- but they are
-                        // labelled with the reason and with HOW OLD they are. Without the age you
-                        // cannot tell "could not reach it a second ago" from "stuck since
-                        // yesterday".
-                        let age = self.last.as_ref()
-                            .map(|s| format!(", showing state from {} ago",
-                                             view::ago(view::age_of(s.at))))
-                            .unwrap_or_default();
-                        self.status = format!("! not updated: {e}{age}");
+                        self.store_error = Some(e);
+                        self.status.clear();
                         dirty = true;
                     }
                     Ok(Update::Note(n)) => {
-                        self.awaiting = None;
                         self.note = Some((n, SystemTime::now()));
                         dirty = true;
                     }
                     Ok(Update::Jobs(jobs, err)) => {
-                        // Deliberately does NOT clear `awaiting`: a background jobs poll is not
-                        // an answer to whatever `Refresh` or a write command asked, and treating
-                        // it as one would let a hung store fetch hide behind it forever.
-                        self.jobs_in_flight = false;
                         self.jobs = jobs;
                         self.jobs_error = err;
+                        dirty = true;
+                    }
+                    Ok(Update::Autostart(fault)) => {
+                        self.autostart_fault = fault;
+                        dirty = true;
+                    }
+                    Ok(Update::Done(kind)) => {
+                        self.answered(kind);
                         dirty = true;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -380,17 +467,25 @@ still for a little while after a button is pressed.
                 }
             }
 
-            // A worker that is alive but has stopped answering. Without this the menu keeps
-            // asserting "updated just now" over a reading that never arrived.
-            if let Some((what, since)) = self.awaiting.clone() {
-                if since.elapsed() > WORKER_PATIENCE && !self.status.starts_with("! no answer") {
-                    self.status = format!("! no answer about {what} for {} -- the reader is \
-                                           stuck", view::ago(since.elapsed()));
-                    dirty = true;
-                }
+            dirty
+        }
+
+        /// Not one blocking call in here: a non-blocking channel read and a timer. Called on a
+        /// ~200ms tick by whichever platform loop is driving this `App`.
+        pub fn tick(&mut self) -> Tick {
+            if self.tray.is_none() {
+                self.rebuild();
+                self.last_render = Some(self.content_fingerprint());
             }
 
+            let mut dirty = self.receive_updates();
+
+            dirty |= self.check_watchdog();
+
             while let Ok(ev) = MenuEvent::receiver().try_recv() {
+                if self.items.info.iter().any(|item| item.id() == &ev.id) {
+                    continue;
+                }
                 if Some(&ev.id) == self.items.quit.as_ref().map(|i| i.id()) {
                     return Tick::Quit;
                 }
@@ -431,20 +526,7 @@ still for a little while after a button is pressed.
                 dirty = true;
             }
 
-            if self.last_refresh.elapsed() >= REFRESH {
-                self.last_refresh = Instant::now();
-                self.ask(Command::Refresh, &self.status.clone(), "a reading");
-            }
-            // The jobs, cheap and local, on their own faster cadence -- faster still for a while
-            // after a button was pressed, so pressing it does not mean waiting out the idle
-            // cadence to see whether it worked.
-            let jobs_cadence = if Instant::now() < self.burst_until { BURST_REFRESH }
-                               else { JOBS_REFRESH };
-            if !self.jobs_in_flight && self.last_jobs_refresh.elapsed() >= jobs_cadence {
-                self.last_jobs_refresh = Instant::now();
-                self.jobs_in_flight = true;
-                let _ = self.cmd.send(Command::RefreshJobs);
-            }
+            self.queue_periodic();
             self.render_pending |= dirty;
             // Replacing a tracking menu dismisses it, even when only an age label changed.
             #[cfg(target_os = "macos")]
@@ -473,13 +555,14 @@ still for a little while after a button is pressed.
         /// the words themselves would change.
         fn content_fingerprint(&self) -> String {
             let mut fp = self.status_line();
+            fp.push_str(&self.status);
             fp.push('\n');
             if let Some((note, _)) = &self.note {
                 fp.push_str(note);
                 fp.push('\n');
             }
-            if let Some(why) = jobs::autostart_fault(jobs::DEFAULT_TRAY_LABEL) {
-                fp.push_str(&why);
+            if let Some(why) = &self.autostart_fault {
+                fp.push_str(why);
                 fp.push('\n');
             }
             if let Some(s) = &self.last {
@@ -499,33 +582,53 @@ still for a little while after a button is pressed.
             fp
         }
 
+        fn health(&self) -> view::Health {
+            let mut out = view::health(self.last.as_ref().map(|s| &s.stats), &self.jobs,
+                                       self.jobs_error.as_deref());
+            if let Some(why) = &self.autostart_fault {
+                out.push(StatusLine::new(Severity::Error, format!("Autostart: {why}")));
+            }
+            if let Some(why) = &self.store_error {
+                out.push(StatusLine::new(Severity::Error, format!("Store reading failed: {why}")));
+            }
+            if let Some(why) = self.status.strip_prefix("! ") {
+                out.push(StatusLine::new(Severity::Error, why));
+            }
+            if let Some((note, _)) = &self.note {
+                if let Some(why) = note.strip_prefix("! ") {
+                    out.push(StatusLine::new(Severity::Error, format!("Last action failed: {why}")));
+                }
+            }
+            out.reasons.sort_by_key(|l| std::cmp::Reverse(l.severity));
+            out
+        }
+
         fn rebuild(&mut self) {
             let menu = Menu::new();
             let mut items = Items::default();
 
-            let _ = menu.append(&MenuItem::new(self.status_line(), false, None));
+            items.append_info(&menu, self.status_line());
             // The outcome of the last button press keeps its own line, with its age, until
             // another press replaces it.
             if let Some((note, when)) = &self.note {
-                let _ = menu.append(&MenuItem::new(
-                    format!("{note}  ({} ago)", view::ago(view::age_of(*when))), false, None));
+                items.append_info(&menu,
+                    format!("{note}  ({} ago)", view::ago(view::age_of(*when))));
             }
-            if let Some(why) = jobs::autostart_fault(jobs::DEFAULT_TRAY_LABEL) {
-                let _ = menu.append(&MenuItem::new(format!("! {why}"), false, None));
+            let health = self.health();
+            items.append_info(&menu, format!("Status: {}", health.title()));
+            for reason in &health.reasons {
+                items.append_info(&menu, reason.marked());
             }
             let _ = menu.append(&PredefinedMenuItem::separator());
 
-            let mut warned = false;
             if let Some(s) = &self.last {
                 for line in view::summary(&s.stats) {
-                    let _ = menu.append(&MenuItem::new(line, false, None));
+                    items.append_info(&menu, line);
                 }
                 let _ = menu.append(&PredefinedMenuItem::separator());
 
-                if let Some(why) = &self.jobs_error {
-                    let _ = menu.append(&MenuItem::new(format!("! jobs unreadable: {why}"),
-                                                       false, None));
-                }
+            }
+            {
                 let run = Submenu::new("Run now", true);
                 for j in &self.jobs {
                     let item = MenuItem::new(view::job_line(j), true, None);
@@ -576,15 +679,7 @@ still for a little while after a button is pressed.
                     }
                 }
 
-                warned = view::warned(&s.stats, &self.jobs, &self.jobs_error);
             }
-            // The status line and the last note are as much a part of "does this need a mark" as
-            // the store's own numbers: a failed refresh has no `Snapshot` to derive a warning
-            // from, and without this a dead worker or a failed refresh would sit under a calm
-            // icon forever.
-            warned = warned
-                || self.status_line().starts_with('!')
-                || self.note.as_ref().is_some_and(|(n, _)| n.starts_with('!'));
 
             let _ = menu.append(&PredefinedMenuItem::separator());
             let refresh = MenuItem::new("Refresh now", true, None);
@@ -595,16 +690,15 @@ still for a little while after a button is pressed.
             items.quit = Some(quit);
 
             self.items = items;
-            let tooltip = if warned { "HyperMnesia — needs attention" }
-                          else if self.last.is_none() { "HyperMnesia — loading" }
-                          else { "HyperMnesia" };
+            let tooltip = format!("HyperMnesia — {}", health.title());
+            let severity = health.severity;
             match self.tray.as_ref() {
                 Some(t) => {
                     t.set_menu(Some(Box::new(menu)));
-                    let _ = t.set_tooltip(Some(tooltip));
-                    if self.icon_warned != Some(warned) {
-                        match t.set_icon(Some(mark_icon(warned))) {
-                            Ok(()) => self.icon_warned = Some(warned),
+                    let _ = t.set_tooltip(Some(&tooltip));
+                    if self.icon_severity != Some(severity) {
+                        match t.set_icon(Some(mark_icon(severity))) {
+                            Ok(()) => self.icon_severity = Some(severity),
                             Err(e) => eprintln!("hypermnesia: could not update the tray icon: {e}"),
                         }
                     }
@@ -615,12 +709,12 @@ still for a little while after a button is pressed.
                     // to say so and stop.
                     match TrayIconBuilder::new()
                         .with_menu(Box::new(menu))
-                        .with_icon(mark_icon(warned))
-                        .with_tooltip(tooltip)
+                        .with_icon(mark_icon(severity))
+                        .with_tooltip(&tooltip)
                         .build() {
                         Ok(t) => {
                             self.tray = Some(t);
-                            self.icon_warned = Some(warned);
+                            self.icon_severity = Some(severity);
                         }
                         Err(e) => {
                             eprintln!("hypermnesia: the tray icon could not be created: {e}");
@@ -636,8 +730,17 @@ still for a little while after a button is pressed.
         /// Computed here rather than stored, because a stored sentence cannot age. `at` is wall
         /// clock, so a machine that slept for two hours reports two hours, not "just now".
         fn status_line(&self) -> String {
+            if let Some(why) = &self.store_error {
+                let age = self.last.as_ref()
+                    .map(|s| format!(", showing state from {} ago", view::ago(view::age_of(s.at))))
+                    .unwrap_or_default();
+                return format!("! not updated: {why}{age}");
+            }
             if !self.status.is_empty() {
-                return self.status.clone();
+                let age = self.last.as_ref().filter(|_| self.status.starts_with('!'))
+                    .map(|s| format!(", showing state from {} ago", view::ago(view::age_of(s.at))))
+                    .unwrap_or_default();
+                return format!("{}{age}", self.status);
             }
             match &self.last {
                 None => "loading…".into(),
@@ -655,8 +758,8 @@ still for a little while after a button is pressed.
     }
 
     /// Embedded artwork: the installed binary needs no asset files beside it.
-    fn mark_icon(warned: bool) -> Icon {
-        let bytes: &[u8] = if warned { include_bytes!("../../assets/tray-warning.png") }
+    fn mark_icon(severity: Severity) -> Icon {
+        let bytes: &[u8] = if severity != Severity::Healthy { include_bytes!("../../assets/tray-warning.png") }
                           else { include_bytes!("../../assets/tray-ok.png") };
         let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
         decoder.set_transformations(png::Transformations::normalize_to_color8());
@@ -665,6 +768,16 @@ still for a little while after a button is pressed.
         let info = reader.next_frame(&mut rgba).expect("embedded tray PNG pixels");
         assert_eq!(info.color_type, png::ColorType::Rgba, "tray artwork must have alpha");
         rgba.truncate(info.buffer_size());
+        if severity == Severity::Attention {
+            // Runtime palette preserves alpha and neutral lettering in the existing artwork.
+            for pixel in rgba.chunks_exact_mut(4) {
+                let [r, g, b, _] = [pixel[0], pixel[1], pixel[2], pixel[3]];
+                if r > g && r > b {
+                    pixel[1] = g.max(b.saturating_add(((u16::from(r) - u16::from(b)) * 3 / 4) as u8));
+                    pixel[2] = b.min(g);
+                }
+            }
+        }
         Icon::from_rgba(rgba, info.width, info.height).expect("embedded tray icon dimensions")
     }
 
@@ -673,9 +786,130 @@ still for a little while after a button is pressed.
         use super::*;
 
         #[test]
-        fn both_embedded_status_icons_decode() {
-            let _ = mark_icon(false);
-            let _ = mark_icon(true);
+        fn all_status_icons_decode() {
+            let _ = mark_icon(Severity::Healthy);
+            let _ = mark_icon(Severity::Error);
+            let _ = mark_icon(Severity::Attention);
+        }
+
+        #[test]
+        fn repeated_refresh_does_not_reset_a_pending_deadline() {
+            let (_, rx) = mpsc::channel();
+            let (cmd, commands) = mpsc::channel();
+            let mut app = App::new(rx, cmd);
+            let first = Instant::now() - Duration::from_secs(61);
+            app.awaiting = Some(("the first reading".into(), first));
+            app.ask(Command::Refresh, "refreshing…", "a reading");
+            assert_eq!(app.awaiting.as_ref().unwrap().1, first);
+            assert!(commands.try_recv().is_err(), "a pending read must not queue duplicates");
+        }
+
+
+        #[test]
+        fn periodic_reads_leave_the_original_deadline_and_recover_after_reply() {
+            let (_, rx) = mpsc::channel();
+            let (cmd, commands) = mpsc::channel();
+            let mut app = App::new(rx, cmd);
+            let first = Instant::now() - Duration::from_secs(91);
+            app.awaiting = Some(("the first reading".into(), first));
+            app.last_refresh = Instant::now() - REFRESH;
+            app.last_jobs_refresh = Instant::now() - JOBS_REFRESH;
+            app.queue_periodic();
+            assert!(commands.try_recv().is_err());
+            app.answered(Pending::Jobs);
+            assert_eq!(app.awaiting.as_ref().unwrap().1, first);
+            assert!(app.check_watchdog());
+            assert_eq!(app.health().severity, Severity::Error);
+            app.answered(Pending::Reading);
+            assert!(app.awaiting.is_none());
+            assert!(!app.status.starts_with("! no answer"));
+            app.queue_periodic();
+            assert!(matches!(commands.try_recv(), Ok(Command::Refresh)));
+            assert!(commands.try_recv().is_err());
+        }
+
+        #[test]
+        fn a_hung_jobs_read_is_watched_too() {
+            let (_, rx) = mpsc::channel();
+            let (cmd, commands) = mpsc::channel();
+            let mut app = App::new(rx, cmd);
+            app.answered(Pending::Reading);
+            app.last_jobs_refresh = Instant::now() - JOBS_REFRESH;
+            app.queue_periodic();
+            assert!(matches!(commands.try_recv(), Ok(Command::RefreshJobs)));
+            app.awaiting.as_mut().unwrap().1 = Instant::now() - Duration::from_secs(91);
+            assert!(app.check_watchdog());
+            app.answered(Pending::Jobs);
+            assert!(app.awaiting.is_none());
+            assert!(!app.status.starts_with('!'));
+        }
+
+        #[test]
+        fn autostart_and_last_action_errors_are_named_without_a_snapshot() {
+            let (_, rx) = mpsc::channel();
+            let (cmd, _) = mpsc::channel();
+            let mut app = App::new(rx, cmd);
+            app.autostart_fault = Some("binary missing".into());
+            app.note = Some(("! job did not start".into(), SystemTime::now()));
+            let h = app.health();
+            assert_eq!(h.severity, Severity::Error);
+            assert!(h.reasons.iter().any(|l| l.text == "Autostart: binary missing"));
+            assert!(h.reasons.iter().any(|l| l.text == "Last action failed: job did not start"));
+        }
+
+        #[test]
+        fn failed_reading_age_is_not_frozen_at_failure_time() {
+            let (_, rx) = mpsc::channel();
+            let (cmd, _) = mpsc::channel();
+            let mut app = App::new(rx, cmd);
+            app.status = "! not updated: unavailable".into();
+            app.last = Some(Snapshot { stats: Stats::default(),
+                at: SystemTime::now() - Duration::from_secs(240) });
+            assert!(app.status_line().contains("showing state from 4m ago"));
+            app.last.as_mut().unwrap().at -= Duration::from_secs(120);
+            assert!(app.status_line().contains("showing state from 6m ago"));
+        }
+
+
+        #[test]
+        fn partial_worker_replies_cannot_admit_another_command() {
+            let (updates, rx) = mpsc::channel();
+            let (cmd, commands) = mpsc::channel();
+            let mut app = App::new(rx, cmd);
+            app.answered(Pending::Reading);
+            app.ask(Command::RunJob("fixture".into()), "running…", "fixture");
+            assert!(matches!(commands.try_recv(), Ok(Command::RunJob(_))));
+            updates.send(Update::Note("started".into())).unwrap();
+            updates.send(Update::Jobs(vec![], None)).unwrap();
+            app.receive_updates();
+            assert_eq!(app.awaiting_kind, Some(Pending::Action));
+            app.last_refresh = Instant::now() - REFRESH;
+            app.queue_periodic();
+            assert!(commands.try_recv().is_err());
+            updates.send(Update::Done(Pending::Action)).unwrap();
+            app.receive_updates();
+            app.queue_periodic();
+            assert!(matches!(commands.try_recv(), Ok(Command::Refresh)));
+        }
+
+        #[test]
+        fn unrelated_actions_cannot_clear_a_failed_store_reading() {
+            let (updates, rx) = mpsc::channel();
+            let (cmd, _commands) = mpsc::channel();
+            let mut app = App::new(rx, cmd);
+            updates.send(Update::Failed("database unavailable".into())).unwrap();
+            updates.send(Update::Done(Pending::Reading)).unwrap();
+            app.receive_updates();
+            app.ask(Command::RunJob("fixture".into()), "running…", "fixture");
+            updates.send(Update::Note("started".into())).unwrap();
+            updates.send(Update::Done(Pending::Action)).unwrap();
+            app.receive_updates();
+            assert_eq!(app.health().severity, Severity::Error);
+            assert!(app.status_line().contains("database unavailable"));
+            updates.send(Update::Data(Box::new(Snapshot { stats: Stats::default(),
+                at: SystemTime::now() }))).unwrap();
+            app.receive_updates();
+            assert_eq!(app.health().severity, Severity::Healthy);
         }
 
         #[test]

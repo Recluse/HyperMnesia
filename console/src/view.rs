@@ -1,69 +1,109 @@
-//! How the tray renders what it knows, shared by every platform's menu shell.
-//!
-//! Nothing here calls a GUI library or a platform's service manager. It turns a `Stats` and a
-//! `[Job]` into the same lines and the same single yes/no "does this need a mark" verdict on
-//! macOS and on Linux, so the two menu shells cannot drift into disagreeing about what a person
-//! should be shown. `warned()` is deliberately *derived* from the lines this module renders,
-//! never recomputed beside them: a title mark that disagrees with the menu under it is the same
-//! quiet lie as a stale reading drawn as a fresh one.
-
+//! Shared tray presentation: typed reasons drive both the menu and the icon.
 use std::time::{Duration, SystemTime};
-
 use crate::jobs::Job;
 use crate::Stats;
 
-/// What is visible without opening the menu. A mark
-/// matters more than a number here: the title/icon is where a problem is NOTICED, not where a
-/// report is read.
-///
-/// Derived from the same lines `summary` and `job_line` produce, not from a second list of
-/// conditions kept in step by hand -- recomputing separately is what once let a warning line sit
-/// in the menu under a calm mark.
-pub fn warned(stats: &Stats, jobs: &[Job], jobs_error: &Option<String>) -> bool {
-    summary(stats).iter().any(|l| l.starts_with('!'))
-        || jobs_error.is_some()
-        || jobs.iter().any(Job::broken)
-        || jobs.iter().any(Job::overdue)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    #[default]
+    Healthy,
+    Attention,
+    Error,
 }
 
-/// The lines describing the store's numbers, for the menu body.
+#[derive(Clone, Debug)]
+pub struct StatusLine {
+    pub severity: Severity,
+    pub text: String,
+}
+
+impl StatusLine {
+    pub fn new(severity: Severity, text: impl Into<String>) -> Self {
+        Self { severity, text: text.into() }
+    }
+
+    pub fn marked(&self) -> String {
+        let prefix = match self.severity {
+            Severity::Healthy => "", Severity::Attention => "~ ", Severity::Error => "! ",
+        };
+        format!("{prefix}{}", self.text)
+    }
+}
+
+#[derive(Default)]
+pub struct Health {
+    pub severity: Severity,
+    pub reasons: Vec<StatusLine>,
+}
+
+impl Health {
+    pub fn push(&mut self, line: StatusLine) {
+        self.severity = self.severity.max(line.severity);
+        if line.severity != Severity::Healthy { self.reasons.push(line); }
+    }
+
+    pub fn title(&self) -> &'static str {
+        match self.severity {
+            Severity::Healthy => "Healthy",
+            Severity::Attention => "Needs attention",
+            Severity::Error => "Errors detected",
+        }
+    }
+}
+
+/// Job errors remain visible before the first successful database reading.
+pub fn health(stats: Option<&Stats>, jobs: &[Job], jobs_error: Option<&str>) -> Health {
+    let mut out = Health::default();
+    if let Some(s) = stats {
+        for line in summary_rows(s) { out.push(line); }
+    } else {
+        out.push(StatusLine::new(Severity::Attention, "Waiting for the first store reading"));
+    }
+    if let Some(why) = jobs_error {
+        out.push(StatusLine::new(Severity::Error, format!("Jobs unreadable: {why}")));
+    }
+    for j in jobs {
+        let status = job_status(j);
+        out.push(StatusLine::new(status.severity, format!("{}: {}", j.short(), status.text)));
+    }
+    out
+}
+
 pub fn summary(s: &Stats) -> Vec<String> {
-    let (docs, chunks, embedded) = s.corpus.iter()
-        .filter(|r| !r.is_memory_page())
-        .fold((0, 0, 0), |(d, c, e), r| (d + r.docs, c + r.chunks, e + r.embedded));
+    summary_rows(s).iter().map(StatusLine::marked).collect()
+}
+
+fn summary_rows(s: &Stats) -> Vec<StatusLine> {
+    use Severity::{Attention, Error, Healthy};
+    // Wider sums prevent multiple valid i64 database counts from wrapping at the UI boundary.
+    let totals = |pages| s.corpus.iter().filter(|r| r.is_memory_page() == pages)
+        .fold((0i128, 0i128, 0i128), |(d, c, e), r|
+              (d + i128::from(r.docs), c + i128::from(r.chunks), e + i128::from(r.embedded)));
+    let (docs, chunks, embedded) = totals(false);
     let mut out = vec![
-        format!("Memory: {} active of {}", s.memories_active, s.memories_total),
-        format!("Knowledge pages: {}", s.pages),
-        format!("Corpus: {docs} docs, {chunks} chunks"),
+        StatusLine::new(Healthy, format!("Memory: {} active of {}", s.memories_active, s.memories_total)),
+        StatusLine::new(Healthy, format!("Knowledge pages: {}", s.pages)),
+        StatusLine::new(Healthy, format!("Corpus: {docs} docs, {chunks} chunks")),
     ];
     if embedded < chunks {
-        out.push(format!("! not embedded: {}", chunks - embedded));
+        out.push(StatusLine::new(Attention, format!("Not embedded: {}", chunks - embedded)));
     }
-    // Page mirrors are filtered out of the totals above, so an unembedded knowledge page raised
-    // nothing here and the title -- derived from these lines -- stayed calm over it.
-    let (_, mchunks, membedded) = s.corpus.iter()
-        .filter(|r| r.is_memory_page())
-        .fold((0, 0, 0), |(d, c, e), r| (d + r.docs, c + r.chunks, e + r.embedded));
+    let (_, mchunks, membedded) = totals(true);
     if membedded < mchunks {
-        out.push(format!("! pages not embedded: {}", mchunks - membedded));
+        out.push(StatusLine::new(Attention, format!("Pages not embedded: {}", mchunks - membedded)));
     }
     if s.embedding_models.len() > 1 {
-        // Two models in one store means part of the corpus cannot be reached by meaning at all.
-        out.push(format!("! embedding models: {}", s.embedding_models.len()));
+        out.push(StatusLine::new(Error, format!("Embedding models: {}", s.embedding_models.len())));
     }
     if s.embedding_unset > 0 {
-        // Its own line rather than a model called "(null)": see Stats::embedding_unset.
-        out.push(format!("! chunks with no model recorded: {}", s.embedding_unset));
+        out.push(StatusLine::new(Error, format!("Chunks with no model recorded: {}", s.embedding_unset)));
     }
-    // Marked when there is something in it, so the title can be derived from these lines rather
-    // than from a second list of conditions kept in step by hand.
     out.push(if s.review_pending > 0 {
-        format!("! Review queue: {} (oldest {} days)", s.review_pending, s.review_oldest_days)
-    } else {
-        "Review queue: 0".to_string()
-    });
-    out.push(format!("Stale: {}", s.stale));
-    out.push(format!("Database: {}", s.db_size));
+        StatusLine::new(Attention, format!("Review queue: {} (oldest {} days)",
+                                         s.review_pending, s.review_oldest_days))
+    } else { StatusLine::new(Healthy, "Review queue: 0") });
+    out.push(StatusLine::new(Healthy, format!("Old unused memories (180+ days): {}", s.stale)));
+    out.push(StatusLine::new(Healthy, format!("Database: {}", s.db_size)));
     out
 }
 
@@ -80,44 +120,40 @@ pub fn ago(d: Duration) -> String {
     else { format!("{}d", s / 86_400) }
 }
 
-/// One job's line in the "Run now" / status listing.
+/// The same classified state is used in the submenu and in the top-level reasons.
 pub fn job_line(j: &Job) -> String {
+    format!("{}  ({}, {})", j.short(), j.schedule.human(), job_status(j).marked())
+}
+
+fn job_status(j: &Job) -> StatusLine {
+    use Severity::{Attention, Error, Healthy};
     if let Some(why) = &j.fault {
-        // The backend refused this unit too, so the job is not running. It used to be missing
-        // from the menu entirely.
-        let first = why.lines().next().unwrap_or(why);
-        return format!("{}  (! {first})", j.short());
+        return StatusLine::new(Error, why.lines().next().unwrap_or(why));
     }
-    let state = if j.running() {
-        "running".to_string()
-    } else if j.overdue() {
-        "! overdue".to_string()
-    } else if j.never_ran() {
-        "never run yet".to_string()
-    } else if let Some(_) = j.freshness_unknown() {
-        // Neither fresh nor stale: the log that would date it is gone or undatable. Drawing
-        // that as health is how a job that quietly stopped stays invisible.
-        "? cannot be dated".to_string()
-    } else if j.last_exit.is_none() {
-        "not loaded".to_string()
-    } else if j.runs == Some(0) {
-        // The service manager prints exit 0 both for "finished successfully" and for "never
-        // finished at all". With no run since this login there is nothing to call successful.
-        "no run since login".to_string()
-    } else {
-        // The exit code belongs here. Without it a job that fails on every single run reads
-        // exactly like one that works: same schedule, same fresh log timestamp.
-        let when = match j.since_last_output() {
-            Some(d) => format!("{} ago", ago(d)),
-            None => "—".to_string(),
-        };
-        match j.last_exit {
-            Some(0) => when,
-            Some(c) => format!("! exit {c}, {when}"),
-            None => format!("{when}, not loaded"),
+    // A live rerun is not an overdue idle job, nor the previous run's exit code.
+    if j.running() { return StatusLine::new(Healthy, "running"); }
+    let when = j.since_last_output().map(|d| format!("{} ago", ago(d)))
+        .unwrap_or_else(|| "last output unknown".into());
+    // Timestamp uncertainty and overdue checks must not hide a failed run.
+    if let Some(code) = j.last_exit.filter(|c| *c != 0) {
+        // The freshness sweep uses 10 only after every source check completed.
+        // Findings remain visible; a failed check uses 1 and stays red.
+        if j.short() == "freshness" && code == 10 {
+            if j.overdue() { return StatusLine::new(Error, "overdue"); }
+            return StatusLine::new(Attention, format!("review findings, {when}"));
         }
-    };
-    format!("{}  ({}, {})", j.short(), j.schedule.human(), state)
+        return StatusLine::new(Error, format!("exit {code}, {when}"));
+    }
+    if j.overdue() { return StatusLine::new(Error, "overdue"); }
+    if j.never_ran() { return StatusLine::new(Healthy, "never run yet"); }
+    if let Some(why) = j.freshness_unknown() {
+        return StatusLine::new(Attention, format!("cannot be dated: {why}"));
+    }
+    if j.last_exit.is_none() {
+        return StatusLine::new(Attention, "not loaded / no completion recorded");
+    }
+    if j.runs == Some(0) { return StatusLine::new(Healthy, "no run since login"); }
+    StatusLine::new(Healthy, when)
 }
 
 #[cfg(test)]
@@ -137,6 +173,84 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn completed_freshness_findings_differ_from_failed_checks() {
+        let mut j = job(Schedule::Every(86_400));
+        j.label = "ru.recluse.agentmem.freshness".into();
+        j.last_exit = Some(10);
+        assert_eq!(job_status(&j).severity, Severity::Attention);
+        assert!(job_line(&j).contains("review findings"));
+        j.last_exit = Some(1);
+        assert_eq!(job_status(&j).severity, Severity::Error);
+        j.last_exit = Some(10);
+        j.label = "ru.recluse.agentmem.ingest".into();
+        assert_eq!(job_status(&j).severity, Severity::Error);
+    }
+
+    #[test]
+    fn review_alone_is_amber_and_errors_take_precedence() {
+        let mut s = Stats::default();
+        s.review_pending = 2;
+        s.review_oldest_days = 11;
+        let h = health(Some(&s), &[], None);
+        assert_eq!(h.severity, Severity::Attention);
+        assert_eq!(h.reasons.len(), 1);
+        assert!(h.reasons[0].text.contains("Review queue: 2"));
+        let mut j = job(Schedule::Every(14_400));
+        j.last_exit = Some(1);
+        let h = health(Some(&s), &[j], None);
+        assert_eq!(h.severity, Severity::Error);
+        assert!(h.reasons.iter().any(|r| r.text.contains("exit 1")));
+        assert!(h.reasons.iter().any(|r| r.text.contains("Review queue")));
+        s.review_pending = 0;
+        assert_eq!(health(Some(&s), &[], None).severity, Severity::Healthy);
+    }
+
+    #[test]
+    fn job_errors_do_not_require_a_store_snapshot() {
+        let mut j = job(Schedule::Every(14_400));
+        j.last_exit = Some(2);
+        let h = health(None, &[j], Some("service manager unavailable"));
+        assert_eq!(h.severity, Severity::Error);
+        assert!(h.reasons.iter().any(|r| r.text.contains("exit 2")));
+        assert!(h.reasons.iter().any(|r| r.text.contains("service manager")));
+    }
+
+    #[test]
+    fn running_and_unknown_jobs_are_not_misclassified() {
+        let mut j = job(Schedule::Every(60));
+        j.last_exit = Some(1);
+        j.pid = Some(123);
+        assert_eq!(health(Some(&Stats::default()), &[j.clone()], None).severity, Severity::Healthy);
+        assert!(job_line(&j).contains("running"));
+        j.pid = None;
+        j.log_state = LogState::Missing;
+        assert_eq!(health(Some(&Stats::default()), &[j.clone()], None).severity, Severity::Error);
+        j.last_exit = Some(0);
+        assert_eq!(health(Some(&Stats::default()), &[j], None).severity, Severity::Attention);
+    }
+
+    #[test]
+    fn embedding_backlog_and_invalid_model_metadata_have_distinct_severity() {
+        let mut s = Stats::default();
+        s.corpus.push(crate::RepoStats { repo: "project~mem".into(),
+            docs: 1, chunks: 1, embedded: 0 });
+        assert_eq!(health(Some(&s), &[], None).severity, Severity::Attention);
+        s.embedding_unset = 1;
+        assert_eq!(health(Some(&s), &[], None).severity, Severity::Error);
+    }
+
+    #[test]
+    fn corpus_totals_do_not_wrap_at_the_i64_boundary() {
+        let mut s = Stats::default();
+        for repo in ["a", "b"] {
+            s.corpus.push(crate::RepoStats { repo: repo.into(),
+                docs: 1, chunks: i64::MAX, embedded: 0 });
+        }
+        assert!(summary(&s).iter().any(|l| l.contains("Not embedded: 18446744073709551614")));
+    }
+
     /// A job that fails on every run used to read exactly like one that works: same schedule,
     /// same fresh log timestamp, no code anywhere in the menu.
     #[test]
@@ -148,6 +262,13 @@ mod tests {
         let line = job_line(&j);
         assert!(line.contains("exit 2"), "the exit code has to be on the line: {line}");
         assert!(line.starts_with("extract  (every 4 h, !"), "and marked: {line}");
+    }
+
+    #[test]
+    fn recent_failure_also_marks_the_icon() {
+        let mut j = job(Schedule::Every(14_400));
+        j.last_exit = Some(1);
+        assert_eq!(health(Some(&Stats::default()), &[j], None).severity, Severity::Error);
     }
 
     /// A job the backend cannot run as written is one that is not running. It used to be absent

@@ -139,10 +139,13 @@ pass:
 ## What the console tells you about itself
 
 The console is a tool for noticing silence, so silence in the console is the worst bug it can
-have. What it says, and what each line means:
+have. Use `hypermnesia --status` to print the same classifications without a GUI. The report is read-only and does not start jobs or resolve review items. What each line means:
 
 | On screen | What it means |
 |-----------|---------------|
+| `Status: Needs attention` | amber: review work, incomplete embeddings or unavailable timing evidence; the next lines name the causes |
+| `Status: Errors detected` | red: at least one observed failure; pending reviews may coexist with it |
+| `Old unused memories (180+ days): 0` | no qualifying old unused personal memories; this says nothing about document index freshness |
 | `! not updated: <reason>, showing state from 4m ago` | the reading failed; these numbers are old and this is how old |
 | `! no answer about a reading for 2m -- the reader is stuck` | the worker thread is alive and has stopped answering |
 | `! the reader thread has died` | nothing will update again; restart the tray |
@@ -153,7 +156,8 @@ have. What it says, and what each line means:
 | `! <systemctl said>` (Linux) | the same, from `systemctl --user show` or the parser instead of `plutil` |
 | `! the timer is disabled, so it is not scheduled by anything` (Linux) | the `.timer` unit exists and parses, but is not enabled — no launchd analogue: a plist in LaunchAgents is loaded by definition, but a systemd timer can exist and simply not be armed |
 | `! the timer is loaded but not armed (ActiveState=..., SubState=...)` (Linux) | loaded and enabled, but not actually active right now |
-| `! exit 2, 5m ago` | the last run failed. `freshness` exits 1 by design, meaning discrepancies were found |
+| `~ review findings, 5m ago` | `freshness` completed with explicit findings (exit 10); review its report. An overdue check still becomes an error. |
+| `! exit 2, 5m ago` | the last run failed. `freshness` can exit 1 for discrepancies or a check failure; inspect its log before deciding which |
 | `loaded; no run since this login` (macOS) | launchd has the job and has not started it since the last login. Its exit column says 0, which it prints for "never finished" as well as for "finished well" |
 | `? the configured log is not there` | the job ran, but the file that would date its last run is gone. Neither health nor failure: the evidence is missing, and that is its own answer |
 | `! the hooks IGNORE this file entirely: <why>` | the settings file is out of force; the defaults are running |
