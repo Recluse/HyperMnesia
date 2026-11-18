@@ -35,6 +35,15 @@ with tempfile.TemporaryDirectory() as raw:
     second = run("--kind", "claude", "--path", claude, "--home", home)
     assert second.stdout.strip() == "unchanged"
 
+    # The default installation has no hooks but must still deny both write tools.
+    no_hooks = run("--kind", "claude-hooks", "--path", settings, "--home", home)
+    assert no_hooks.stdout.strip() == "changed"
+    initial_settings = json.loads(settings.read_text())
+    assert set(initial_settings["permissions"]["deny"]) >= {
+        "mcp__hypermnesia__memory_write", "mcp__hypermnesia__memory_supersede"}
+    assert not initial_settings.get("hooks")
+    assert run("--kind", "claude-hooks", "--path", settings, "--home", home).stdout.strip() == "unchanged"
+
     run("--kind", "claude-hooks", "--path", settings, "--home", home,
         "--profile", "--recall", "--capture")
     run("--kind", "claude-hooks", "--path", settings, "--home", home,

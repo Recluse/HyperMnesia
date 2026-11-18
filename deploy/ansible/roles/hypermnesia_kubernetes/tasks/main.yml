@@ -4,6 +4,8 @@
     that:
       - hypermnesia_namespace is match('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
       - hypermnesia_storage_class | length > 0
+      - hypermnesia_postgres_uid is integer and hypermnesia_postgres_uid > 0
+      - hypermnesia_postgres_gid is integer and hypermnesia_postgres_gid > 0
       - not hypermnesia_postgres_create_secret or hypermnesia_postgres_password is match('^[A-Fa-f0-9]{32,128}$')
       - not hypermnesia_reranker_enabled or hypermnesia_reranker_image | length > 0
       - not hypermnesia_vllm_enabled or (hypermnesia_vllm_image | length > 0 and hypermnesia_vllm_model | length > 0)

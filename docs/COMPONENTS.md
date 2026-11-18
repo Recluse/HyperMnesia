@@ -197,6 +197,11 @@ python3 hooks/mem_review.py list
 Dreamer operate on the store and can run wherever Postgres, the embedder and the LLM endpoint are
 reachable. Dreamer only creates review proposals; approval is a separate human action.
 
+Dreamer and Reflect exit non-zero when a store call, model call or required write fails, even
+if another group succeeds. No eligible work or an already-held job lock is a successful no-op.
+Extractor `--dry-run` leaves the completion ledger unchanged, including short or missing
+transcripts, so a preview cannot consume queued work.
+
 ## 9. MCP server
 
 Build the stdio server:

@@ -104,7 +104,11 @@ Knowledge pages stay out of it, history only on request, and a row the reader ma
 
 `memory_ask` is the synchronous Dialectic. It gives a model only the bounded context, then checks
 the reply as data: each atomic claim needs one or more IDs from that exact context, and every
-cited row must still be active. One unsupported claim rejects the whole answer. Returned prose
+cited row must be active within its validity window when context is assembled. This includes
+transitive evidence: expired and future-dated premises are omitted even if a direct explicit
+premise remains current. `memory_evidence` still exposes visible historical provenance for
+inspection; it is not the context used to ground a current answer. One unsupported claim rejects
+the whole answer. Returned prose
 and citations are built by code; a failed check becomes an explicit abstention.
 
 Two words there mean less than they might suggest, so precisely:

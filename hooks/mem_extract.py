@@ -472,9 +472,10 @@ def main():
                 # appended behind those. Extraction had stopped, and said so nowhere: the log printed
                 # "will retry" thousands of times, which reads as a system doing something.
                 if not os.path.exists(tp):
-                    print(f"  gone (marking done): {tp}")
-                    with open(DONE, "a", encoding="utf-8") as f:
-                        f.write(done_key(tp) + "\n")
+                    print(f"  gone ({'would mark done' if dry else 'marking done'}): {tp}")
+                    if not dry:
+                        with open(DONE, "a", encoding="utf-8") as f:
+                            f.write(done_key(tp) + "\n")
                     continue
                 text = transcript_text(tp)
                 if text is None:                 # present but unreadable right now -> retry next run
@@ -482,8 +483,9 @@ def main():
                     continue
                 if len(text) < 500:              # genuinely tiny -> nothing durable, mark done
                     print(f"  skip (tiny): {tp}")
-                    with open(DONE, "a", encoding="utf-8") as f:
-                        f.write(done_key(tp) + "\n")
+                    if not dry:
+                        with open(DONE, "a", encoding="utf-8") as f:
+                            f.write(done_key(tp) + "\n")
                     continue
                 try:
                     # <private> spans are already gone: transcript_text() strips them per turn,

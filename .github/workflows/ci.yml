@@ -68,6 +68,8 @@ jobs:
         run: python tests/test_mem_pages.py
       - name: Extraction queue (claims, failures exit non-zero, author gate)
         run: python tests/test_mem_extract_queue.py
+      - name: Audit regressions (exclusion failures, job exits and dry-run queue)
+        run: python tests/test_audit_regressions.py
       - name: Ingest ignore file
         run: python tests/test_ingest_ignore.py
       # Hooks, jobs and the MCP server run from an installed commit, not from a checkout; the
@@ -101,6 +103,8 @@ jobs:
           ansible-galaxy collection install -r deploy/ansible/requirements.yml
       - name: Structural registration helper
         run: python deploy/ansible/tests/test_config_merge.py
+      - name: Client role registration and idempotence (disposable HOME)
+        run: python deploy/ansible/tests/test_client_role.py
       - name: Kubernetes template contract
         run: python deploy/ansible/tests/test_kubernetes_templates.py
       - name: Ansible role lint
@@ -232,6 +236,10 @@ jobs:
           python tests/test_memory_lifecycle_live.py
       # Builds its own scratch databases (the CI owner may CREATE DATABASE) and runs the
       # lifecycle migration over rows in the shapes the old code wrote.
+      - name: Incremental ingest snapshot and concurrent writers, live
+        env:
+          DATABASE_URL: postgresql://hm:hm@localhost:5432/hypermnesia
+        run: python tests/test_incremental_ingest_live.py
       - name: Memory lifecycle migration over legacy rows
         env:
           DATABASE_URL: postgresql://hm:hm@localhost:5432/hypermnesia

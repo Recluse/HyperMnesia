@@ -470,7 +470,7 @@ def main():
     assert 'obj.insert("project".into(), Value::String(repo()))' in src
     assert '"memory_context" => structured(' in src
     assert '"structuredContent":value' in src
-    assert "JOIN mem.all_memories m ON m.id=r.memory_id" in (ROOT / "ingest/mem_ops.py").read_text()
+    assert "JOIN mem.active_memories m ON m.id=r.memory_id" in (ROOT / "ingest/mem_ops.py").read_text()
     print(json.dumps({"ok": True, "full_ids": ids,
                       "tiny_tokens": tiny["estimated_tokens"]}))
 

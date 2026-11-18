@@ -44,6 +44,14 @@
     owner: "{{ hypermnesia_user }}"
     mode: "0700"
 
+- name: Client | Install the read-only MCP smoke helper
+  ansible.builtin.copy:
+    src: smoke.py
+    dest: "{{ hypermnesia_home }}/state/ansible-mcp-smoke.py"
+    owner: "{{ hypermnesia_user }}"
+    mode: "0700"
+  when: hypermnesia_smoke_enabled
+
 - name: Client | Check the Codex MCP table
   ansible.builtin.shell: |
     set -eu
@@ -75,12 +83,12 @@
           '--path', hypermnesia_claude_config, '--home', hypermnesia_home]
          + (['--force'] if hypermnesia_force_client_merge else []) }}
   register: hypermnesia_claude_merge
-  changed_when: "'changed' in hypermnesia_claude_merge.stdout"
+  changed_when: "hypermnesia_claude_merge.stdout | trim == 'changed'"
   when:
     - "'claude' in hypermnesia_clients"
     - not ansible_check_mode
 
-- name: Client | Register Claude hooks
+- name: Client | Register Claude write denies and optional hooks
   ansible.builtin.command:
     argv: >-
       {{ [hypermnesia_home ~ '/state/ansible-merge-json.py', '--kind', 'claude-hooks',
@@ -89,10 +97,9 @@
          + (['--recall'] if hypermnesia_hooks_recall else [])
          + (['--capture'] if hypermnesia_hooks_capture else []) }}
   register: hypermnesia_claude_hooks_merge
-  changed_when: "'changed' in hypermnesia_claude_hooks_merge.stdout"
+  changed_when: "hypermnesia_claude_hooks_merge.stdout | trim == 'changed'"
   when:
     - "'claude' in hypermnesia_clients"
-    - hypermnesia_hooks_profile or hypermnesia_hooks_recall or hypermnesia_hooks_capture
     - not ansible_check_mode
 
 - name: Client | Register Codex hooks
@@ -103,7 +110,7 @@
          + (['--profile'] if hypermnesia_hooks_profile else [])
          + (['--recall'] if hypermnesia_hooks_recall else []) }}
   register: hypermnesia_codex_hooks_merge
-  changed_when: "'changed' in hypermnesia_codex_hooks_merge.stdout"
+  changed_when: "hypermnesia_codex_hooks_merge.stdout | trim == 'changed'"
   when:
     - "'codex' in hypermnesia_clients"
     - hypermnesia_hooks_profile or hypermnesia_hooks_recall
@@ -146,7 +153,7 @@
   ansible.builtin.command:
     argv:
       - "{{ hypermnesia_python }}"
-      - "{{ role_path }}/files/smoke.py"
+      - "{{ hypermnesia_home }}/state/ansible-mcp-smoke.py"
       - "{{ hypermnesia_mcp_binary_path }}"
       - "{{ hypermnesia_mcp_server_name }}"
   environment:

@@ -115,13 +115,14 @@ def main():
         return 2
     if not acquire_lock(LOCK):
         print("another dream run holds the lock; exiting", flush=True)
-        return
+        return 0
+    failures = 0
     try:
         raw = mem_ops("dream_inputs", {"min_memories": MIN_MEMORIES,
                       "max_memories": MAX_MEMORIES, "max_peers": MAX_GROUPS}, timeout=45)
         if raw is None:
             print("memory store unreachable; exiting", flush=True)
-            return
+            return 1
         groups = json.loads(raw).get("groups", [])
         print(f"{len(groups)} perspective group(s) eligible", flush=True)
         for group in groups:
@@ -136,6 +137,7 @@ def main():
                 "observed_entity_id": group["observed"]["id"], "input_count": len(ids),
                 "config": {"input_sha": fingerprint, "max_candidates": MAX_CANDIDATES}}, timeout=30)
             if not started_raw:
+                failures += 1
                 print(f"  {label}: could not record run; skipped", flush=True)
                 continue
             started = json.loads(started_raw)
@@ -165,15 +167,19 @@ def main():
                     # that did get queued are not duplicated by the retry.
                     raise RuntimeError(f"{lost} of {len(candidates)} candidate(s) could not "
                                        f"be queued for review")
-                mem_ops("dream_finish", {"id": run_id, "status": "succeeded",
-                        "candidate_count": queued}, timeout=30)
+                finished = mem_ops("dream_finish", {"id": run_id, "status": "succeeded",
+                                   "candidate_count": queued}, timeout=30)
+                if not finished:
+                    raise RuntimeError("could not confirm the completed dream run")
                 print(f"  {label}: dream #{run_id} succeeded, {queued} candidate(s)", flush=True)
             except Exception as exc:
+                failures += 1
                 mem_ops("dream_finish", {"id": run_id, "status": "failed",
                         "candidate_count": queued, "error": str(exc)}, timeout=30)
                 print(f"  {label}: dream #{run_id} FAILED ({exc})", flush=True)
     finally:
         release_lock(LOCK)
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

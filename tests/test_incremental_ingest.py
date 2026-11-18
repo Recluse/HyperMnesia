@@ -131,9 +131,15 @@ def main():
         check("and the unreadable file is reported, not passed over in silence",
               "could not read keep.md" in ureport)
 
-        check("aborts on a snapshot that does not match the DB",
-              "DO $do$" in inc and "IF n <> 3 THEN RAISE EXCEPTION" in inc
-              and "SELECT count(*) INTO n FROM documents WHERE repo = 'testrepo';" in inc)
+        check("compares both paths and hashes, including unexpected rows",
+              "jsonb_to_recordset(" in inc and "path text, content_hash text" in inc
+              and "expected EXCEPT SELECT * FROM actual" in inc
+              and "actual EXCEPT SELECT * FROM expected" in inc)
+        check("serializes corpus writes before checking the snapshot",
+              inc.index("LOCK TABLE documents IN SHARE ROW EXCLUSIVE MODE;")
+              < inc.index("jsonb_to_recordset("))
+        check("full replacements participate in the same serialization",
+              "LOCK TABLE documents IN SHARE ROW EXCLUSIVE MODE;" in full)
 
     # A path with any non-ASCII byte: git C-escapes and double-quotes it unless asked not to, so
     # `git ls-files` used to hand back a 21-character literal instead of the filename. The

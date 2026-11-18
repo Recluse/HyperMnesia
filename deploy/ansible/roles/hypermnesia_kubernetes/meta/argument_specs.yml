@@ -10,6 +10,8 @@ argument_specs:
       hypermnesia_storage_class: {type: str}
       hypermnesia_postgres_storage: {type: str}
       hypermnesia_postgres_image: {type: str}
+      hypermnesia_postgres_uid: {type: int}
+      hypermnesia_postgres_gid: {type: int}
       hypermnesia_require_image_digests: {type: bool}
       hypermnesia_postgres_existing_secret: {type: str}
       hypermnesia_postgres_create_secret: {type: bool}

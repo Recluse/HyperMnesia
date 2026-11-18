@@ -94,9 +94,15 @@ cover.
   so an enumeration that returns nothing would mean "delete everything". It exits non-zero
   instead and names the way out (`--walk`, for a git-ignored tree).
 - **Trust a snapshot from elsewhere.** The `--known-hashes` file is treated as ground truth about
-  the database, so the emitted SQL asserts the scope still holds exactly as many documents as the
-  snapshot describes and raises otherwise. That guard only reaches you if psql runs with
-  `-v ON_ERROR_STOP=1`.
+  the database, so the emitted SQL compares the complete set of paths and content hashes before
+  applying changes. A replaced or renamed row is rejected even when the document count matches.
+  Both full and incremental applies lock `documents` for writing until commit; readers continue
+  to work, but corpus writers serialize across scopes. Embedding work runs outside that lock.
+  On a mismatch, fetch a new snapshot and regenerate the SQL. Always run psql with
+  `-v ON_ERROR_STOP=1` so a rejected transaction also fails the command.
+- **Ignore a broken exclusion policy.** A missing optional `.hmignore` is allowed. If it
+  exists but cannot be read, ingest stops before replacing its SQL output; a broken symlink
+  also fails. It never retries with an empty exclusion list.
 - **Silently drop what it could not read.** A file that exists but cannot be read this time is
   counted as present, so a transient error does not delete a good document. A path git lists that
   is *not* on disk is treated as deleted and said so — the usual cause is an unstaged deletion.

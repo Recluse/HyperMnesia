@@ -6,6 +6,8 @@ hypermnesia_create_namespace: true
 hypermnesia_storage_class: ""
 hypermnesia_postgres_storage: 20Gi
 hypermnesia_postgres_image: pgvector/pgvector:0.8.5-pg16
+hypermnesia_postgres_uid: 999
+hypermnesia_postgres_gid: 999
 hypermnesia_require_image_digests: true
 hypermnesia_postgres_existing_secret: hypermnesia-postgres
 hypermnesia_postgres_create_secret: false

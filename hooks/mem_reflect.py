@@ -45,8 +45,7 @@ def reflect_one(project, dry):
     body = "\n".join(f"- [{m['type']}] {m['content']}" for m in grp[:MAX_MEMS])
     page = complete(PROMPT, f"Project: {project}\n\n{body}")
     if not page or not page.strip():
-        print(f"  {project}: LLM returned nothing, skip")
-        return False
+        raise RuntimeError("LLM returned an empty page")
     if dry:
         print(f"  [dry] {project} ({len(grp)} mems) ->\n{page.strip()[:400]}\n")
         return False
@@ -60,7 +59,9 @@ def reflect_one(project, dry):
         page_id = None
     print(f"  {project} ({len(grp)} mems): "
           f"{f'saved [#{page_id}]' if page_id else 'WRITE FAILED'}")
-    return bool(page_id)
+    if not page_id:
+        raise RuntimeError("page_upsert did not confirm a saved page")
+    return True
 
 
 def main():
@@ -77,7 +78,8 @@ def main():
     # owner is recovered, and so is a lock whose recorded PID was reused after a reboot.
     if not acquire_lock(LOCK):
         print("another reflect run holds the lock; exiting", flush=True)
-        return
+        return 0
+    failures = 0
     try:
         if only:
             targets = [{"project": only}]
@@ -87,7 +89,7 @@ def main():
                 # Not "nothing to reflect": the store never answered. Printing 0 here made a
                 # failed scheduled run indistinguishable from one with no work to do.
                 print("store unreachable; exiting", flush=True)
-                return
+                return 1
             targets = json.loads(raw)
         print(f"{len(targets)} project(s) to reflect", flush=True)
         changed = False
@@ -95,8 +97,9 @@ def main():
             try:
                 changed |= reflect_one(t["project"], dry)
             except Exception as e:
+                failures += 1
                 print(f"  {t.get('project')}: FAILED {e}")
-        if changed and not dry and os.path.exists(PROFILE_CACHE):
+        if (changed or failures) and not dry and os.path.exists(PROFILE_CACHE):
             try:
                 os.remove(PROFILE_CACHE)
                 print("profile cache invalidated")
@@ -104,6 +107,7 @@ def main():
                 pass
     finally:
         release_lock(LOCK)
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

@@ -590,6 +590,50 @@ def main():
               and not ({f1, f2} & set(ctx["scope"].get("stale_premises", []))),
               f"evidence={ev} relevant={rel} stale={ctx['scope'].get('stale_premises')}")
 
+        print("\n== current evidence excludes expired and future explicit ancestors ==")
+        expiry_project = f"{TAG}-expiry"
+        owner_sql("INSERT INTO mem.project_members(author,project) VALUES ('alice',%s) "
+                  "ON CONFLICT DO NOTHING", (expiry_project,))
+        ancestor = write(ac, alice, type="semantic", project=expiry_project,
+                         content="cedar evidence was valid during its event window",
+                         valid_from="2020-01-01", valid_to="2099-01-01")
+        direct = write(ac, alice, type="semantic", project=expiry_project,
+                       content="cedar direct evidence supports the current conclusion",
+                       evidence=[{"memory_id": ancestor, "relation": "supports"}])
+        derived_result = m.apply_proposal_result(ac, "derive", [direct], {
+            "reasoning_level": "deductive", "confidence": .8, "importance": .5,
+            "content": "cedar conclusion rests on current direct evidence"}, who="alice")
+        alice.commit()
+        assert derived_result["applied"], derived_result
+        derived_id = derived_result["id"]
+        sys.path.insert(0, str(ROOT / "hooks"))
+        ds = importlib.util.spec_from_file_location("dialectic_expiry", ROOT / "hooks/mem_dialectic.py")
+        dialectic = importlib.util.module_from_spec(ds)
+        ds.loader.exec_module(dialectic)
+        claim = {"claims": [{"text": "The ancestor is currently valid.", "memory_ids": [ancestor]}]}
+        for window, start, end in [("current", "2020-01-01", "2099-01-01"),
+                                   ("expired", "2020-01-01", "2020-01-02"),
+                                   ("future", "2098-01-01", "2099-01-01")]:
+            # Move event time in the fixture rather than sleeping until the record expires.
+            owner_sql("UPDATE mem.memories SET valid_from=%s,valid_to=%s WHERE id=%s",
+                      (start, end, ancestor))
+            ac.execute("SELECT mem.premises_live(%s)", (derived_id,))
+            assert ac.fetchone()[0] is True   # the direct premise is still current
+            context = m.do_context(ac, {"query": "cedar conclusion", "project": expiry_project,
+                                       "depth": "max", "token_budget": 8192})
+            alice.commit()
+            ids = {item["id"] for sec in context["sections"] for item in sec["items"]}
+            check(f"{window}: live conclusion stays available", derived_id in ids, str(ids))
+            check(f"{window}: only current explicit ancestors enter the context",
+                  (ancestor in ids) == (window == "current"), str(ids))
+            try:
+                dialectic.validate_reply(claim, context)
+                accepted = True
+            except ValueError:
+                accepted = False
+            check(f"{window}: citation eligibility follows event time",
+                  accepted == (window == "current"))
+
         print("\n== R4c: retirement is stamped when it happens, not when the transaction began ==")
         old_row = write(ac, alice, type="semantic", content="lamp bulbs are warm white")
         ac.execute("SELECT now()")

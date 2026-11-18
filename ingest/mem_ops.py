@@ -1007,6 +1007,10 @@ ORDER BY m.importance DESC, m.created_at DESC, m.id DESC LIMIT %s"""
 
 def _context_evidence(cur, derived_ids, max_hops, limit):
     """Visible active premises for conclusions, with bounded cycle-safe ancestry traversal."""
+    # Current context uses the same status and validity-window predicates as search. A
+    # transitive explicit premise can expire while the direct premise remains active;
+    # checking only derived conclusions does not catch that case. Historical edges remain
+    # available through the separate evidence tool, outside current-answer grounding.
     if not derived_ids or max_hops < 1:
         return []
     # The edge relation travels with the walk. A `contradicts` edge points at a memory that
@@ -1041,7 +1045,7 @@ def _context_evidence(cur, derived_ids, max_hops, limit):
                           m.valid_to::date::text,m.project,m.content,0.0,
                           coalesce(m.metadata->>'reasoning_level','explicit'),
                           r.depth,r.roots,r.paths,r.contradicts
-                     FROM ranked r JOIN mem.all_memories m ON m.id=r.memory_id
+                     FROM ranked r JOIN mem.active_memories m ON m.id=r.memory_id
                     WHERE (m.metadata->>'kind') IS DISTINCT FROM 'page'
                     ORDER BY r.depth,m.importance DESC,m.created_at DESC,m.id DESC""",
                 (derived_ids, max_hops, limit))

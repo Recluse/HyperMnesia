@@ -50,7 +50,12 @@ Fresh Claude Code registration uses a structural JSON merger. It preserves unrel
 deduplicates hooks and deny rules, writes atomically, and refuses a foreign `hypermnesia` entry.
 Codex registration is an Ansible-managed TOML block with the same conflict check. The Codex
 allowlist is read-only; Claude receives explicit denies for `memory_write` and
-`memory_supersede`.
+`memory_supersede`, including when all automatic hooks are disabled. Reapplying an unchanged
+registration reports `changed=0`.
+
+When `hypermnesia_smoke_enabled` is true and both smoke scope values are set, the role copies
+its read-only check to `~/.HyperMnesia/state/ansible-mcp-smoke.py` on the managed host, then runs
+it there. The managed host does not need the controller's checkout path.
 
 Extraction is opt-in:
 
@@ -92,6 +97,19 @@ Production values pin every enabled image as `name@sha256:...`. A disposable eva
 may set `hypermnesia_require_image_digests: false`. A migration Job reads a complete
 `HM_ADMIN_URL` from `hypermnesia_migration_existing_secret`, avoiding URL construction from an
 unescaped password. Give every release a new DNS-safe migration ID.
+
+PostgreSQL runs as a numeric, non-root user. `hypermnesia_postgres_uid` and
+`hypermnesia_postgres_gid` default to `999`, matching the Debian-based pgvector image; set both
+to the IDs required by a custom image and existing volume. The storage driver must support
+`fsGroup`, and custom images must provide `docker-entrypoint.sh`.
+
+New volumes use a `pgdata` child directory owned by that user. A volume with `PG_VERSION` at
+its root keeps that layout. If both locations contain a database, startup stops rather than
+choosing one. The role never moves a database or changes its owner recursively. Check existing
+volume ownership before rollout and take a backup before changing images or IDs.
+
+The reranker listens on the Pod interface (`HM_RERANK_BIND=0.0.0.0`) so its Service and readiness
+probe can reach it. Its Service remains ClusterIP and the model-client NetworkPolicy still applies.
 
 ### Optional vLLM
 

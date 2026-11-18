@@ -26,13 +26,33 @@ spec:
     metadata:
       labels: {app.kubernetes.io/name: postgres, app.kubernetes.io/part-of: hypermnesia}
     spec:
-      securityContext: {runAsNonRoot: true, fsGroup: 999}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ hypermnesia_postgres_uid }}
+        runAsGroup: {{ hypermnesia_postgres_gid }}
+        fsGroup: {{ hypermnesia_postgres_gid }}
       containers:
         - name: postgres
           image: {{ hypermnesia_postgres_image }}
           imagePullPolicy: IfNotPresent
           envFrom:
             - secretRef: {name: {{ hypermnesia_postgres_existing_secret }}}
+          # A new PVC needs a postgres-owned child directory. Preserve databases made
+          # by earlier role versions at the volume root; never initialize beside one.
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              volume=/var/lib/postgresql/data
+              if [ -f "$volume/PG_VERSION" ]; then
+                if [ -f "$volume/pgdata/PG_VERSION" ]; then
+                  echo "Two PostgreSQL data directories found; select one manually." >&2
+                  exit 1
+                fi
+                export PGDATA="$volume"
+              else
+                export PGDATA="$volume/pgdata"
+              fi
+              exec docker-entrypoint.sh postgres
           ports: [{name: postgres, containerPort: 5432}]
           readinessProbe:
             exec: {command: [pg_isready, -U, {{ hypermnesia_postgres_user }}, -d, {{ hypermnesia_postgres_database }}]}
@@ -132,6 +152,9 @@ spec:
       containers:
         - name: reranker
           image: {{ hypermnesia_reranker_image }}
+          env:
+            - name: HM_RERANK_BIND
+              value: "0.0.0.0"
           ports: [{name: http, containerPort: 8091}]
           readinessProbe: {httpGet: {path: /health, port: http}, initialDelaySeconds: 10, periodSeconds: 10}
           resources: {requests: {cpu: 250m, memory: 512Mi}, limits: {memory: 2Gi}}

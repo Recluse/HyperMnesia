@@ -16,10 +16,10 @@ still needs no database connection of its own:
       -c "SELECT path, content_hash FROM documents WHERE repo='myrepo'" > known.tsv
     python ingest_repo.py ~/code/myrepo myrepo out.sql --known-hashes known.tsv
 
-Take that snapshot from the database you are about to load into: the emitted SQL asserts that
-the repo still holds exactly as many documents as the file describes and aborts if it does
-not, because a snapshot from elsewhere would mark documents "already stored" that were never
-there -- a corpus with holes that only shows up as missing search results.
+Take that snapshot from the database you are about to load into: the emitted SQL compares the
+complete path/hash set under a documents write lock and aborts on any mismatch, even when row
+counts agree. Readers remain available; corpus writers serialize until commit. On mismatch,
+fetch a new snapshot and regenerate the SQL instead of applying an outdated plan.
 
 --walk enumerates the tree with os.walk instead of `git ls-files`, for a directory that is
 git-ignored or otherwise untracked. Without it such a directory ingests as zero documents,
@@ -36,6 +36,7 @@ it. The recorded source_hash is left alone; ci/freshness.py compares it with the
 Env: HM_FTS_LANG (default 'english') -- the Postgres text-search config for stemming; 'simple'
 is always added alongside so exact tokens (code identifiers, IDs) match regardless of language.
 """
+import json
 import re
 import sys, os, re, fnmatch, hashlib, subprocess
 
@@ -148,10 +149,15 @@ def read_ignore(repo_dir):
     repo-relative path. Deliberately not a new glob dialect -- two forms cover the cases, and
     neither of them needs explaining to the person writing the file.
     """
+    path = os.path.join(repo_dir, IGNORE_FILE)
     try:
-        with open(os.path.join(repo_dir, IGNORE_FILE), encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             lines = fh.read().splitlines()
-    except OSError:
+    except FileNotFoundError:
+        # An absent optional policy is fine; an existing but broken policy is not.
+        # In particular, a dangling symlink must not silently remove all exclusions.
+        if os.path.lexists(path):
+            raise
         return []
     out = []
     for line in lines:
@@ -424,6 +430,9 @@ def main():
 
     with open(out, "w", encoding="utf-8") as f:
         f.write("BEGIN;\n")
+        # Serialize corpus writes through the snapshot check and apply. Reads remain available;
+        # embedding work happens outside this transaction. This also covers other ingesters.
+        f.write("LOCK TABLE documents IN SHARE ROW EXCLUSIVE MODE;\n")
         if incremental:
             # The TSV is trusted as ground truth about the DB, and a wrong one fails SILENTLY:
             # a document listed with its current hash is treated as already stored, so if the
@@ -431,12 +440,19 @@ def main():
             # answers "no results" instead of erroring. Snapshot and apply must therefore
             # describe the same rows; if they don't, abort the transaction rather than write a
             # corpus with holes in it.
-            f.write("DO $do$ DECLARE n int; BEGIN\n"
-                    f"  SELECT count(*) INTO n FROM documents WHERE repo = {sqlstr(repo)};\n"
-                    f"  IF n <> {len(known)} THEN RAISE EXCEPTION\n"
-                    f"    'known-hashes describes % documents but repo {repo} holds % -- "
-                    f"stale or wrong snapshot, refusing incremental ingest', {len(known)}, n;\n"
-                    "  END IF;\nEND $do$;\n")
+            expected = json.dumps([{"path": path, "content_hash": chash}
+                                   for path, chash in sorted(known.items())])
+            guard = (
+                "BEGIN\n  IF EXISTS (\n"
+                "    WITH expected AS (SELECT * FROM jsonb_to_recordset("
+                + sqlstr(expected) + "::jsonb) AS e(path text, content_hash text)),\n"
+                + f"         actual AS (SELECT path,content_hash FROM documents WHERE repo={sqlstr(repo)})\n"
+                "    (SELECT * FROM expected EXCEPT SELECT * FROM actual)\n"
+                "    UNION ALL\n"
+                "    (SELECT * FROM actual EXCEPT SELECT * FROM expected)\n"
+                "  ) THEN RAISE EXCEPTION 'known-hashes no longer matches repo %', "
+                + sqlstr(repo) + ";\n  END IF;\nEND;")
+            f.write("DO " + dq(guard) + ";\n")
             # freshness.py flags documents whose git_commit != HEAD, so leaving untouched rows
             # at their old commit would report the entire corpus as stale after any commit.
             # Their CONTENT is current as of this commit; only their chunks were not rewritten.
